@@ -195,7 +195,8 @@ ShellRoot {
                    + " size=" + screenFx.width + "x" + screenFx.height;
         }
         function state(): string {
-            return JSON.stringify({ current: root.current, msgs: root.msgs.length, fx: screenFx.current,
+            return JSON.stringify({ connected: sock.connected, threads: root.threads.length,
+                                    current: root.current, msgs: root.msgs.length, fx: screenFx.current,
                                     focused: root.focused, onScreen: root.onScreen,
                                     auto: root.autoEffect("Happy New Year!") });
         }
@@ -215,9 +216,13 @@ ShellRoot {
         }
     }
 
+    // Keep trying while the service is away (restarting, not started yet). A single retry
+    // could land before it was back, and then nothing ever tried again.
     Timer {
         id: reconnect
         interval: 2000
+        repeat: true
+        running: !sock.connected && root.preview === ""
         onTriggered: { sock.connected = false; sock.connected = true; }
     }
 
