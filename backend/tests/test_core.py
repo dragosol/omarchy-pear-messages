@@ -108,6 +108,27 @@ class DedupTest(unittest.TestCase):
         self.s.ingest(self._bb("G1", "ok see you", self.t + 1), "bluebubbles")
         self.assertEqual(len(self.s.messages(store.addr_thread("+447700900123"))), 2)
 
+    def test_email_vs_phone_handle_merges(self):
+        # the iPhone names the sender by Apple Account email, the Mac by phone number
+        _, rid = self.s.ingest(self._map("h1", "cool", self.t, addr="someone@icloud.com"), "iphone")
+        what, rid2 = self.s.ingest(self._bb("G1", "cool", self.t - 2), "bluebubbles")
+        self.assertEqual((what, rid2), ("merged", rid))
+        self.assertEqual(self.s.message(rid)["thread"], store.addr_thread("+447700900123"))
+
+    def test_other_handle_far_apart_stays_separate(self):
+        self.s.ingest(self._map("h1", "cool", self.t, addr="someone@icloud.com"), "iphone")
+        self.s.ingest(self._bb("G1", "cool", self.t - 60), "bluebubbles")
+        self.assertEqual(self.s.db.execute("select count(*) from messages").fetchone()[0], 2)
+
+    def test_merge_orphans_cleans_old_duplicates(self):
+        self.s.ingest(self._bb("G1", "?", self.t), "bluebubbles")
+        # stored by an older version, which didn't match across handles
+        self.s.db.execute("INSERT INTO messages(thread,from_me,sender,sender_addr,text,norm,ts,via,map_handle) "
+                          "VALUES('addr:x',0,'someone@icloud.com','someone@icloud.com','?','?',?,'iphone','h9')", (self.t + 2,))
+        self.assertEqual(self.s.merge_orphans(), 1)
+        rows = self.s.db.execute("select via, map_handle, bb_guid from messages").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [("both", "h9", "G1")])
+
     def test_far_apart_not_merged(self):
         self.s.ingest(self._map("h1", "ok", self.t - 3600), "iphone")
         self.s.ingest(self._bb("G1", "ok", self.t), "bluebubbles")

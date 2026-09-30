@@ -77,9 +77,25 @@ ShellRoot {
                                           "com.apple.messages.effect.CKShootingStarEffect"]
     readonly property var reactionKinds: ["love", "like", "dislike", "laugh", "emphasize", "question"]
 
-    function playEffect(m) {
-        if (!m || !m.effect) return;
-        if (screenFx.isScreen(m.effect)) { screenFx.play(m.effect, m.text); return; }
+    // Messages plays some screen effects by itself when it sees a phrase ("Happy birthday!" ->
+    // balloons). Nothing is stored for those - every device spots the phrase on its own - so
+    // this does the same. Most specific first.
+    readonly property var keywordEffects: [
+        [/happy (chinese|lunar) new year|恭喜发财|新年快乐/i, "com.apple.messages.effect.CKSparklesEffect"],
+        [/happy new year|bonne ann[ée]e|feliz a[ñn]o nuevo|an nou fericit|la mul[țt]i ani .*an nou|frohes neues jahr|felice anno nuovo|gelukkig nieuwjaar/i, "com.apple.messages.effect.CKFireworksEffect"],
+        [/happy birthday|joyeux anniversaire|feliz cumplea[ñn]os|feliz anivers[áa]rio|buon compleanno|alles gute zum geburtstag|la mul[țt]i ani|gefeliciteerd met je verjaardag|с днем рождения|с днём рождения/i, "com.apple.messages.effect.CKHappyBirthdayEffect"],
+        [/congratulations|\bcongrats\b|f[ée]licitations|felicidades|felicit[ăa]ri|herzlichen gl[üu]ckwunsch|congratulazioni|parab[ée]ns|selamat|gefeliciteerd/i, "com.apple.messages.effect.CKConfettiEffect"],
+        [/pew pew/i, "com.apple.messages.effect.CKLasersEffect"]
+    ]
+    function autoEffect(text) {
+        for (const [re, id] of root.keywordEffects) if (re.test(text || "")) return id;
+        return "";
+    }
+
+    function playEffect(m, auto) {
+        const effect = (m && m.effect) || (auto ? root.autoEffect(m && m.text) : "");
+        if (!effect) return;
+        if (screenFx.isScreen(effect)) { screenFx.play(effect, m.text); return; }
         const f = Object.assign({}, root.fxPlay);
         f[m.id] = Date.now();
         root.fxPlay = f;
@@ -227,7 +243,8 @@ ShellRoot {
                     if (i >= 0) next[i] = m; else next.push(m);
                     changed = true;
                     // A message arriving now (or one just sent) plays its effect, as on the phone.
-                    if (i < 0 && m.effect && Date.now() / 1000 - m.ts < 90) Qt.callLater(() => root.playEffect(m));
+                    if (i < 0 && Date.now() / 1000 - m.ts < 90 && (m.effect || root.autoEffect(m.text)))
+                        Qt.callLater(() => root.playEffect(m, true));
                 } else if (i >= 0) {           // merged into another thread (a group chat)
                     next.splice(i, 1);
                     changed = true;
@@ -1958,6 +1975,7 @@ ShellRoot {
         if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
         if (root.preview === "reactok") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
         // fx_<Name>: play that screen effect, e.g. PEAR_MESSAGES_PREVIEW=fx_Confetti
+        if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {
             const want = root.preview.slice(3).replace(/_/g, " ");
             const id = Object.keys(root.effectNames).find(k => root.effectNames[k] === want);

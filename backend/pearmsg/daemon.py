@@ -214,6 +214,8 @@ class Daemon:
             # Old history on first sync is not "new"; only recent incoming messages notify.
             if what == "new" and not n["from_me"] and time.time() - n["ts"] < 120:
                 fresh.append(rid)
+        if self.store.merge_orphans():
+            self._broadcast_threads()
         if newest:
             cur = int(float(self.store.get_meta("bb_since_ms", "0") or 0))
             self.store.set_meta("bb_since_ms", str(max(cur, int(newest))))
@@ -767,6 +769,16 @@ class Daemon:
 
     # -------------------------------------------------------------------- run
     def run(self) -> None:
+        n = self.store.merge_orphans()
+        if n:
+            log(f"merged {n} duplicate message(s) seen through both connections")
+        # A send in flight when the daemon stopped never finished. Say so; one click retries it.
+        stuck = self.store.db.execute(
+            "UPDATE messages SET status='failed', error='Interrupted before it was sent' "
+            "WHERE status='sending'").rowcount
+        self.store.db.commit()
+        if stuck:
+            log(f"{stuck} unfinished send(s) marked for retry")
         self.serve()
         self.apply_settings()
         # Transfers finishing (sends, contact pulls) are reported by the phone module; this

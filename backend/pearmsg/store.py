@@ -84,6 +84,10 @@ MATCH_WINDOW = 180.0
 MATCH_WINDOW_EMPTY = 45.0
 # A truncated copy must still carry at least this much of the text to be recognised.
 PREFIX_MIN = 40
+# The two connections can name one person differently: the iPhone may report an Apple Account
+# email where the Mac reports a phone number. The same text from "two people" this close
+# together is the same message.
+CROSS_HANDLE_WINDOW = 20.0
 
 _OBJ = "￼"  # what Messages puts in the text where an attachment sits
 _TAPBACK_PREFIX = re.compile(
@@ -271,15 +275,25 @@ class Store:
                 "AND ts BETWEEN ? AND ? " + ("" if from_me else "AND sender=? "))
         args = (int(from_me), ts - win, ts + win) + (() if from_me else (sender,))
         r = self.db.execute(base + "AND norm=? ORDER BY ABS(ts-?) LIMIT 1", args + (norm, ts)).fetchone()
-        if r is not None or len(norm) < PREFIX_MIN:
+        if r is not None:
             return r
+        if len(norm) < PREFIX_MIN:
+            return self._cross_handle_twin(from_me, sender, norm, ts, id_col)
         # The iPhone cuts a long text short in some places (its listing stops at 128
         # characters). A text that is the start of the other copy is the same message.
         for c in self.db.execute(base + "ORDER BY ABS(ts-?) LIMIT 20", args + (ts,)).fetchall():
             a, b = c["norm"], norm
             if len(a) >= PREFIX_MIN and (a.startswith(b) or b.startswith(a)):
                 return c
-        return None
+        return self._cross_handle_twin(from_me, sender, norm, ts, id_col)
+
+    def _cross_handle_twin(self, from_me, sender, norm, ts, id_col):
+        if from_me or not norm:
+            return None
+        return self.db.execute(
+            f"SELECT * FROM messages WHERE from_me=0 AND {id_col} IS NULL AND norm=? AND sender!=? "
+            "AND ts BETWEEN ? AND ? ORDER BY ABS(ts-?) LIMIT 1",
+            (norm, sender, ts - CROSS_HANDLE_WINDOW, ts + CROSS_HANDLE_WINDOW, ts)).fetchone()
 
     def ingest(self, m: dict, source: str) -> tuple[str, int]:
         """Add or merge one message. Returns (what happened, row id).
@@ -363,6 +377,23 @@ class Store:
             if "bb_guid" in upd:
                 self._apply_pending_reactions(r["id"], upd["bb_guid"])
             self.db.commit()
+
+    def merge_orphans(self) -> int:
+        """Merge iPhone-only rows into BlueBubbles-only rows that are the same message.
+        Returns how many duplicates were removed."""
+        n = 0
+        for r in self.db.execute("SELECT * FROM messages WHERE map_handle IS NOT NULL AND bb_guid IS NULL").fetchall():
+            twin = self._find_twin(from_me=bool(r["from_me"]), sender=r["sender"], norm=r["norm"],
+                                   ts=r["ts"], id_col="map_handle")
+            if twin is None or twin["id"] == r["id"] or not twin["bb_guid"]:
+                continue
+            self.db.execute("DELETE FROM messages WHERE id=?", (r["id"],))
+            self.db.execute("UPDATE messages SET map_handle=?, via='both', "
+                            "unread=CASE WHEN ? THEN unread ELSE 0 END WHERE id=?",
+                            (r["map_handle"], r["unread"], twin["id"]))
+            n += 1
+        self.db.commit()
+        return n
 
     def set_effect(self, mid: int, effect: str) -> None:
         self.db.execute("UPDATE messages SET effect=? WHERE id=?", (effect, mid))
