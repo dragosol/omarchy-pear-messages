@@ -2,6 +2,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -41,6 +42,84 @@ ShellRoot {
     property string flash: ""
     property int reqId: 1
 
+    // reactions / effects / previews
+    property var picker: null            // {id, x, y, mine} - the reaction picker, when open
+    property bool effectPickerOpen: false
+    property string pendingEffect: ""    // effect for the next send
+    property var fxPlay: ({})            // message id -> nonce; a change replays its bubble effect
+    property string selAtt: ""           // attachment guid clicked last (Space previews it)
+    property var hoverAtt: null          // attachment under the pointer
+    property string pendingPreview: ""   // guid to preview once it has downloaded
+    property string builtinPreview: ""   // path shown in our own preview (no Sushi)
+    readonly property var abilities: status.abilities || ({ reactions: false, effects: false, reason: "Not connected." })
+
+    readonly property var effectNames: ({
+        "com.apple.MobileSMS.expressivesend.impact": "Slam",
+        "com.apple.MobileSMS.expressivesend.loud": "Loud",
+        "com.apple.MobileSMS.expressivesend.gentle": "Gentle",
+        "com.apple.MobileSMS.expressivesend.invisibleink": "Invisible Ink",
+        "com.apple.messages.effect.CKEchoEffect": "Echo",
+        "com.apple.messages.effect.CKSpotlightEffect": "Spotlight",
+        "com.apple.messages.effect.CKHappyBirthdayEffect": "Balloons",
+        "com.apple.messages.effect.CKConfettiEffect": "Confetti",
+        "com.apple.messages.effect.CKHeartEffect": "Love",
+        "com.apple.messages.effect.CKLasersEffect": "Lasers",
+        "com.apple.messages.effect.CKFireworksEffect": "Fireworks",
+        "com.apple.messages.effect.CKSparklesEffect": "Celebration",
+        "com.apple.messages.effect.CKShootingStarEffect": "Shooting Star"
+    })
+    readonly property var bubbleEffects: ["com.apple.MobileSMS.expressivesend.impact", "com.apple.MobileSMS.expressivesend.loud",
+                                          "com.apple.MobileSMS.expressivesend.gentle", "com.apple.MobileSMS.expressivesend.invisibleink"]
+    readonly property var screenEffects: ["com.apple.messages.effect.CKEchoEffect", "com.apple.messages.effect.CKSpotlightEffect",
+                                          "com.apple.messages.effect.CKHappyBirthdayEffect", "com.apple.messages.effect.CKConfettiEffect",
+                                          "com.apple.messages.effect.CKHeartEffect", "com.apple.messages.effect.CKLasersEffect",
+                                          "com.apple.messages.effect.CKFireworksEffect", "com.apple.messages.effect.CKSparklesEffect",
+                                          "com.apple.messages.effect.CKShootingStarEffect"]
+    readonly property var reactionKinds: ["love", "like", "dislike", "laugh", "emphasize", "question"]
+
+    function playEffect(m) {
+        if (!m || !m.effect) return;
+        if (screenFx.isScreen(m.effect)) { screenFx.play(m.effect, m.text); return; }
+        const f = Object.assign({}, root.fxPlay);
+        f[m.id] = Date.now();
+        root.fxPlay = f;
+    }
+
+    // Why a reaction can't be sent to this message, or "" when it can.
+    function reactBlock(m) {
+        if (!root.abilities.reactions) return root.abilities.reason;
+        if (!m.guid) return "This message only came through your iPhone, so your Mac doesn't know it yet. Try again in a moment.";
+        return "";
+    }
+
+    function isVideo(att) {
+        return (att.mime || "").indexOf("video/") === 0 || /\.(mov|mp4|m4v|avi|mkv|webm|3gp)$/i.test(att.name || "");
+    }
+    // Photos more than 200 messages up the conversation only ever go to the temp folder.
+    function attTemp(att, msgIndex) { return root.isVideo(att) || msgIndex < root.msgs.length - 200; }
+
+    function previewAttachment(att, msgIndex) {
+        if (!att || !att.guid) return false;
+        root.selAtt = att.guid;
+        const st = root.attachments[att.guid];
+        if (st && st.path) { root.send({ op: "preview", path: st.path }); return true; }
+        root.pendingPreview = att.guid;
+        root.needAttachment(att, msgIndex);
+        return true;
+    }
+    function spacePreview() {
+        const target = root.hoverAtt || root.findAtt(root.selAtt);
+        if (!target) return false;
+        return root.previewAttachment(target.att, target.index);
+    }
+    function findAtt(guid) {
+        if (!guid) return null;
+        for (let i = root.msgs.length - 1; i >= 0; i--)
+            for (const a of (root.msgs[i].attachments || []))
+                if (a.guid === guid) return { att: a, index: i };
+        return null;
+    }
+
     readonly property string route: status.route || "none"
     readonly property var bb: status.bluebubbles || ({})
     readonly property var phone: status.iphone || ({})
@@ -71,6 +150,20 @@ ShellRoot {
         }
         onError: if (root.preview === "") reconnect.start()
     }
+    // Tells us when fingers touch the touchpad - the one event Qt's Wayland client never
+    // delivers (see touch_watch.py). Prints only "touch".
+    Process {
+        running: root.preview === ""
+        command: ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("touch_watch.py").toString().replace(/^file:\/\//, ""))]
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: function (line) {
+                if (line !== "touch") return;
+                threadPhys.catchCoast(); msgPhys.catchCoast(); settingsPhys.catchCoast();
+            }
+        }
+    }
+
     Timer {
         id: reconnect
         interval: 2000
@@ -133,6 +226,8 @@ ShellRoot {
                 if (m.thread === root.current) {
                     if (i >= 0) next[i] = m; else next.push(m);
                     changed = true;
+                    // A message arriving now (or one just sent) plays its effect, as on the phone.
+                    if (i < 0 && m.effect && Date.now() / 1000 - m.ts < 90) Qt.callLater(() => root.playEffect(m));
                 } else if (i >= 0) {           // merged into another thread (a group chat)
                     next.splice(i, 1);
                     changed = true;
@@ -168,11 +263,16 @@ ShellRoot {
             break;
         case "attachment": {
             const a = Object.assign({}, root.attachments);
-            a[d.guid] = d.path ? { path: d.path } : { error: d.error || "failed" };
+            a[d.guid] = d.path ? { path: d.path, temp: !!d.temp } : { error: d.error || "failed" };
             root.attachments = a;
-            if (d.path && root.pendingOpen === d.guid) { root.pendingOpen = ""; Qt.openUrlExternally("file://" + d.path); }
+            if (d.path && root.pendingPreview === d.guid) { root.pendingPreview = ""; root.send({ op: "preview", path: d.path }); }
             break;
         }
+        case "preview":
+            // No Sushi: our own preview for pictures, the default app for everything else.
+            if (/\.(png|jpe?g|gif|webp|heic|bmp|tiff?)$/i.test(d.path)) root.builtinPreview = root.builtinPreview === d.path ? "" : d.path;
+            else Qt.openUrlExternally("file://" + d.path);
+            break;
         case "open":
             if (d.thread) root.openThread(d.thread);
             break;
@@ -181,10 +281,13 @@ ShellRoot {
             break;
         }
     }
-    property string pendingOpen: ""
 
     function openThread(id) {
         root.composing = false;
+        root.picker = null;
+        root.effectPickerOpen = false;
+        root.pendingEffect = "";
+        root.hoverAtt = null;
         root.settingsOpen = false;
         if (id !== root.current) {
             root.current = id;
@@ -216,19 +319,24 @@ ShellRoot {
         if (root.composing) {
             const to = root.composeTo || toField.text.trim();
             if (!to) { root.flash = "Who is this to?"; toField.forceActiveFocus(); return; }
-            root.send({ op: "send", to: to, text: text });
+            root.send({ op: "send", to: to, text: text, effect: root.pendingEffect });
         } else if (root.current) {
-            root.send({ op: "send", thread: root.current, text: text });
+            root.send({ op: "send", thread: root.current, text: text, effect: root.pendingEffect });
         } else return;
         composer.text = "";
+        root.pendingEffect = "";
+        root.effectPickerOpen = false;
     }
 
-    function needAttachment(att) {
-        if (!att.guid || root.attachments[att.guid]) return;
+    function needAttachment(att, msgIndex) {
+        if (!att.guid) return;
+        const cur = root.attachments[att.guid];
+        if (cur && (cur.path || cur.loading)) return;
         const a = Object.assign({}, root.attachments);
         a[att.guid] = { loading: true };
         root.attachments = a;
-        root.send({ op: "attachment", guid: att.guid, name: att.name });
+        root.send({ op: "attachment", guid: att.guid, name: att.name, mime: att.mime,
+                    temp: root.attTemp(att, msgIndex === undefined ? root.msgs.length : msgIndex) });
     }
 
     // ------------------------------------------------------------------ formatting
@@ -265,6 +373,18 @@ ShellRoot {
         return escapeHtml(s).replace(/(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g,
             '<a href="$1" style="color:' + color + '">$1</a>').replace(/\n/g, "<br>");
     }
+    function fmtSize(n) {
+        if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+        if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+        if (n >= 1e3) return Math.round(n / 1e3) + " KB";
+        return n + " B";
+    }
+    function openPicker(m, item) {
+        if (root.picker && root.picker.id === m.id) { root.picker = null; return; }
+        const p = item.mapToItem(msgArea, 0, 0);
+        root.effectPickerOpen = false;
+        root.picker = { id: m.id, m: m, x: p.x, y: p.y, w: item.width, mine: m.fromMe };
+    }
     function reactionGlyph(kind) {
         return ({ love: "♥", like: "👍", dislike: "👎", laugh: "😂", emphasize: "‼", question: "?" })[kind] || kind;
     }
@@ -300,8 +420,13 @@ ShellRoot {
 
             Keys.onPressed: function (ev) {
                 const ctrl = ev.modifiers & Qt.ControlModifier;
+                if (ev.key === Qt.Key_Space && root.builtinPreview) { root.builtinPreview = ""; ev.accepted = true; return; }
+                if (ev.key === Qt.Key_Space && root.spacePreview()) { ev.accepted = true; return; }
                 if (ev.key === Qt.Key_Escape) {
-                    if (root.settingsOpen) root.settingsOpen = false;
+                    if (root.builtinPreview) root.builtinPreview = "";
+                    else if (root.picker) root.picker = null;
+                    else if (root.effectPickerOpen) root.effectPickerOpen = false;
+                    else if (root.settingsOpen) root.settingsOpen = false;
                     else if (root.composing) { root.composing = false; if (root.threads.length) root.openThread(root.threads[0].id); }
                     else if (search.text) search.text = "";
                     else Qt.quit();
@@ -316,6 +441,30 @@ ShellRoot {
                     if (list[i]) root.openThread(list[i].id);
                     ev.accepted = true;
                 }
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                z: 100
+                visible: root.builtinPreview !== ""
+                color: Qt.rgba(0, 0, 0, 0.88)
+                Image {
+                    anchors.fill: parent
+                    anchors.margins: 32
+                    source: root.builtinPreview ? "file://" + root.builtinPreview : ""
+                    fillMode: Image.PreserveAspectFit
+                    asynchronous: true
+                }
+                Text {
+                    anchors.bottom: parent.bottom
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottomMargin: 10
+                    text: "Space or Esc to close"
+                    color: "#bbbbbb"
+                    font.family: Theme.uiFont
+                    font.pixelSize: Theme.fCaption
+                }
+                TapHandler { onTapped: root.builtinPreview = "" }
             }
 
             RowLayout {
@@ -363,8 +512,14 @@ ShellRoot {
                             clip: true
                             model: root.shownThreads
                             spacing: 2
-                            boundsBehavior: Flickable.StopAtBounds
+                            interactive: false
                             ScrollBar.vertical: AppScrollBar {}
+                            ScrollPhysics { id: threadPhys; flick: threadList }
+                            WheelHandler {
+                                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                onWheel: ev => threadPhys.wheel(ev)
+                            }
+                            function stopPhysics() { threadPhys.stopPhysics(); }
 
                             delegate: Rectangle {
                                 id: row
@@ -626,6 +781,7 @@ ShellRoot {
 
                         // messages
                         Item {
+                            id: msgArea
                             Layout.fillWidth: true
                             Layout.fillHeight: true
 
@@ -637,8 +793,14 @@ ShellRoot {
                                 clip: true
                                 model: root.msgs
                                 spacing: 3
-                                boundsBehavior: Flickable.StopAtBounds
+                                interactive: false
                                 ScrollBar.vertical: AppScrollBar {}
+                                ScrollPhysics { id: msgPhys; flick: list }
+                                WheelHandler {
+                                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                    onWheel: ev => msgPhys.wheel(ev)
+                                }
+                                function stopPhysics() { msgPhys.stopPhysics(); }
                                 header: Item { width: 1; height: 12 }
                                 footer: Item { width: 1; height: 12 }
                                 readonly property real bubbleMax: Math.min(560, width * 0.72)
@@ -649,13 +811,15 @@ ShellRoot {
                                 // Follow the newest message until the user scrolls up. Photos load after the
                 // first jump to the end and grow the list, so growth re-pins it while following.
                 property bool followEnd: true
-                function stickToEnd() { followEnd = true; Qt.callLater(() => list.positionViewAtEnd()); }
-                onContentHeightChanged: if (followEnd) Qt.callLater(() => list.positionViewAtEnd())
-                onHeightChanged: if (followEnd) Qt.callLater(() => list.positionViewAtEnd())
+                function stickToEnd() { followEnd = true; msgPhys.stopPhysics(); Qt.callLater(() => list.positionViewAtEnd()); }
+                onContentHeightChanged: if (followEnd && !msgPhys.busy) Qt.callLater(() => list.positionViewAtEnd())
+                onHeightChanged: if (followEnd && !msgPhys.busy) Qt.callLater(() => list.positionViewAtEnd())
                 onMovementEnded: followEnd = atYEnd
                                 onContentYChanged: {
-                                    // wheel, drag and scrollbar all move contentY; growth alone doesn't
-                                    followEnd = atYEnd;
+                                    // wheel, drag and scrollbar all move contentY; growth alone doesn't.
+                                    // A bounce past the end still counts as at the end.
+                                    followEnd = contentY >= msgPhys.maxY - 2;
+                                    root.picker = null;
                                     if (contentY <= originY + 40 && root.msgs.length >= 200 && !loadingOlder.running) {
                                         loadingOlder.start();
                                         root.send({ op: "older", thread: root.current, before: root.msgs[0].ts });
@@ -704,7 +868,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fCaption
                                         }
 
-                                        // attachments
+                                        // attachments: click selects, Space or a double-click previews
                                         Repeater {
                                             model: msgItem.m.attachments || []
                                             delegate: Item {
@@ -713,9 +877,18 @@ ShellRoot {
                                                 readonly property var st: root.attachments[modelData.guid] || ({})
                                                 readonly property bool isImage: (modelData.mime || "").indexOf("image/") === 0
                                                                                && modelData.size < 25000000
+                                                readonly property bool isVideo: root.isVideo(modelData)
+                                                readonly property bool selected: root.selAtt === modelData.guid
                                                 width: col.width
                                                 height: isImage && st.path ? img.height : fileChip.height
-                                                Component.onCompleted: if (isImage) root.needAttachment(modelData)
+                                                // Photos load by themselves (to the temp folder when far up the
+                                                // conversation); videos only when you ask to see one.
+                                                Component.onCompleted: if (isImage) root.needAttachment(modelData, msgItem.index)
+
+                                                function hover(on) {
+                                                    if (on) root.hoverAtt = { att: attItem.modelData, index: msgItem.index };
+                                                    else if (root.hoverAtt && root.hoverAtt.att.guid === attItem.modelData.guid) root.hoverAtt = null;
+                                                }
 
                                                 Image {
                                                     id: img
@@ -729,10 +902,19 @@ ShellRoot {
                                                     width: status === Image.Ready ? Math.min(280, list.bubbleMax, 340 / Math.max(0.01, aspect)) : 200
                                                     height: status === Image.Ready ? width * aspect : 120
                                                     sourceSize.width: 600
-                                                    MouseArea {
+                                                    HoverHandler { cursorShape: Qt.PointingHandCursor; onHoveredChanged: attItem.hover(hovered) }
+                                                    TapHandler {
+                                                        onTapped: root.selAtt = attItem.modelData.guid
+                                                        onDoubleTapped: root.previewAttachment(attItem.modelData, msgItem.index)
+                                                    }
+                                                    Rectangle {
                                                         anchors.fill: parent
-                                                        cursorShape: Qt.PointingHandCursor
-                                                        onClicked: Qt.openUrlExternally("file://" + attItem.st.path)
+                                                        anchors.margins: -3
+                                                        visible: attItem.selected
+                                                        color: "transparent"
+                                                        radius: Theme.radius
+                                                        border.width: 2
+                                                        border.color: Theme.accent
                                                     }
                                                 }
                                                 Rectangle {
@@ -742,9 +924,9 @@ ShellRoot {
                                                     width: Math.min(list.bubbleMax, fileText.implicitWidth + 28)
                                                     height: 40
                                                     radius: Theme.radius
-                                                    color: Theme.panel
-                                                    border.width: 1
-                                                    border.color: Theme.line
+                                                    color: chipHover.hovered ? Theme.hover : Theme.panel
+                                                    border.width: attItem.selected ? 2 : 1
+                                                    border.color: attItem.selected ? Theme.accent : Theme.line
                                                     Text {
                                                         id: fileText
                                                         anchors.fill: parent
@@ -752,19 +934,17 @@ ShellRoot {
                                                         anchors.rightMargin: 14
                                                         verticalAlignment: Text.AlignVCenter
                                                         elide: Text.ElideMiddle
-                                                        text: (attItem.st.loading ? "Loading " : attItem.st.error ? "Couldn't load " : "📎 ")
+                                                        text: (attItem.st.loading ? "Loading… " : attItem.st.error ? "Couldn't load " : attItem.isVideo ? "▶  " : "📎  ")
                                                               + (attItem.modelData.name || "Attachment")
+                                                              + (attItem.modelData.size ? "  ·  " + root.fmtSize(attItem.modelData.size) : "")
                                                         color: attItem.st.error ? Theme.danger : Theme.fg
                                                         font.family: Theme.uiFont
                                                         font.pixelSize: Theme.fSmall
                                                     }
-                                                    MouseArea {
-                                                        anchors.fill: parent
-                                                        cursorShape: Qt.PointingHandCursor
-                                                        onClicked: {
-                                                            if (attItem.st.path) Qt.openUrlExternally("file://" + attItem.st.path);
-                                                            else { root.pendingOpen = attItem.modelData.guid; root.needAttachment(attItem.modelData); }
-                                                        }
+                                                    HoverHandler { id: chipHover; cursorShape: Qt.PointingHandCursor; onHoveredChanged: attItem.hover(hovered) }
+                                                    TapHandler {
+                                                        onTapped: root.selAtt = attItem.modelData.guid
+                                                        onDoubleTapped: root.previewAttachment(attItem.modelData, msgItem.index)
                                                     }
                                                 }
                                             }
@@ -772,9 +952,11 @@ ShellRoot {
 
                                         // the bubble
                                         Item {
+                                            id: bubbleRow
                                             visible: msgItem.m.text !== ""
                                             width: parent.width
                                             height: bubble.height + (msgItem.reacts.length ? 10 : 0)
+                                            HoverHandler { id: bubbleHover }
 
                                             Rectangle {
                                                 id: bubble
@@ -785,6 +967,49 @@ ShellRoot {
                                                 radius: Math.max(Theme.radius, 4)
                                                 color: msgItem.mine ? (msgItem.m.status === "failed" ? Theme.danger : Theme.accent) : Theme.panel
                                                 opacity: msgItem.m.status === "sending" ? 0.6 : 1
+                                                transformOrigin: msgItem.mine ? Item.BottomRight : Item.BottomLeft
+
+                                                // ---- bubble effects
+                                                readonly property string effect: msgItem.m.effect || ""
+                                                readonly property bool ink: effect.endsWith("invisibleink")
+                                                property bool revealed: false
+                                                readonly property bool inkHidden: ink && !revealed && !bubbleHover.hovered
+                                                readonly property real fxNonce: root.fxPlay[msgItem.m.id] || 0
+                                                onFxNonceChanged: if (fxNonce) runEffect()
+                                                function runEffect() {
+                                                    if (effect.endsWith("impact")) slamAnim.restart();
+                                                    else if (effect.endsWith("loud")) loudAnim.restart();
+                                                    else if (effect.endsWith("gentle")) gentleAnim.restart();
+                                                    else if (ink) { revealed = false; inkAnim.restart(); }
+                                                }
+                                                SequentialAnimation {
+                                                    id: slamAnim
+                                                    NumberAnimation { target: bubble; property: "scale"; from: 2.6; to: 1; duration: 380; easing.type: Easing.OutBack; easing.overshoot: 2.4 }
+                                                    SequentialAnimation {
+                                                        loops: 2
+                                                        NumberAnimation { target: list; property: "anchors.leftMargin"; to: 22; duration: 40 }
+                                                        NumberAnimation { target: list; property: "anchors.leftMargin"; to: 10; duration: 40 }
+                                                    }
+                                                    NumberAnimation { target: list; property: "anchors.leftMargin"; to: 16; duration: 40 }
+                                                }
+                                                SequentialAnimation {
+                                                    id: loudAnim
+                                                    NumberAnimation { target: bubble; property: "scale"; from: 1; to: 2.1; duration: 160; easing.type: Easing.OutQuad }
+                                                    SequentialAnimation {
+                                                        loops: 3
+                                                        NumberAnimation { target: bubble; property: "rotation"; to: -4; duration: 55 }
+                                                        NumberAnimation { target: bubble; property: "rotation"; to: 4; duration: 55 }
+                                                    }
+                                                    NumberAnimation { target: bubble; property: "rotation"; to: 0; duration: 50 }
+                                                    PauseAnimation { duration: 220 }
+                                                    NumberAnimation { target: bubble; property: "scale"; to: 1; duration: 320; easing.type: Easing.OutBack }
+                                                }
+                                                ParallelAnimation {
+                                                    id: gentleAnim
+                                                    NumberAnimation { target: bubble; property: "scale"; from: 0.35; to: 1; duration: 1600; easing.type: Easing.InOutSine }
+                                                    NumberAnimation { target: body; property: "opacity"; from: 0.15; to: 1; duration: 1600 }
+                                                }
+                                                NumberAnimation { id: inkAnim; target: inkDots; property: "opacity"; from: 0; to: 1; duration: 500 }
 
                                                 Text {
                                                     id: measure
@@ -798,7 +1023,7 @@ ShellRoot {
                                                     y: 8
                                                     width: bubble.width - 28
                                                     readOnly: true
-                                                    selectByMouse: true
+                                                    selectByMouse: !bubble.inkHidden
                                                     wrapMode: TextEdit.Wrap
                                                     textFormat: TextEdit.RichText
                                                     text: root.linkify(msgItem.m.text, msgItem.mine ? Theme.bg : Theme.accent)
@@ -808,12 +1033,61 @@ ShellRoot {
                                                     font.family: Theme.uiFont
                                                     font.pixelSize: Theme.fBody
                                                     onLinkActivated: link => Qt.openUrlExternally(link)
+                                                    // Invisible Ink: blurred away until the pointer is on it.
+                                                    layer.enabled: bubble.inkHidden
+                                                    layer.effect: MultiEffect { blurEnabled: true; blur: 1.0; blurMax: 48; saturation: -1 }
                                                     HoverHandler {
                                                         enabled: body.hoveredLink !== ""
                                                         cursorShape: Qt.PointingHandCursor
                                                     }
                                                 }
+                                                // the ink's shimmer
+                                                Item {
+                                                    id: inkDots
+                                                    anchors.fill: parent
+                                                    anchors.margins: 6
+                                                    clip: true
+                                                    visible: bubble.inkHidden
+                                                    Repeater {
+                                                        model: bubble.ink ? 36 : 0
+                                                        Rectangle {
+                                                            required property int index
+                                                            width: 2; height: 2; radius: 1
+                                                            color: msgItem.mine ? Theme.bg : Theme.fg
+                                                            x: Math.random() * inkDots.width
+                                                            y: Math.random() * inkDots.height
+                                                            SequentialAnimation on opacity {
+                                                                loops: Animation.Infinite
+                                                                running: bubble.inkHidden
+                                                                PauseAnimation { duration: Math.random() * 900 }
+                                                                NumberAnimation { from: 0.1; to: 0.9; duration: 500 + Math.random() * 500 }
+                                                                NumberAnimation { from: 0.9; to: 0.1; duration: 500 + Math.random() * 500 }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
+
+                                            // react button, beside the bubble while the pointer is on it
+                                            Rectangle {
+                                                visible: (bubbleHover.hovered || (!!root.picker && root.picker.id === msgItem.m.id))
+                                                         && msgItem.m.status !== "sending"
+                                                width: 28; height: 28; radius: 14
+                                                anchors.verticalCenter: bubble.verticalCenter
+                                                x: msgItem.mine ? bubble.x - width - 6 : bubble.x + bubble.width + 6
+                                                color: reactHover.hovered ? Theme.hover : Theme.bg
+                                                border.width: 1
+                                                border.color: Theme.line
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: "☺"
+                                                    color: root.reactBlock(msgItem.m) ? Theme.faint : Theme.fg
+                                                    font.pixelSize: Theme.fBody
+                                                }
+                                                HoverHandler { id: reactHover; cursorShape: Qt.PointingHandCursor }
+                                                TapHandler { onTapped: root.openPicker(msgItem.m, bubble) }
+                                            }
+
                                             Rectangle {
                                                 visible: msgItem.reacts.length > 0
                                                 anchors.top: parent.top
@@ -824,7 +1098,7 @@ ShellRoot {
                                                 radius: 11
                                                 color: Theme.bg
                                                 border.width: 1
-                                                border.color: Theme.line
+                                                border.color: (msgItem.m.reactions || {}).me ? Theme.accent : Theme.line
                                                 Row {
                                                     id: reactRow
                                                     anchors.centerIn: parent
@@ -834,11 +1108,28 @@ ShellRoot {
                                                         Text {
                                                             required property var modelData
                                                             text: root.reactionGlyph(msgItem.m.reactions[modelData])
-                                                            color: Theme.fg
+                                                            color: modelData === "me" ? Theme.accent : Theme.fg
                                                             font.pixelSize: Theme.fSmall
                                                         }
                                                     }
                                                 }
+                                            }
+                                        }
+
+                                        // "Sent with Slam · Replay" - click to watch it again
+                                        Text {
+                                            visible: !!root.effectNames[msgItem.m.effect || ""]
+                                            anchors.right: msgItem.mine ? parent.right : undefined
+                                            leftPadding: 4
+                                            rightPadding: 4
+                                            text: (msgItem.mine ? "Sent with " : "") + (root.effectNames[msgItem.m.effect || ""] || "") + " · Replay"
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.playEffect(msgItem.m)
                                             }
                                         }
 
@@ -851,7 +1142,8 @@ ShellRoot {
                                                 const via = msgItem.m.via === "iphone" ? " · via iPhone" : "";
                                                 if (s === "failed") return "Not delivered — click to retry" + (msgItem.m.error ? "  (" + msgItem.m.error + ")" : "");
                                                 if (s === "sending") return "Sending…";
-                                                return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via;
+                                                return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via
+                                                       + (msgItem.m.error ? " — " + msgItem.m.error : "");
                                             }
                                             color: msgItem.m.status === "failed" ? Theme.danger : Theme.dim
                                             font.family: Theme.uiFont
@@ -909,6 +1201,152 @@ ShellRoot {
                                                 x: 12
                                                 Text { text: modelData.name; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fBody }
                                                 Text { text: modelData.addr; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            ScreenEffects { id: screenFx }
+
+                            // click anywhere else closes a picker
+                            MouseArea {
+                                anchors.fill: parent
+                                z: 60
+                                visible: !!root.picker || root.effectPickerOpen
+                                onClicked: { root.picker = null; root.effectPickerOpen = false; }
+                                onWheel: wheel => { root.picker = null; root.effectPickerOpen = false; wheel.accepted = false; }
+                            }
+
+                            // ---- reaction picker
+                            Rectangle {
+                                id: pickerBox
+                                z: 61
+                                visible: !!root.picker
+                                readonly property string block: root.picker ? root.reactBlock(root.picker.m) : ""
+                                readonly property string mine: root.picker ? ((root.picker.m.reactions || {}).me || "") : ""
+                                width: block ? Math.max(pickRow.implicitWidth, 300) + 20 : pickRow.implicitWidth + 20
+                                height: pickCol.implicitHeight + 20
+                                x: root.picker ? Math.max(8, Math.min(msgArea.width - width - 8,
+                                       root.picker.mine ? root.picker.x + root.picker.w - width : root.picker.x)) : 0
+                                y: root.picker ? Math.max(8, root.picker.y - height - 8) : 0
+                                radius: Math.max(Theme.radius, 8)
+                                color: Theme.bg
+                                border.width: 1
+                                border.color: Theme.line
+                                Column {
+                                    id: pickCol
+                                    x: 10; y: 10
+                                    spacing: 8
+                                    Row {
+                                        id: pickRow
+                                        spacing: 4
+                                        Repeater {
+                                            model: root.reactionKinds
+                                            Rectangle {
+                                                required property string modelData
+                                                width: 38; height: 38; radius: 19
+                                                opacity: pickerBox.block ? 0.35 : 1
+                                                color: pickerBox.mine === modelData ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.3)
+                                                     : kindHover.hovered && !pickerBox.block ? Theme.hover : "transparent"
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: root.reactionGlyph(parent.modelData)
+                                                    color: Theme.fg
+                                                    font.pixelSize: Theme.fBody + 4
+                                                }
+                                                HoverHandler { id: kindHover; cursorShape: pickerBox.block ? Qt.ForbiddenCursor : Qt.PointingHandCursor }
+                                                TapHandler {
+                                                    enabled: !pickerBox.block
+                                                    onTapped: {
+                                                        root.send({ op: "react", message: root.picker.id, reaction: parent.modelData });
+                                                        root.picker = null;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        visible: pickerBox.block !== ""
+                                        width: pickerBox.width - 20
+                                        wrapMode: Text.WordWrap
+                                        text: pickerBox.block
+                                        color: Theme.dim
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fCaption
+                                    }
+                                }
+                            }
+
+                            // ---- effect picker (above the composer)
+                            Rectangle {
+                                id: effectBox
+                                z: 61
+                                visible: root.effectPickerOpen
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                                anchors.margins: 12
+                                width: 400
+                                height: effCol.implicitHeight + 28
+                                radius: Math.max(Theme.radius, 8)
+                                color: Theme.bg
+                                border.width: 1
+                                border.color: Theme.line
+                                Column {
+                                    id: effCol
+                                    x: 14; y: 14
+                                    width: effectBox.width - 28
+                                    spacing: 8
+                                    Text {
+                                        text: "Send with effect"
+                                        color: Theme.fg
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fBody
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        visible: !root.abilities.effects
+                                        width: parent.width
+                                        wrapMode: Text.WordWrap
+                                        text: root.abilities.reason
+                                        color: Theme.dim
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fCaption
+                                    }
+                                    Text { text: "Bubble"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Flow {
+                                        width: parent.width
+                                        spacing: 6
+                                        Repeater {
+                                            model: root.bubbleEffects
+                                            AppButton {
+                                                required property string modelData
+                                                text: root.effectNames[modelData]
+                                                fontSize: Theme.fSmall
+                                                enabled: root.abilities.effects
+                                                selected: root.pendingEffect === modelData
+                                                onClicked: { root.pendingEffect = modelData; root.effectPickerOpen = false; composer.forceActiveFocus(); }
+                                            }
+                                        }
+                                    }
+                                    Text { text: "Screen"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Flow {
+                                        width: parent.width
+                                        spacing: 6
+                                        Repeater {
+                                            model: root.screenEffects
+                                            AppButton {
+                                                required property string modelData
+                                                text: root.effectNames[modelData]
+                                                fontSize: Theme.fSmall
+                                                enabled: root.abilities.effects
+                                                selected: root.pendingEffect === modelData
+                                                onClicked: {
+                                                    root.pendingEffect = modelData;
+                                                    root.effectPickerOpen = false;
+                                                    screenFx.play(modelData, composer.text);   // a preview of what they'll see
+                                                    composer.forceActiveFocus();
+                                                }
                                             }
                                         }
                                     }
@@ -978,12 +1416,55 @@ ShellRoot {
                                         topPadding: 9
                                         bottomPadding: 9
                                         Keys.onPressed: function (ev) {
+                                            if (ev.key === Qt.Key_Space && composer.text === "" && (root.builtinPreview || root.spacePreview())) {
+                                                if (root.builtinPreview) root.builtinPreview = "";
+                                                ev.accepted = true;
+                                                return;
+                                            }
+                                            if (ev.key === Qt.Key_Escape && (root.builtinPreview || root.picker || root.effectPickerOpen)) {
+                                                root.builtinPreview = ""; root.picker = null; root.effectPickerOpen = false;
+                                                ev.accepted = true;
+                                                return;
+                                            }
                                             if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && !(ev.modifiers & Qt.ShiftModifier)) {
                                                 root.sendCurrent();
                                                 ev.accepted = true;
                                             }
                                         }
                                     }
+                                }
+                                Rectangle {
+                                    Layout.alignment: Qt.AlignBottom
+                                    visible: root.pendingEffect !== ""
+                                    implicitHeight: 34
+                                    implicitWidth: fxChip.implicitWidth + 34
+                                    radius: Theme.radius
+                                    color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
+                                    Text {
+                                        id: fxChip
+                                        x: 10
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "✦ " + (root.effectNames[root.pendingEffect] || "")
+                                        color: Theme.fg
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fSmall
+                                    }
+                                    Text {
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 8
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "×"
+                                        color: Theme.dim
+                                        font.pixelSize: Theme.fBody
+                                        TapHandler { onTapped: root.pendingEffect = "" }
+                                    }
+                                }
+                                AppButton {
+                                    Layout.alignment: Qt.AlignBottom
+                                    text: "✦"
+                                    selected: root.effectPickerOpen
+                                    tooltipText: root.abilities.effects ? "Send with effect" : root.abilities.reason
+                                    onClicked: { root.picker = null; root.effectPickerOpen = !root.effectPickerOpen; }
                                 }
                                 AppButton {
                                     Layout.alignment: Qt.AlignBottom
@@ -1008,8 +1489,14 @@ ShellRoot {
                             anchors.fill: parent
                             contentHeight: settingsCol.implicitHeight + 40
                             clip: true
-                            boundsBehavior: Flickable.StopAtBounds
+                            interactive: false
                             ScrollBar.vertical: AppScrollBar {}
+                            ScrollPhysics { id: settingsPhys; flick: settingsFlick }
+                            WheelHandler {
+                                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                onWheel: ev => settingsPhys.wheel(ev)
+                            }
+                            function stopPhysics() { settingsPhys.stopPhysics(); }
 
                             ColumnLayout {
                                 id: settingsCol
@@ -1452,10 +1939,30 @@ ShellRoot {
             { id: 2, thread: "addr:1", fromMe: true, text: "Yes! The new ramen place on King St — https://example.com/ramen", ts: now - 7300, status: "read", via: "bluebubbles", attachments: [], reactions: { "+44": "love" } },
             { id: 3, thread: "addr:1", fromMe: false, sender: "+44", text: "Perfect. What time works for you?", ts: now - 300, status: "", attachments: [], reactions: {} },
             { id: 4, thread: "addr:1", fromMe: true, text: "7?", ts: now - 200, status: "delivered", via: "iphone", attachments: [], reactions: {} },
-            { id: 5, thread: "addr:1", fromMe: false, sender: "+44", text: "Sounds good, see you at 7!", ts: now - 120, status: "", attachments: [], reactions: {} }
+            { id: 5, thread: "addr:1", fromMe: false, sender: "+44", text: "Sounds good, see you at 7!", ts: now - 120, status: "", attachments: [], reactions: { me: "like" }, guid: "G5",
+              effect: "com.apple.MobileSMS.expressivesend.impact" },
+            { id: 6, thread: "addr:1", fromMe: false, sender: "+44", text: "", ts: now - 100, status: "", reactions: {}, guid: "G6",
+              attachments: [{ guid: "A6", mime: "video/quicktime", name: "IMG_4412.MOV", size: 48200000 }] },
+            { id: 7, thread: "addr:1", fromMe: true, text: "psst — the surprise is at 8", ts: now - 60, status: "delivered", via: "bluebubbles", reactions: {}, guid: "G7",
+              attachments: [], effect: "com.apple.MobileSMS.expressivesend.invisibleink" }
         ];
         if (root.preview === "settings" || root.preview === "pair") root.settingsOpen = true;
         if (root.preview === "pair") root.pair = { stage: "confirm", device: "Alex’s iPhone", code: "436952" };
+        const reason = "Reactions and effects need BlueBubbles. You're connected through your iPhone over Bluetooth, which only carries plain text.";
+        if (root.preview === "react" || root.preview === "effects" || root.preview === "iphone") {
+            root.status = Object.assign({}, root.status, { route: "iphone", abilities: { reactions: false, effects: false, reason: reason } });
+        } else {
+            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, reason: "" } });
+        }
+        if (root.preview === "effects") root.effectPickerOpen = true;
+        if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
+        if (root.preview === "reactok") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
+        // fx_<Name>: play that screen effect, e.g. PEAR_MESSAGES_PREVIEW=fx_Confetti
+        if (root.preview.indexOf("fx_") === 0) {
+            const want = root.preview.slice(3).replace(/_/g, " ");
+            const id = Object.keys(root.effectNames).find(k => root.effectNames[k] === want);
+            if (id) Qt.callLater(() => screenFx.play(id, "Happy birthday!"));
+        }
         if (root.preview === "compose") { root.composing = true; root.current = ""; root.msgs = []; root.searchResults = [{ name: "Sam Rivera", addr: "+44 7700 900123" }, { name: "Sam Okafor", addr: "sam@example.com" }]; }
         if (root.snapshotPath) snapshotTimer.start();
     }

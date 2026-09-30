@@ -249,7 +249,7 @@ class Daemon:
             self._notify(rid)
 
     # ----------------------------------------------------------------- send
-    def send(self, thread: str, text: str, to: str = "") -> dict:
+    def send(self, thread: str, text: str, to: str = "", effect: str = "") -> dict:
         text = (text or "").strip()
         if not text:
             return {"ok": False, "error": "Nothing to send"}
@@ -262,12 +262,14 @@ class Daemon:
             address = to or t["participants"][0]
         if not t:
             self.store.ensure_thread(thread, participants=[address] if address else [])
+        if effect and not self.abilities()["effects"]:
+            effect = ""
         temp = BB.new_temp_guid()
         _, rid = self.store.ingest({
             "temp_id": temp, "thread": thread, "from_me": True, "text": text,
-            "ts": time.time(), "status": "sending"}, "local")
+            "ts": time.time(), "status": "sending", "effect": effect}, "local")
         self._after_ingest({thread: [rid]}, [])
-        self._route(rid, thread, address, group, text, temp, (t or {}).get("bbChat", ""))
+        self._route(rid, thread, address, group, text, temp, (t or {}).get("bbChat", ""), effect)
         return {"ok": True, "id": rid, "thread": thread}
 
     def retry(self, rid: int) -> None:
@@ -280,9 +282,10 @@ class Daemon:
         temp = self.store.db.execute("SELECT temp_id FROM messages WHERE id=?", (rid,)).fetchone()[0] \
             or BB.new_temp_guid()
         addr = (t.get("participants") or [""])[0] if not t.get("group") else ""
-        self._route(rid, m["thread"], addr, bool(t.get("group")), m["text"], temp, t.get("bbChat", ""))
+        self._route(rid, m["thread"], addr, bool(t.get("group")), m["text"], temp, t.get("bbChat", ""),
+                    m.get("effect", ""))
 
-    def _route(self, rid, thread, address, group, text, temp, bb_chat) -> None:
+    def _route(self, rid, thread, address, group, text, temp, bb_chat, effect: str = "") -> None:
         def fail(err):
             self.store.set_status(rid, "failed", err)
             self._after_ingest({thread: [rid]}, [])
@@ -295,7 +298,12 @@ class Daemon:
 
             def done(ok, err):
                 if ok:
-                    self.store.set_status(rid, "sent", "", via="iphone")
+                    note = ""
+                    if effect:
+                        # The iPhone's Bluetooth link carries plain text only.
+                        self.store.set_effect(rid, "")
+                        note = "Sent without the effect: BlueBubbles couldn't send it, and the iPhone can't send effects over Bluetooth"
+                    self.store.set_status(rid, "sent", note, via="iphone")
                     self._after_ingest({thread: [rid]}, [])
                 else:
                     fail(err)
@@ -309,9 +317,9 @@ class Daemon:
                 started_ms = int(time.time() * 1000)
                 try:
                     if bb_chat:
-                        res = client.send(bb_chat, text, temp, private)
+                        res = client.send(bb_chat, text, temp, private, effect)
                     elif address:
-                        res = client.new_chat(address, text, temp, private)
+                        res = client.new_chat(address, text, temp, private, effect)
                     else:
                         raise BB.BBError("No address for this conversation")
                     GLib.idle_add(ok_bb, res)
@@ -344,6 +352,63 @@ class Daemon:
             threading.Thread(target=work, daemon=True).start()
         else:
             via_phone()
+
+    # ------------------------------------------------------- reactions / effects
+    def abilities(self) -> dict:
+        """What can be sent beyond text right now, and if nothing, why - in words for the UI."""
+        creds = _read_json(BB_CREDS, {})
+        if self.bb_online and self.bb_info.get("private_api"):
+            return {"reactions": True, "effects": True, "reason": ""}
+        if self.bb_online:
+            reason = ("Reactions and effects need BlueBubbles' Private API, which is off on your Mac. "
+                      "Turn it on in BlueBubbles Server → Settings → Private API (it needs System "
+                      "Integrity Protection turned off on the Mac).")
+        elif self.phone_state.get("state") == "online":
+            reason = ("Reactions and effects need BlueBubbles. You're connected through your iPhone "
+                      "over Bluetooth, which only carries plain text.")
+            if creds.get("url") and self.settings["bluebubbles"]["enabled"]:
+                reason += " BlueBubbles is offline right now."
+        else:
+            reason = "Not connected."
+        return {"reactions": False, "effects": False, "reason": reason}
+
+    def react(self, c, rid, mid: int, kind: str) -> None:
+        m = self.store.message(mid)
+        ab = self.abilities()
+        if not m:
+            return
+        err = ""
+        if not ab["reactions"]:
+            err = ab["reason"]
+        elif not m["guid"]:
+            err = ("This message only came through your iPhone, so the Mac doesn't know it yet. "
+                   "Try again in a moment.")
+        t = self.store.thread(m["thread"]) or {}
+        if not err and not t.get("bbChat"):
+            err = "BlueBubbles doesn't know this conversation yet."
+        if err:
+            self._send(c, {"ev": "error", "re": rid, "error": err})
+            return
+        before = (m["reactions"] or {}).get("me", "")
+        new = "" if kind == before else kind
+        wire = new or ("-" + before)
+        self.store.react(m["guid"], "me", new)
+        self._after_ingest({m["thread"]: [mid]}, [])
+        client = self.client
+
+        def work():
+            try:
+                if before and new:           # swap: take the old one back first
+                    client.react(t["bbChat"], m["guid"], m["text"], "-" + before)
+                client.react(t["bbChat"], m["guid"], m["text"], wire)
+            except BB.BBError as e:
+                def undo(e=e):
+                    self.store.react(m["guid"], "me", before)
+                    self._after_ingest({m["thread"]: [mid]}, [])
+                    self._send(c, {"ev": "error", "re": rid, "error": f"Couldn't react: {e}"})
+                    return False
+                GLib.idle_add(undo)
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ notifications
     def _notify(self, rid: int) -> None:
@@ -423,6 +488,7 @@ class Daemon:
                 "paired": phones,
             },
             "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview")},
+            "abilities": self.abilities(),
             "pairing": self.pairing.active,
         }
 
@@ -534,13 +600,19 @@ class Daemon:
             reply({"ev": "older", "thread": tid,
                    "messages": self.store.messages(tid, 200, float(req["before"]))})
         elif op == "send":
-            reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""))})
+            reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""),
+                                             req.get("effect", ""))})
+        elif op == "react":
+            self.react(c, rid, int(req["message"]), req.get("reaction", ""))
         elif op == "retry":
             self.retry(int(req["message"]))
         elif op == "search":
             reply({"ev": "search", "q": req.get("q", ""), "results": self.store.search_contacts(req.get("q", ""))})
         elif op == "attachment":
-            self._attachment(c, rid, req["guid"], req.get("name", ""))
+            self._attachment(c, rid, req["guid"], req.get("name", ""), req.get("mime", ""),
+                             bool(req.get("temp")))
+        elif op == "preview":
+            self._preview(c, rid, req.get("path", ""))
         # ---- settings / connection assistant
         elif op == "settings":
             for k in ("notifications", "notificationPreview"):
@@ -628,17 +700,30 @@ class Daemon:
             GLib.idle_add(lambda: (self._send(c, {"ev": "bb_found", "re": rid, "servers": found}), False)[1])
         threading.Thread(target=work, daemon=True).start()
 
-    def _attachment(self, c, rid, guid, name) -> None:
-        d = os.path.join(CACHE, "attachments")
-        os.makedirs(d, exist_ok=True)
+    def _attachment(self, c, rid, guid, name, mime="", temp=False) -> None:
+        """Download an attachment from BlueBubbles.
+
+        Where it goes: videos, and anything the app marks `temp` (photos far up a conversation),
+        land in the runtime directory - memory-backed, gone at logout - so scrolling back
+        through years of history never fills the disk. Recent photos are kept in the cache.
+        """
         safe = "".join(ch for ch in (name or "file") if ch.isalnum() or ch in "._- ")[:80] or "file"
-        path = os.path.join(d, f"{guid[:16]}-{safe}")
-        if os.path.exists(path):
-            self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "path": path})
-            return
+        fname = f"{guid[:16]}-{safe}"
+        keep_dir = os.path.join(CACHE, "attachments")
+        temp_dir = os.path.join(RUNTIME, "attachments")
+        is_video = (mime or "").startswith("video/") or safe.lower().endswith(
+            (".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm", ".3gp"))
+        for d in (keep_dir, temp_dir):
+            if os.path.exists(os.path.join(d, fname)):
+                self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "path": os.path.join(d, fname)})
+                return
+        d = temp_dir if (temp or is_video) else keep_dir
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        path = os.path.join(d, fname)
         client = self.client
         if not client:
-            self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "error": "BlueBubbles is offline"})
+            self._send(c, {"ev": "attachment", "re": rid, "guid": guid,
+                           "error": "Attachments come from BlueBubbles, which is offline"})
             return
 
         def work():
@@ -647,11 +732,38 @@ class Daemon:
                 with open(path + ".part", "wb") as f:
                     f.write(data)
                 os.replace(path + ".part", path)
-                res = {"path": path}
+                res = {"path": path, "temp": d == temp_dir}
             except (BB.BBError, OSError) as e:
                 res = {"error": str(e)}
             GLib.idle_add(lambda: (self._send(c, {"ev": "attachment", "re": rid, "guid": guid, **res}), False)[1])
         threading.Thread(target=work, daemon=True).start()
+
+    def _preview(self, c, rid, path: str) -> None:
+        """Quick Look: GNOME's previewer (Sushi) when it's there. Calling it again on the same
+        file closes it, which is what a second press of Space should do. Without Sushi the app
+        shows its own preview."""
+        if not path or not os.path.exists(path):
+            return
+        if self._has_previewer():
+            import urllib.parse
+            uri = "file://" + urllib.parse.quote(path)
+            try:
+                prev = self.ses.get_object("org.gnome.NautilusPreviewer", "/org/gnome/NautilusPreviewer")
+                dbus.Interface(prev, "org.gnome.NautilusPreviewer2").ShowFile(
+                    uri, "", True, "", reply_handler=lambda: None,
+                    error_handler=lambda e: self._send(c, {"ev": "preview", "re": rid, "path": path, "builtin": True}))
+                return
+            except dbus.DBusException:
+                pass
+        self._send(c, {"ev": "preview", "re": rid, "path": path, "builtin": True})
+
+    def _has_previewer(self) -> bool:
+        try:
+            d = dbus.Interface(self.ses.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+                               "org.freedesktop.DBus")
+            return "org.gnome.NautilusPreviewer" in (list(d.ListActivatableNames()) + list(d.ListNames()))
+        except dbus.DBusException:
+            return False
 
     # -------------------------------------------------------------------- run
     def run(self) -> None:

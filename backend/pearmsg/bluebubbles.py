@@ -108,15 +108,26 @@ class Client:
             })
         return out
 
-    def send(self, chat_guid: str, text: str, temp_guid: str, private_api: bool) -> dict:
-        return self._req("POST", "/message/text", {
-            "chatGuid": chat_guid, "tempGuid": temp_guid, "message": text,
-            "method": "private-api" if private_api else "apple-script"}, timeout=20) or {}
+    def send(self, chat_guid: str, text: str, temp_guid: str, private_api: bool, effect: str = "") -> dict:
+        body = {"chatGuid": chat_guid, "tempGuid": temp_guid, "message": text,
+                "method": "private-api" if private_api else "apple-script"}
+        if effect:
+            body["effectId"] = effect   # only the Private API can send effects
+        return self._req("POST", "/message/text", body, timeout=20) or {}
 
-    def new_chat(self, address: str, text: str, temp_guid: str, private_api: bool) -> dict:
-        return self._req("POST", "/chat/new", {
-            "addresses": [address], "message": text, "tempGuid": temp_guid, "service": "iMessage",
-            "method": "private-api" if private_api else "apple-script"}, timeout=20) or {}
+    def new_chat(self, address: str, text: str, temp_guid: str, private_api: bool, effect: str = "") -> dict:
+        body = {"addresses": [address], "message": text, "tempGuid": temp_guid, "service": "iMessage",
+                "method": "private-api" if private_api else "apple-script"}
+        if effect:
+            body["effectId"] = effect
+        return self._req("POST", "/chat/new", body, timeout=20) or {}
+
+    def react(self, chat_guid: str, message_guid: str, message_text: str, reaction: str) -> dict:
+        """reaction: love like dislike laugh emphasize question, or '-love' etc. to take one back.
+        BlueBubbles can only do this through its Private API."""
+        return self._req("POST", "/message/react", {
+            "chatGuid": chat_guid, "selectedMessageGuid": message_guid,
+            "selectedMessageText": message_text, "reaction": reaction, "partIndex": 0}, timeout=20) or {}
 
     def mark_read(self, chat_guid: str) -> None:
         self._req("POST", f"/chat/{urllib.parse.quote(chat_guid, safe='')}/read", {})
@@ -124,6 +135,31 @@ class Client:
     def attachment(self, guid: str) -> bytes:
         return self._req("GET", f"/attachment/{urllib.parse.quote(guid, safe='')}/download",
                          raw=True, timeout=120)
+
+
+# iMessage effects, by the id Messages stores. Bubble effects animate one message; screen
+# effects fill the conversation.
+EFFECTS = {
+    "com.apple.MobileSMS.expressivesend.impact": "Slam",
+    "com.apple.MobileSMS.expressivesend.loud": "Loud",
+    "com.apple.MobileSMS.expressivesend.gentle": "Gentle",
+    "com.apple.MobileSMS.expressivesend.invisibleink": "Invisible Ink",
+    "com.apple.messages.effect.CKEchoEffect": "Echo",
+    "com.apple.messages.effect.CKSpotlightEffect": "Spotlight",
+    "com.apple.messages.effect.CKHappyBirthdayEffect": "Balloons",
+    "com.apple.messages.effect.CKConfettiEffect": "Confetti",
+    "com.apple.messages.effect.CKHeartEffect": "Love",
+    "com.apple.messages.effect.CKLasersEffect": "Lasers",
+    "com.apple.messages.effect.CKFireworksEffect": "Fireworks",
+    "com.apple.messages.effect.CKSparklesEffect": "Celebration",
+    "com.apple.messages.effect.CKShootingStarEffect": "Shooting Star",
+}
+
+
+def _emoji_from_text(text: str) -> str:
+    import re
+    m = re.match(r"^Reacted (\S+) to", text or "")
+    return m.group(1) if m else ""
 
 
 def new_temp_guid() -> str:
@@ -155,17 +191,22 @@ def to_message(m: dict) -> dict | None:
     atype = m.get("associatedMessageType")
     if assoc and atype not in (None, 0, "0"):
         target = assoc.split("/", 1)[-1]  # "p:0/GUID" -> GUID
-        kind = ""
+        # Servers send the type as a number (2000) or a string ("love", "-love", "2006").
+        if isinstance(atype, str) and atype.lstrip("-").isdigit():
+            atype = int(atype)
         if isinstance(atype, int):
             if 2000 <= atype <= 2005:
                 kind = TAPBACKS[atype - 2000]
-            elif 3000 <= atype <= 3005:
+            elif atype == 2006:
+                # iOS 18 emoji reaction: the emoji is only in the text, "Reacted 😂 to “…”"
+                kind = m.get("associatedMessageEmoji") or _emoji_from_text(m.get("text") or "") or "👍"
+            elif 3000 <= atype <= 3006:
                 kind = ""
             else:
                 return None  # stickers, games etc.
         else:
             s = str(atype)
-            kind = "" if s.startswith("-") else s  # newer servers send "love", "-love"
+            kind = "" if s.startswith("-") else s  # "love", "-love"
         return {"kind": "reaction", "target": target, "sender": "me" if from_me else handle,
                 "reaction": kind}
     if m.get("itemType") not in (None, 0):
@@ -200,6 +241,7 @@ def to_message(m: dict) -> dict | None:
         "status": status,
         "error": f"Not delivered (error {m['error']})" if from_me and m.get("error") else "",
         "attachments": atts,
+        "effect": m.get("expressiveSendStyleId") or "",
         "unread": (not from_me) and not m.get("dateRead"),
         "thread_meta": {
             "name": chat.get("displayName") or "" if group else "",

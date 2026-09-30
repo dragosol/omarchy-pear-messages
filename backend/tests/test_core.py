@@ -169,6 +169,44 @@ class DedupTest(unittest.TestCase):
         self.assertFalse(self.s.is_tapback_text("Loved the film"))
 
 
+class EffectsTest(unittest.TestCase):
+    def setUp(self):
+        self.s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+
+    def test_effect_kept_and_upgraded_on_merge(self):
+        t = time.time() - 10
+        _, rid = self.s.ingest({"map_handle": "h1", "thread": store.addr_thread("+15550100"), "from_me": False,
+                                "sender_addr": "+15550100", "text": "boom", "ts": t}, "iphone")
+        self.assertEqual(self.s.message(rid)["effect"], "")      # Bluetooth never carries effects
+        n = BB.to_message({"guid": "G1", "text": "boom", "isFromMe": False, "handle": {"address": "+15550100"},
+                           "dateCreated": int((t + 1) * 1000), "expressiveSendStyleId": "com.apple.MobileSMS.expressivesend.impact",
+                           "chats": [{"guid": "iMessage;-;+15550100", "style": 45, "participants": [{"address": "+15550100"}]}]})
+        self.s.ingest(n, "bluebubbles")
+        self.assertEqual(self.s.message(rid)["effect"], "com.apple.MobileSMS.expressivesend.impact")
+        self.assertEqual(self.s.message(rid)["guid"], "G1")
+
+    def test_my_reaction_roundtrip(self):
+        n = BB.to_message({"guid": "G1", "text": "hi", "isFromMe": False, "handle": {"address": "+1"},
+                           "dateCreated": int(time.time() * 1000), "chats": []})
+        _, rid = self.s.ingest(n, "bluebubbles")
+        self.s.react("G1", "me", "love")
+        self.assertEqual(self.s.message(rid)["reactions"], {"me": "love"})
+        # BlueBubbles echoes our own reaction back as a from-me reaction message
+        r = BB.to_message({"guid": "R", "associatedMessageGuid": "p:0/G1", "associatedMessageType": 3000, "isFromMe": True})
+        self.s.react(r["target"], r["sender"], r["reaction"])
+        self.assertEqual(self.s.message(rid)["reactions"], {})
+
+    def test_old_database_gets_effect_column(self):
+        import sqlite3
+        path = os.path.join(tempfile.mkdtemp(), "old.db")
+        db = sqlite3.connect(path)
+        db.executescript(store.SCHEMA.replace(",\n    effect      TEXT NOT NULL DEFAULT ''     -- iMessage bubble/screen effect id", ""))
+        db.close()
+        s2 = store.Store(path)
+        cols = {r[1] for r in s2.db.execute("PRAGMA table_info(messages)")}
+        self.assertIn("effect", cols)
+
+
 class BBTest(unittest.TestCase):
     def test_reaction_parse(self):
         r = BB.to_message({"guid": "R", "associatedMessageGuid": "p:0/ABC", "associatedMessageType": 2001,
@@ -177,6 +215,16 @@ class BBTest(unittest.TestCase):
         r = BB.to_message({"guid": "R", "associatedMessageGuid": "ABC", "associatedMessageType": 3001,
                            "isFromMe": True})
         self.assertEqual(r["reaction"], "")
+
+    def test_string_and_emoji_reactions(self):
+        r = BB.to_message({"associatedMessageGuid": "p:0/A", "associatedMessageType": "2006", "isFromMe": False,
+                           "handle": {"address": "+1"}, "text": "Reacted 😂 to “hello there”"})
+        self.assertEqual(r["reaction"], "😂")
+        r = BB.to_message({"associatedMessageGuid": "p:0/A", "associatedMessageType": "3006", "isFromMe": False,
+                           "handle": {"address": "+1"}, "text": "Removed a 😂 from “hello there”"})
+        self.assertEqual(r["reaction"], "")
+        r = BB.to_message({"associatedMessageGuid": "A", "associatedMessageType": "laugh", "isFromMe": True})
+        self.assertEqual((r["reaction"], r["sender"]), ("laugh", "me"))
 
 
 if __name__ == "__main__":

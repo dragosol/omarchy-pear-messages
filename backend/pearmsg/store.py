@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
     temp_id     TEXT UNIQUE,
     attachments TEXT NOT NULL DEFAULT '[]',
     reactions   TEXT NOT NULL DEFAULT '{}',
-    unread      INTEGER NOT NULL DEFAULT 0
+    unread      INTEGER NOT NULL DEFAULT 0,
+    effect      TEXT NOT NULL DEFAULT ''     -- iMessage bubble/screen effect id
 );
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
 CREATE INDEX IF NOT EXISTS messages_match ON messages(sender, from_me, ts);
@@ -106,6 +107,12 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA journal_mode=WAL")
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
+        if "effect" not in cols:   # databases from 1.0.0
+            self.db.execute("ALTER TABLE messages ADD COLUMN effect TEXT NOT NULL DEFAULT ''")
+            # re-read recent history from BlueBubbles once, to fill in effects already sent
+            self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('bb_since_ms','0')")
+            self.db.commit()
         os.chmod(path, 0o600)
 
     # ------------------------------------------------------------------ meta
@@ -241,6 +248,7 @@ class Store:
             "text": r["text"].replace(_OBJ, "").strip(), "ts": r["ts"], "status": r["status"],
             "error": r["error"], "via": r["via"], "attachments": json.loads(r["attachments"]),
             "reactions": json.loads(r["reactions"]), "unread": bool(r["unread"]),
+            "effect": r["effect"], "guid": r["bb_guid"] or "",
         }
 
     def message(self, mid: int) -> dict | None:
@@ -310,11 +318,12 @@ class Store:
         # 3. New.
         cur = self.db.execute(
             "INSERT INTO messages(thread,from_me,sender,sender_addr,text,norm,ts,status,error,via,"
-            "bb_guid,map_handle,temp_id,attachments,unread) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "bb_guid,map_handle,temp_id,attachments,unread,effect) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (m["thread"], int(from_me), sender, "" if from_me else m.get("sender_addr", ""),
              m.get("text", ""), norm, float(m["ts"]), m.get("status", ""), m.get("error", ""), source,
              m.get("bb_guid"), m.get("map_handle"), m.get("temp_id"),
-             json.dumps(m.get("attachments") or []), int(bool(m.get("unread")) and not from_me)))
+             json.dumps(m.get("attachments") or []), int(bool(m.get("unread")) and not from_me),
+             m.get("effect") or ""))
         rid = cur.lastrowid
         if m.get("bb_guid"):
             self._apply_pending_reactions(rid, m["bb_guid"])
@@ -334,6 +343,8 @@ class Store:
                 upd["thread"] = m["thread"]
             if m.get("attachments"):
                 upd["attachments"] = json.dumps(m["attachments"])
+            if m.get("effect") and m["effect"] != r["effect"]:
+                upd["effect"] = m["effect"]
         if m.get("text") and len(m["text"]) > len(r["text"]) and normalize(m["text"]).startswith(r["norm"]):
             upd["text"] = m["text"]
             upd["norm"] = normalize(m["text"])
@@ -352,6 +363,10 @@ class Store:
             if "bb_guid" in upd:
                 self._apply_pending_reactions(r["id"], upd["bb_guid"])
             self.db.commit()
+
+    def set_effect(self, mid: int, effect: str) -> None:
+        self.db.execute("UPDATE messages SET effect=? WHERE id=?", (effect, mid))
+        self.db.commit()
 
     def set_status(self, mid: int, status: str, error: str = "", via: str | None = None) -> None:
         if via:

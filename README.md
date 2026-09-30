@@ -34,6 +34,20 @@ once.
 - **Your iPhone keeps its own audio.** A paired iPhone normally starts playing music and calls
   through the computer. Pear Messages drops those audio connections the moment they appear, and
   leaves the link for messages up.
+- **Reactions and effects.** Hover a message and press ☺ to react ♥ 👍 👎 😂 ‼ ?, including iOS 18
+  emoji reactions. ✦ next to Send picks an effect:
+  - **Bubble:** Slam, Loud, Gentle, Invisible Ink.
+  - **Screen:** Echo, Spotlight, Balloons, Confetti, Love, Lasers, Fireworks, Celebration, Shooting Star.
+
+  Effects play when a message arrives, and *Replay* plays one again. Sending reactions and effects
+  needs BlueBubbles with its Private API turned on. When that isn't possible, because you're only
+  connected through the iPhone or the Private API is off, the controls are greyed out and say why.
+- **Space to preview.** Click a photo, video or file, or just hover it, and press Space. It opens in
+  GNOME's previewer (Sushi) if you have it, or a built-in viewer if you don't. Space or Esc closes it.
+- **Keeps your disk clean.** Recent photos are cached. Videos, and photos more than 200 messages up
+  a conversation, only go to a temporary folder that is cleared when you log out.
+- **Scrolling like Pear Passwords.** A mouse wheel glides. A touchpad follows your fingers, coasts,
+  and rubber-bands at the ends. Resting a finger on the touchpad stops a coast.
 - **A connection assistant in Settings.**
   - **BlueBubbles:** *Find my Mac* looks for a server on your Tailscale network. You can also
     type any address: LAN, Tailscale, or a tunnel. It checks the server and saves it.
@@ -43,7 +57,7 @@ once.
   receiving. Click a notification to open that conversation.
 - **Follows your Omarchy theme.** It is built from Omarchy's own shell components.
 - **Keyboard first.** Ctrl+N starts a new message, Ctrl+F searches, and Alt+↑/↓ moves between
-  conversations. Enter sends, Shift+Enter adds a new line, Esc goes back.
+  conversations. Enter sends, Shift+Enter adds a new line, Space previews, Esc goes back.
 
 ### What each connection can do
 
@@ -55,7 +69,8 @@ once.
 | Send, one-to-one | ✓ iMessage | ✓ iMessage or SMS, your iPhone decides |
 | Group chats | ✓ | Messages arrive; no replies |
 | Photos and files | ✓ | — |
-| Reactions, delivered/read | ✓ | — |
+| Delivered/read, reactions you receive | ✓ | — |
+| Sending reactions and effects | ✓ with the Private API | — |
 | Contact names | From the Mac | From the iPhone |
 
 ## Install
@@ -156,7 +171,8 @@ PEAR_MESSAGES_PREVIEW=threads PEAR_MESSAGES_SNAPSHOT=/tmp/shot.png \
   QT_QPA_PLATFORM=offscreen quickshell -p <a copy of app/ with Ui and Commons linked>
 ```
 
-`PEAR_MESSAGES_PREVIEW` also takes `settings`, `pair` and `compose`.
+`PEAR_MESSAGES_PREVIEW` also takes `settings`, `pair`, `compose`, `react` and `effects` (both as
+seen over the iPhone), and `fx_<Effect>` (e.g. `fx_Confetti`, `fx_Shooting_Star`) to play a screen effect.
 
 ## License
 
