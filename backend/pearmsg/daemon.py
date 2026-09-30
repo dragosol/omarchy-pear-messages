@@ -34,6 +34,7 @@ from . import bluebubbles as BB
 from . import contacts as C
 from . import iphone as IP
 from . import tailnet
+from . import tapback
 from .store import Store, addr_thread
 
 HOME = os.path.expanduser("~")
@@ -240,10 +241,18 @@ class Daemon:
         fresh = []
         bb_recent = self.bb_online or time.time() - self.bb_online_at < 600
         for n in msgs:
-            # Over Bluetooth a reaction is a plain message ('Loved “hi”'). When BlueBubbles is
-            # around it reports the real reaction, so the text copy is dropped.
-            if bb_recent and self.store.is_tapback_text(n["text"]):
-                continue
+            # Over Bluetooth a reaction arrives as a sentence in the phone's language ('Loved
+            # “hi”', 'a attribué la mention « Adore » à « hi »'). When BlueBubbles is around it
+            # delivers the real reaction, so the sentence is dropped; otherwise it becomes a
+            # reaction on the message it quotes.
+            tb = tapback.parse(n["text"])
+            if tb:
+                target = self.store.find_quoted(self.store.canonical(n["thread"]), tb.quoted, n["ts"])
+                if target is not None:
+                    if not bb_recent:
+                        self.store.react_row(target["id"], C.key(n.get("sender_addr", "")), tb.kind)
+                        changed.setdefault(target["thread"], []).append(target["id"])
+                    continue
             what, rid = self.store.ingest(n, "iphone")
             msg = self.store.message(rid)
             changed.setdefault(msg["thread"], []).append(rid)
@@ -799,6 +808,9 @@ class Daemon:
         n = self.store.merge_orphans()
         if n:
             log(f"merged {n} duplicate message(s) seen through both connections")
+        fixed = self.store.cleanup_reaction_texts()
+        if self.store.removed_reaction_texts:
+            log(f"turned {self.store.removed_reaction_texts} reaction text(s) back into reactions")
         self.store.learn_self()
         n = self.store.rethread()
         if n:

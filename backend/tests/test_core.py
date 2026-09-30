@@ -290,6 +290,47 @@ class TextEffectsTest(unittest.TestCase):
         self.assertEqual(store._segments("hello", []), [])
 
 
+class TapbackTextTest(unittest.TestCase):
+    def test_languages(self):
+        from pearmsg import tapback
+        cases = {
+            "Loved “see you at 7”": ("love", "see you at 7"),
+            "a attribué la mention « Adore » à « nice im right about to start! »": ("love", "nice im right about to start!"),
+            "a attribué la mention « J’aime » à « ok »": ("like", "ok"),
+            "a attribué la mention « Je n’aime pas » à « ok »": ("dislike", "ok"),
+            "Laughed at “lol”": ("laugh", "lol"),
+            "Emphasized “really”": ("emphasize", "really"),
+            "Questioned “what”": ("question", "what"),
+            "Reacted 😂 to “that meme”": ("😂", "that meme"),
+            "a réagi avec 🔥 à « la photo »": ("🔥", "la photo"),
+            "Removed a heart from “hi”": ("", "hi"),
+            "Le encantó “hola”": ("love", "hola"),
+        }
+        for text, (kind, quoted) in cases.items():
+            tb = tapback.parse(text)
+            self.assertIsNotNone(tb, text)
+            self.assertEqual((tb.kind, tb.quoted), (kind, quoted), text)
+
+    def test_ordinary_messages_are_not_reactions(self):
+        from pearmsg import tapback
+        for text in ["He said “I loved it” and then left, can you believe that he actually did that?!",
+                     "see you at 7", "“quote only”", "I adore this"]:
+            self.assertIsNone(tapback.parse(text), text)
+
+    def test_cleanup_turns_stored_text_into_reaction(self):
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        t = time.time() - 100
+        th = store.addr_thread("+16135550100")
+        _, target = s.ingest({"bb_guid": "G1", "thread": th, "from_me": True, "text": "nice im right about to start!",
+                              "ts": t}, "bluebubbles")
+        s.ingest({"map_handle": "h1", "thread": th, "from_me": False, "sender_addr": "+16135550100",
+                  "text": "a attribué la mention « Adore » à « nice im right about to start! »", "ts": t + 30}, "iphone")
+        s.cleanup_reaction_texts()
+        msgs = s.messages(th)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(list(msgs[0]["reactions"].values()), ["love"])
+
+
 class BBTest(unittest.TestCase):
     def test_reaction_parse(self):
         r = BB.to_message({"guid": "R", "associatedMessageGuid": "p:0/ABC", "associatedMessageType": 2001,

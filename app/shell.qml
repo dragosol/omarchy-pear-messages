@@ -913,7 +913,7 @@ ShellRoot {
                                 model: root.msgs
                                 spacing: 3
                                 interactive: false
-                                ScrollBar.vertical: AppScrollBar {}
+                                ScrollBar.vertical: AppScrollBar { id: msgBar }
                                 ScrollPhysics { id: msgPhys; flick: list }
                                 WheelHandler {
                                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
@@ -964,11 +964,23 @@ ShellRoot {
                 }
                 onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running) { settle.left = 3; settle.restart(); }
                 onHeightChanged: if (followEnd && !msgPhys.busy) { settle.left = 3; settle.restart(); }
-                onMovementEnded: followEnd = atYEnd
+                // Pinned to the newest message unless YOU scroll away: only your own scrolling
+                // (wheel, touchpad, the scrollbar) un-pins or re-pins it. A new message, a photo
+                // loading, older history arriving - content moving by itself never un-pins it.
+                readonly property bool userScrolling: (msgPhys.busy || msgBar.pressed) && !toBottom.running
+                function checkPin() { followEnd = contentY >= msgPhys.maxY - 4; }
+                Connections {
+                    target: msgPhys
+                    // a coast or bounce has just settled: where did it leave the view?
+                    function onBusyChanged() { if (!msgPhys.busy && !toBottom.running) list.checkPin(); }
+                }
+                Connections {
+                    target: msgBar
+                    function onPressedChanged() { if (!msgBar.pressed) list.checkPin(); }
+                }
                                 onContentYChanged: {
-                                    // wheel, drag and scrollbar all move contentY; growth alone doesn't.
                                     // A bounce past the end still counts as at the end.
-                                    followEnd = contentY >= msgPhys.maxY - 2;
+                                    if (userScrolling) checkPin();
                                     root.picker = null;
                                     if (contentY <= originY + 40 && root.msgs.length >= 200 && !loadingOlder.running) {
                                         loadingOlder.start();

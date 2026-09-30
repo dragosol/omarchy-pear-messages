@@ -134,6 +134,7 @@ class Store:
         self.db.commit()
         self._identity: dict[str, str] | None = None
         self.newly_hidden: list[int] = []
+        self.removed_reaction_texts = 0
         os.chmod(path, 0o600)
 
     # ------------------------------------------------------------------ meta
@@ -570,6 +571,52 @@ class Store:
     def is_tapback_text(self, text: str) -> bool:
         """The iPhone (over MAP) delivers a reaction as a plain message like 'Loved “hi”'."""
         return bool(_TAPBACK_PREFIX.match(text or ""))
+
+    def find_quoted(self, thread: str, quoted: str, before: float) -> sqlite3.Row | None:
+        """The recent message a reaction text quotes, newest first."""
+        from .tapback import quote_matches
+        for r in self.db.execute(
+                "SELECT * FROM messages WHERE thread=? AND hidden=0 AND ts<=? ORDER BY ts DESC LIMIT 80",
+                (thread, before + 5)).fetchall():
+            if quote_matches(quoted, r["text"]):
+                return r
+        return None
+
+    def react_row(self, rid: int, sender: str, kind: str) -> None:
+        r = self.db.execute("SELECT reactions FROM messages WHERE id=?", (rid,)).fetchone()
+        if r is None:
+            return
+        reactions = json.loads(r["reactions"])
+        if kind:
+            reactions[sender] = kind
+        else:
+            reactions.pop(sender, None)
+        self.db.execute("UPDATE messages SET reactions=? WHERE id=?", (json.dumps(reactions), rid))
+        self.db.commit()
+
+    def cleanup_reaction_texts(self) -> list[tuple[str, int]]:
+        """Reactions that were stored as messages (in any language) become reactions again.
+        Returns (thread, message id) of each message whose reactions changed."""
+        from .tapback import parse
+        changed = []
+        for r in self.db.execute("SELECT * FROM messages WHERE from_me=0 AND bb_guid IS NULL "
+                                 "AND map_handle IS NOT NULL").fetchall():
+            tb = parse(r["text"])
+            if not tb:
+                continue
+            target = self.find_quoted(r["thread"], tb.quoted, r["ts"])
+            if target is None or target["id"] == r["id"]:
+                continue
+            have = json.loads(target["reactions"])
+            # BlueBubbles may already have delivered the real one, under its own sender key
+            if tb.kind and tb.kind not in have.values():
+                self.react_row(target["id"], r["sender"], tb.kind)
+                changed.append((target["thread"], target["id"]))
+            self.db.execute("DELETE FROM messages WHERE id=?", (r["id"],))
+            self.removed_reaction_texts += 1
+            changed.append((r["thread"], r["id"]))
+        self.db.commit()
+        return changed
 
     def latest_ts(self, via_col: str) -> float:
         r = self.db.execute(f"SELECT MAX(ts) FROM messages WHERE {via_col} IS NOT NULL").fetchone()
