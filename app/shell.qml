@@ -158,7 +158,7 @@ ShellRoot {
     readonly property string route: status.route || "none"
     readonly property var bb: status.bluebubbles || ({})
     readonly property var phone: status.iphone || ({})
-    readonly property bool daemonUp: sock.connected || root.preview !== ""
+    readonly property bool daemonUp: root.linked || root.preview !== ""
 
     // Development: PEAR_MESSAGES_PREVIEW=threads|settings|pair|compose draws made-up data
     // without a daemon; with PEAR_MESSAGES_SNAPSHOT=<png> the window renders itself to that
@@ -168,23 +168,31 @@ ShellRoot {
     readonly property string openOnStart: Quickshell.env("PEAR_MESSAGES_OPEN") || ""
 
     // ------------------------------------------------------------------ daemon link
-    Socket {
-        id: sock
-        path: (Quickshell.env("XDG_RUNTIME_DIR") || "/run/user/1000") + "/pear-messages/sock"
-        connected: root.preview === ""
-        parser: SplitParser {
-            splitMarker: "\n"
-            onRead: data => root.onEvent(data)
+    // A fresh socket for every attempt: once a Quickshell Socket has failed to connect (the
+    // service restarting at that moment), switching it off and on again doesn't revive it.
+    Loader {
+        id: sockLoader
+        active: root.preview === ""
+        sourceComponent: Component {
+            Socket {
+                path: (Quickshell.env("XDG_RUNTIME_DIR") || "/run/user/1000") + "/pear-messages/sock"
+                connected: true
+                parser: SplitParser {
+                    splitMarker: "\n"
+                    onRead: data => root.onEvent(data)
+                }
+                onConnectedChanged: {
+                    root.linked = connected;
+                    if (connected) {
+                        root.send({ op: "hello" });
+                        if (root.current) root.send({ op: "open", thread: root.current });
+                        root.reportView();
+                    }
+                }
+            }
         }
-        onConnectedChanged: {
-            if (connected) {
-                root.send({ op: "hello" });
-                if (root.current) root.send({ op: "open", thread: root.current });
-                root.reportView();
-            } else if (root.preview === "") reconnect.start();
-        }
-        onError: if (root.preview === "") reconnect.start()
     }
+    property bool linked: false
     // ------------------------------------------------------------------ Omarchy theme
     // Omarchy pushes a theme switch to its own shell over IPC (`shell applyTheme`); a standalone
     // window never hears it and would keep the theme it started with. So this watches the
@@ -243,7 +251,7 @@ ShellRoot {
         function state(): string {
             return JSON.stringify({ theme: { bg: String(Theme.bg), fg: String(Theme.fg), accent: String(Theme.accent),
                                              panel: String(Theme.panel), font: Theme.uiFont, radius: Theme.radius },
-                                    connected: sock.connected, threads: root.threads.length,
+                                    connected: root.linked, threads: root.threads.length,
                                     current: root.current, msgs: root.msgs.length, fx: screenFx.current,
                                     focused: root.focused, onScreen: root.onScreen,
                                     auto: root.autoEffect("Happy New Year!") });
@@ -270,16 +278,17 @@ ShellRoot {
         id: reconnect
         interval: 2000
         repeat: true
-        running: !sock.connected && root.preview === ""
-        onTriggered: { sock.connected = false; sock.connected = true; }
+        running: !root.linked && root.preview === ""
+        onTriggered: { sockLoader.active = false; sockLoader.active = true; }
     }
 
     function send(obj) {
         if (root.preview !== "") return 0;
         const id = root.reqId++;
         obj.id = id;
-        sock.write(JSON.stringify(obj) + "\n");
-        sock.flush();
+        if (!root.linked || !sockLoader.item) return 0;
+        sockLoader.item.write(JSON.stringify(obj) + "\n");
+        sockLoader.item.flush();
         return id;
     }
 
@@ -509,7 +518,7 @@ ShellRoot {
         if (root.route === "bluebubbles")
             return "BlueBubbles" + (root.bb.link === "tailscale" ? " · Tailscale" : "");
         if (root.route === "iphone") return (root.phone.name || "iPhone") + " · Bluetooth";
-        if (!sock.connected && root.preview === "") return "Pear Messages service isn't running";
+        if (!root.linked && root.preview === "") return "Pear Messages service isn't running";
         return "Not connected";
     }
     function stateText(s) {
