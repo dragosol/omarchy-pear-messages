@@ -18,7 +18,34 @@ import urllib.parse
 import urllib.request
 import uuid
 
-WITH_MSG = ["chat", "chat.participants", "handle", "attachment"]
+WITH_MSG = ["chat", "chat.participants", "handle", "attachment", "attributedBody"]
+
+# iOS 18 text formatting and animated text effects, as Messages stores them on each run of the
+# message's attributed string. Effect ids are the ones imessage-exporter reverse-engineered.
+TEXT_STYLES = {
+    "__kIMTextBoldAttributeName": "bold",
+    "__kIMTextItalicAttributeName": "italic",
+    "__kIMTextUnderlineAttributeName": "underline",
+    "__kIMTextStrikethroughAttributeName": "strikethrough",
+}
+TEXT_EFFECTS = {5: "big", 11: "small", 9: "shake", 8: "nod", 12: "explode", 4: "ripple", 6: "bloom", 10: "jitter"}
+TEXT_EFFECT_IDS = {v: k for k, v in TEXT_EFFECTS.items()}
+
+
+def text_runs(attributed) -> list[dict]:
+    """[{start, length, styles, effect}] (UTF-16 ranges into the message text), only for runs
+    that carry formatting or an effect."""
+    out = []
+    parts = attributed if isinstance(attributed, list) else [attributed] if attributed else []
+    for part in parts[:1]:
+        for r in (part or {}).get("runs", []) or []:
+            attrs = r.get("attributes") or {}
+            styles = [name for key, name in TEXT_STYLES.items() if attrs.get(key)]
+            fx = TEXT_EFFECTS.get(attrs.get("__kIMTextEffectAttributeName"), "")
+            rng = r.get("range") or [0, 0]
+            if (styles or fx) and len(rng) == 2:
+                out.append({"start": int(rng[0]), "length": int(rng[1]), "styles": styles, "effect": fx})
+    return out
 
 # associatedMessageType -> tapback. 2000-2005 add, 3000-3005 remove.
 TAPBACKS = {0: "love", 1: "like", 2: "dislike", 3: "laugh", 4: "emphasize", 5: "question"}
@@ -111,14 +138,21 @@ class Client:
     def send(self, chat_guid: str, text: str, temp_guid: str, private_api: bool, effect: str = "") -> dict:
         body = {"chatGuid": chat_guid, "tempGuid": temp_guid, "message": text,
                 "method": "private-api" if private_api else "apple-script"}
-        if effect:
+        if effect.startswith("text:"):
+            # an iOS 18 text effect over the whole message (Private API only)
+            body["textFormatting"] = [{"start": 0, "length": len(text.encode("utf-16-le")) // 2,
+                                       "styles": [effect[5:]]}]
+        elif effect:
             body["effectId"] = effect   # only the Private API can send effects
         return self._req("POST", "/message/text", body, timeout=20) or {}
 
     def new_chat(self, address: str, text: str, temp_guid: str, private_api: bool, effect: str = "") -> dict:
         body = {"addresses": [address], "message": text, "tempGuid": temp_guid, "service": "iMessage",
                 "method": "private-api" if private_api else "apple-script"}
-        if effect:
+        if effect.startswith("text:"):
+            body["textFormatting"] = [{"start": 0, "length": len(text.encode("utf-16-le")) // 2,
+                                       "styles": [effect[5:]]}]
+        elif effect:
             body["effectId"] = effect
         return self._req("POST", "/chat/new", body, timeout=20) or {}
 
@@ -242,6 +276,7 @@ def to_message(m: dict) -> dict | None:
         "error": f"Not delivered (error {m['error']})" if from_me and m.get("error") else "",
         "attachments": atts,
         "effect": m.get("expressiveSendStyleId") or "",
+        "runs": text_runs(m.get("attributedBody")),
         "unread": (not from_me) and not m.get("dateRead"),
         "thread_meta": {
             "name": chat.get("displayName") or "" if group else "",

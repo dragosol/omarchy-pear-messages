@@ -1,32 +1,31 @@
 #!/bin/sh
-# Opens Pear Messages. The launcher entry runs this, not quickshell directly.
+# Opens Pear Messages, optionally on one conversation:  launch.sh [thread-id]
+# The launcher entry runs this without a thread; a notification click runs it with one.
 #
-# The window floats centred at the 1040x680 it is laid out for, at full opacity. Hyprland decides
-# that when a window maps, so the rules are registered here, just before it opens, through
-# `hyprctl eval` - nothing is written to your Hyprland config, nothing needs a reload, and
-# uninstalling leaves nothing behind. They are registered once per Hyprland session.
+# It is a regular window: Hyprland tiles it like any other app when tiling is on. It asks for
+# 1040x680, which is the size it gets whenever it floats.
 here="$(dirname "$(readlink -f "$0")")"
+backend="$here/../backend"
+thread="${1:-}"
+run="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pear-messages"
+mkdir -p "$run"
 
-# Already open: bring it forward instead of opening a second window.
-if command -v hyprctl >/dev/null 2>&1 && hyprctl clients -j 2>/dev/null | grep -q '"title": "Pear Messages"'; then
-  hyprctl dispatch focuswindow 'title:^Pear Messages$' >/dev/null 2>&1
+focus_running() {
+  if [ -n "$thread" ]; then
+    PYTHONPATH="$backend" python3 -B -m pearmsg open "$thread" >/dev/null 2>&1
+  fi
+  command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch focuswindow 'title:^Pear Messages$' >/dev/null 2>&1
+}
+
+# One window. The open window holds this lock for as long as it runs (quickshell inherits it),
+# so a second launch - a notification click racing the launcher, say - just brings it forward.
+exec 9>"$run/window.lock"
+if ! flock -n 9; then
+  focus_running
   exit 0
-fi
-
-if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] && command -v hyprctl >/dev/null 2>&1; then
-  hyprctl eval '
-if not _G.__pear_messages_rules then
-  local m = { class = [[^org\.quickshell$]], title = [[^Pear Messages$]] }
-  hl.window_rule({ match = m, tag = [[-default-opacity]] })
-  hl.window_rule({ match = m, opacity = [[1 override 1 override]] })
-  hl.window_rule({ match = m, float = true })
-  hl.window_rule({ match = m, size = [[1040 680]] })
-  hl.window_rule({ match = m, center = true })
-  _G.__pear_messages_rules = true
-end' >/dev/null 2>&1 || true
 fi
 
 # The service should already be running; start it if not (it is what the window talks to).
 systemctl --user start pear-messages.service >/dev/null 2>&1 || true
 
-exec quickshell -p "$here"
+PEAR_MESSAGES_OPEN="$thread" exec quickshell -p "$here"

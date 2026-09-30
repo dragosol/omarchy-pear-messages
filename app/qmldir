@@ -3,3 +3,4 @@ AppButton 1.0 AppButton.qml
 AppScrollBar 1.0 AppScrollBar.qml
 ScrollPhysics 1.0 ScrollPhysics.qml
 ScreenEffects 1.0 ScreenEffects.qml
+EffectText 1.0 EffectText.qml

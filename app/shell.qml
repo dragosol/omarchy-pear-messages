@@ -66,8 +66,26 @@ ShellRoot {
         "com.apple.messages.effect.CKLasersEffect": "Lasers",
         "com.apple.messages.effect.CKFireworksEffect": "Fireworks",
         "com.apple.messages.effect.CKSparklesEffect": "Celebration",
-        "com.apple.messages.effect.CKShootingStarEffect": "Shooting Star"
+        "com.apple.messages.effect.CKShootingStarEffect": "Shooting Star",
+        "text:big": "Big", "text:small": "Small", "text:shake": "Shake", "text:nod": "Nod",
+        "text:explode": "Explode", "text:ripple": "Ripple", "text:bloom": "Bloom", "text:jitter": "Jitter"
     })
+    readonly property var textEffects: ["text:big", "text:small", "text:shake", "text:nod",
+                                        "text:explode", "text:ripple", "text:bloom", "text:jitter"]
+    // Formatted text (bold, italic, underline, strikethrough) as rich text.
+    function styledHtml(segments, linkColor) {
+        let out = "";
+        for (const seg of segments) {
+            let t = root.linkify(seg.text, linkColor);
+            const st = seg.styles || [];
+            if (st.indexOf("bold") >= 0) t = "<b>" + t + "</b>";
+            if (st.indexOf("italic") >= 0) t = "<i>" + t + "</i>";
+            if (st.indexOf("underline") >= 0) t = "<u>" + t + "</u>";
+            if (st.indexOf("strikethrough") >= 0) t = "<s>" + t + "</s>";
+            out += t;
+        }
+        return out;
+    }
     readonly property var bubbleEffects: ["com.apple.MobileSMS.expressivesend.impact", "com.apple.MobileSMS.expressivesend.loud",
                                           "com.apple.MobileSMS.expressivesend.gentle", "com.apple.MobileSMS.expressivesend.invisibleink"]
     readonly property var screenEffects: ["com.apple.messages.effect.CKEchoEffect", "com.apple.messages.effect.CKSpotlightEffect",
@@ -721,6 +739,8 @@ ShellRoot {
                                             const t = root.currentInfo;
                                             if (!t) return "";
                                             if (t.group) return t.participants.length + " people";
+                                            if (t.self) return "You" + (t.addresses && t.addresses.length > 1 ? " · " + t.addresses.join(" · ") : "");
+                                            if (t.addresses && t.addresses.length > 1) return t.addresses.join(" · ");
                                             return t.address && t.address !== t.title ? t.address : "";
                                         }
                                         elide: Text.ElideRight
@@ -828,9 +848,22 @@ ShellRoot {
                                 // Follow the newest message until the user scrolls up. Photos load after the
                 // first jump to the end and grow the list, so growth re-pins it while following.
                 property bool followEnd: true
-                function stickToEnd() { followEnd = true; msgPhys.stopPhysics(); Qt.callLater(() => list.positionViewAtEnd()); }
-                onContentHeightChanged: if (followEnd && !msgPhys.busy) Qt.callLater(() => list.positionViewAtEnd())
-                onHeightChanged: if (followEnd && !msgPhys.busy) Qt.callLater(() => list.positionViewAtEnd())
+                // Pinning to the end while a long conversation is still being laid out can leave the
+                // list at the right place with nothing drawn. So pin, then pin again as it settles.
+                function stickToEnd() { followEnd = true; msgPhys.stopPhysics(); settle.left = 8; settle.restart(); }
+                function pinEnd() { list.forceLayout(); list.positionViewAtEnd(); }
+                Timer {
+                    id: settle
+                    property int left: 0
+                    interval: 60
+                    repeat: true
+                    onTriggered: {
+                        if (list.followEnd && !msgPhys.busy) list.pinEnd();
+                        if (--left <= 0) stop();
+                    }
+                }
+                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running) { settle.left = 3; settle.restart(); }
+                onHeightChanged: if (followEnd && !msgPhys.busy) { settle.left = 3; settle.restart(); }
                 onMovementEnded: followEnd = atYEnd
                                 onContentYChanged: {
                                     // wheel, drag and scrollbar all move contentY; growth alone doesn't.
@@ -979,8 +1012,11 @@ ShellRoot {
                                                 id: bubble
                                                 anchors.right: msgItem.mine ? parent.right : undefined
                                                 anchors.bottom: parent.bottom
-                                                width: Math.min(measure.implicitWidth, list.bubbleMax - 28) + 28
-                                                height: body.implicitHeight + 16
+                                                readonly property var segs: msgItem.m.segments || []
+                                                readonly property bool textFx: segs.some(sg => !!sg.effect)
+                                                // letters drawn one by one come out a little wider than the string
+                                                width: Math.min(measure.implicitWidth * (textFx ? 1.12 : 1) + (textFx ? 6 : 0), list.bubbleMax - 28) + 28
+                                                height: (textFx ? effText.height : body.implicitHeight) + 16
                                                 radius: Math.max(Theme.radius, 4)
                                                 color: msgItem.mine ? (msgItem.m.status === "failed" ? Theme.danger : Theme.accent) : Theme.panel
                                                 opacity: msgItem.m.status === "sending" ? 0.6 : 1
@@ -1043,7 +1079,9 @@ ShellRoot {
                                                     selectByMouse: !bubble.inkHidden
                                                     wrapMode: TextEdit.Wrap
                                                     textFormat: TextEdit.RichText
-                                                    text: root.linkify(msgItem.m.text, msgItem.mine ? Theme.bg : Theme.accent)
+                                                    visible: !bubble.textFx
+                                                    text: bubble.segs.length ? root.styledHtml(bubble.segs, msgItem.mine ? Theme.bg : Theme.accent)
+                                                                             : root.linkify(msgItem.m.text, msgItem.mine ? Theme.bg : Theme.accent)
                                                     color: msgItem.mine ? Theme.bg : Theme.fg
                                                     selectedTextColor: msgItem.mine ? Theme.accent : Theme.bg
                                                     selectionColor: msgItem.mine ? Theme.bg : Theme.accent
@@ -1057,6 +1095,17 @@ ShellRoot {
                                                         enabled: body.hoveredLink !== ""
                                                         cursorShape: Qt.PointingHandCursor
                                                     }
+                                                }
+                                                // iOS 18 text effects: letters that move
+                                                EffectText {
+                                                    id: effText
+                                                    visible: bubble.textFx
+                                                    x: 14
+                                                    y: 8
+                                                    width: bubble.width - 28
+                                                    segments: bubble.textFx ? bubble.segs : []
+                                                    color: body.color
+                                                    font: body.font
                                                 }
                                                 // the ink's shimmer
                                                 Item {
@@ -1135,7 +1184,7 @@ ShellRoot {
 
                                         // "Sent with Slam · Replay" - click to watch it again
                                         Text {
-                                            visible: !!root.effectNames[msgItem.m.effect || ""]
+                                            visible: !!root.effectNames[msgItem.m.effect || ""] && !(msgItem.m.effect || "").startsWith("text:")
                                             anchors.right: msgItem.mine ? parent.right : undefined
                                             leftPadding: 4
                                             rightPadding: 4
@@ -1336,6 +1385,22 @@ ShellRoot {
                                         spacing: 6
                                         Repeater {
                                             model: root.bubbleEffects
+                                            AppButton {
+                                                required property string modelData
+                                                text: root.effectNames[modelData]
+                                                fontSize: Theme.fSmall
+                                                enabled: root.abilities.effects
+                                                selected: root.pendingEffect === modelData
+                                                onClicked: { root.pendingEffect = modelData; root.effectPickerOpen = false; composer.forceActiveFocus(); }
+                                            }
+                                        }
+                                    }
+                                    Text { text: "Text"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Flow {
+                                        width: parent.width
+                                        spacing: 6
+                                        Repeater {
+                                            model: root.textEffects
                                             AppButton {
                                                 required property string modelData
                                                 text: root.effectNames[modelData]
@@ -1933,6 +1998,8 @@ ShellRoot {
     }
 
     Component.onCompleted: {
+        // Development: a snapshot of the real window (connected to the running service).
+        if (root.preview === "" && root.snapshotPath) { snapshotTimer.interval = 4000; snapshotTimer.start(); }
         if (root.preview === "") return;
         const now = Date.now() / 1000;
         root.status = {
@@ -1960,6 +2027,11 @@ ShellRoot {
               effect: "com.apple.MobileSMS.expressivesend.impact" },
             { id: 6, thread: "addr:1", fromMe: false, sender: "+44", text: "", ts: now - 100, status: "", reactions: {}, guid: "G6",
               attachments: [{ guid: "A6", mime: "video/quicktime", name: "IMG_4412.MOV", size: 48200000 }] },
+            { id: 8, thread: "addr:1", fromMe: false, sender: "+44", text: "Wow! 🤯 that is huge", ts: now - 80, status: "", reactions: {}, guid: "G8", attachments: [],
+              segments: [{ text: "Wow! 🤯 ", styles: [], effect: "explode" }, { text: "that is ", styles: [], effect: "" }, { text: "huge", styles: ["bold"], effect: "big" }] },
+            { id: 9, thread: "addr:1", fromMe: false, sender: "+44", text: "so bold and italic and struck", ts: now - 75, status: "", reactions: {}, guid: "G9", attachments: [],
+              segments: [{ text: "so ", styles: [], effect: "" }, { text: "bold", styles: ["bold"], effect: "" }, { text: " and ", styles: [], effect: "" },
+                         { text: "italic", styles: ["italic"], effect: "" }, { text: " and ", styles: [], effect: "" }, { text: "struck", styles: ["strikethrough"], effect: "" }] },
             { id: 7, thread: "addr:1", fromMe: true, text: "psst — the surprise is at 8", ts: now - 60, status: "delivered", via: "bluebubbles", reactions: {}, guid: "G7",
               attachments: [], effect: "com.apple.MobileSMS.expressivesend.invisibleink" }
         ];

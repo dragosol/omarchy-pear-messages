@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS messages (
     attachments TEXT NOT NULL DEFAULT '[]',
     reactions   TEXT NOT NULL DEFAULT '{}',
     unread      INTEGER NOT NULL DEFAULT 0,
-    effect      TEXT NOT NULL DEFAULT ''     -- iMessage bubble/screen effect id
+    effect      TEXT NOT NULL DEFAULT '',    -- iMessage bubble/screen effect id
+    runs        TEXT NOT NULL DEFAULT '[]',  -- text formatting / iOS 18 text effects (UTF-16 ranges)
+    hidden      INTEGER NOT NULL DEFAULT 0   -- the received copy of a message you sent yourself
 );
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
 CREATE INDEX IF NOT EXISTS messages_match ON messages(sender, from_me, ts);
@@ -65,8 +67,11 @@ CREATE TABLE IF NOT EXISTS contacts (
     key    TEXT PRIMARY KEY,
     name   TEXT NOT NULL,
     addr   TEXT NOT NULL,
-    source TEXT NOT NULL
+    source TEXT NOT NULL,
+    card   TEXT NOT NULL DEFAULT ''    -- which contact card: addresses on one card are one person
 );
+-- an address can sit on more than one card; this keeps every (card, address) pair
+CREATE TABLE IF NOT EXISTS card_keys (card TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (card, key));
 
 -- Reactions whose message has not arrived yet.
 CREATE TABLE IF NOT EXISTS pending_reactions (
@@ -88,6 +93,9 @@ PREFIX_MIN = 40
 # email where the Mac reports a phone number. The same text from "two people" this close
 # together is the same message.
 CROSS_HANDLE_WINDOW = 20.0
+# Messaging yourself, the received copy follows the sent one - later still when the send went
+# the long way round (a BlueBubbles timeout, then the iPhone).
+SELF_MIRROR_WINDOW = 120.0
 
 _OBJ = "￼"  # what Messages puts in the text where an attachment sits
 _TAPBACK_PREFIX = re.compile(
@@ -112,11 +120,19 @@ class Store:
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA journal_mode=WAL")
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
-        if "effect" not in cols:   # databases from 1.0.0
-            self.db.execute("ALTER TABLE messages ADD COLUMN effect TEXT NOT NULL DEFAULT ''")
-            # re-read recent history from BlueBubbles once, to fill in effects already sent
+        resync = False
+        for col, ddl in (("effect", "TEXT NOT NULL DEFAULT ''"), ("runs", "TEXT NOT NULL DEFAULT '[]'"),
+                         ("hidden", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in cols:   # databases from older versions
+                self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
+                resync = resync or col in ("effect", "runs")
+        if "card" not in {r[1] for r in self.db.execute("PRAGMA table_info(contacts)")}:
+            self.db.execute("ALTER TABLE contacts ADD COLUMN card TEXT NOT NULL DEFAULT ''")
+        if resync:
+            # re-read recent history from BlueBubbles once, to fill in what older versions dropped
             self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('bb_since_ms','0')")
-            self.db.commit()
+        self.db.commit()
+        self._identity: dict[str, str] | None = None
         os.chmod(path, 0o600)
 
     # ------------------------------------------------------------------ meta
@@ -132,18 +148,101 @@ class Store:
     def set_contacts(self, cards: list[dict], source: str) -> int:
         """Replace one source's contacts. Returns how many addresses were stored."""
         self.db.execute("DELETE FROM contacts WHERE source=?", (source,))
+        self.db.execute("DELETE FROM card_keys WHERE card LIKE ?", (source + ":%",))
         n = 0
-        for c in cards:
+        for i, c in enumerate(cards):
             if not c.get("name"):
                 continue
+            card = f"{source}:{i}"
             for a in list(c.get("tels", [])) + list(c.get("emails", [])):
                 k = C.key(a)
                 if not k:
                     continue
                 self.db.execute(
-                    "INSERT OR IGNORE INTO contacts(key,name,addr,source) VALUES(?,?,?,?)",
-                    (k, c["name"], a, source))
+                    "INSERT OR IGNORE INTO contacts(key,name,addr,source,card) VALUES(?,?,?,?,?)",
+                    (k, c["name"], a, source, card))
+                self.db.execute("INSERT OR IGNORE INTO card_keys(card,key) VALUES(?,?)", (card, k))
                 n += 1
+        self.db.commit()
+        self._identity = None
+        return n
+
+    # --------------------------------------------------------------- identity
+    # One person, one conversation. Two things make several addresses one person:
+    #   - they are all yours: addresses you message yourself at ("self")
+    #   - they sit together on one contact card (and on no other card - a landline shared by
+    #     a household must not fuse two people)
+    def self_keys(self) -> set[str]:
+        return set(json.loads(self.get_meta("self_keys", "[]")))
+
+    def add_self(self, addrs) -> bool:
+        cur = self.self_keys()
+        new = cur | {C.key(a) for a in addrs if a}
+        if new == cur:
+            return False
+        self.set_meta("self_keys", json.dumps(sorted(new)))
+        self._identity = None
+        return True
+
+    def _build_identity(self) -> dict[str, str]:
+        ident: dict[str, str] = {}
+        cards: dict[str, set[str]] = {}
+        owners: dict[str, set[str]] = {}
+        for r in self.db.execute("SELECT card, key FROM card_keys"):
+            cards.setdefault(r["card"], set()).add(r["key"])
+            owners.setdefault(r["key"], set()).add(r["card"])
+        # the same card synced from both the iPhone and the Mac is one card: group by content
+        for card, keys in cards.items():
+            solo = sorted(k for k in keys if len({frozenset(cards[c]) for c in owners[k]}) == 1)
+            if len(solo) > 1:
+                for k in solo:
+                    ident[k] = solo[0]
+        for k in self.self_keys():
+            ident[k] = "self"
+        return ident
+
+    def canonical(self, tid: str) -> str:
+        if not tid.startswith("addr:"):
+            return tid
+        if self._identity is None:
+            self._identity = self._build_identity()
+        k = self._identity.get(tid[5:])
+        return "addr:" + k if k else tid
+
+    def rethread(self) -> int:
+        """Move conversations onto their person's one thread. Returns threads merged."""
+        self._identity = None
+        moved = 0
+        for (tid,) in self.db.execute("SELECT id FROM threads WHERE id LIKE 'addr:%'").fetchall():
+            new = self.canonical(tid)
+            if new == tid:
+                continue
+            old = self.db.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone()
+            self.ensure_thread(new, participants=json.loads(old["participants"]),
+                               bb_chat=old["bb_chat"], service=old["service"])
+            self.db.execute("UPDATE messages SET thread=? WHERE thread=?", (new, tid))
+            self.db.execute("DELETE FROM threads WHERE id=?", (tid,))
+            moved += 1
+        if moved:
+            self.hide_self_mirrors()
+        self.db.commit()
+        return moved
+
+    def learn_self(self) -> bool:
+        """An address is yours if a message you sent to it came straight back from it: that's
+        messaging yourself, where Messages records a sent and a received copy together."""
+        rows = self.db.execute(
+            "SELECT DISTINCT i.sender FROM messages i JOIN messages o "
+            "ON o.from_me=1 AND i.from_me=0 AND o.norm=i.norm AND o.norm!='' "
+            "AND ABS(o.ts-i.ts) <= 3 AND (o.thread='addr:'||i.sender OR o.thread='addr:self')").fetchall()
+        return self.add_self(r["sender"] for r in rows if r["sender"])
+
+    def hide_self_mirrors(self) -> int:
+        """In your own conversation each message exists twice (sent + received). Show it once."""
+        n = self.db.execute(
+            "UPDATE messages SET hidden=1, unread=0 WHERE thread='addr:self' AND from_me=0 AND hidden=0 "
+            "AND EXISTS (SELECT 1 FROM messages o WHERE o.thread='addr:self' AND o.from_me=1 "
+            "AND o.norm=messages.norm AND messages.ts - o.ts BETWEEN -3 AND ?)", (SELF_MIRROR_WINDOW,)).rowcount
         self.db.commit()
         return n
 
@@ -176,8 +275,11 @@ class Store:
         upd = {}
         if name and name != row["name"]:
             upd["name"] = name
-        if participants and json.loads(row["participants"]) != participants:
-            upd["participants"] = json.dumps(participants)
+        if participants:
+            have = json.loads(row["participants"])
+            merged = have + [p for p in participants if C.key(p) not in {C.key(h) for h in have}]
+            if merged != have:
+                upd["participants"] = json.dumps(merged)
         # Prefer the iMessage chat as the one to send into; keep an SMS one only as a fallback.
         if bb_chat and (not row["bb_chat"] or (service == "iMessage" and row["service"] != "iMessage")):
             upd["bb_chat"] = bb_chat
@@ -197,6 +299,17 @@ class Store:
         if r["name"]:
             return r["name"]
         parts = json.loads(r["participants"])
+        if r["id"] == "addr:self":
+            # your own card is the one with the most of your addresses on it
+            best = self.db.execute(
+                "SELECT c.name, (SELECT COUNT(*) FROM card_keys k WHERE k.card=c.card) n FROM contacts c "
+                "WHERE c.key IN (%s) ORDER BY n DESC, c.name LIMIT 1"
+                % ",".join("?" * len(parts)), [C.key(p) for p in parts]).fetchone() if parts else None
+            return (best["name"] if best else "You")
+        if r["id"].startswith("addr:") and len(parts) > 1:
+            names = {self.contact_name(p) for p in parts} - {""}
+            if len(names) == 1:
+                return names.pop()
         if not parts and r["id"].startswith("addr:"):
             last = self.db.execute(
                 "SELECT sender_addr FROM messages WHERE thread=? AND sender_addr!='' ORDER BY ts DESC LIMIT 1",
@@ -209,10 +322,10 @@ class Store:
 
     def _thread_dict(self, r: sqlite3.Row) -> dict:
         last = self.db.execute(
-            "SELECT text, ts, from_me, attachments FROM messages WHERE thread=? ORDER BY ts DESC LIMIT 1",
+            "SELECT text, ts, from_me, attachments FROM messages WHERE thread=? AND hidden=0 ORDER BY ts DESC LIMIT 1",
             (r["id"],)).fetchone()
         unread = self.db.execute(
-            "SELECT COUNT(*) FROM messages WHERE thread=? AND unread=1", (r["id"],)).fetchone()[0]
+            "SELECT COUNT(*) FROM messages WHERE thread=? AND unread=1 AND hidden=0", (r["id"],)).fetchone()[0]
         parts = json.loads(r["participants"])
         preview = ""
         if last:
@@ -224,6 +337,8 @@ class Store:
             "title": self._thread_title(r),
             "participants": parts,
             "address": parts[0] if len(parts) == 1 else (r["id"][5:] if r["id"].startswith("addr:") and not parts else ""),
+            "addresses": parts if r["id"].startswith("addr:") else [],
+            "self": r["id"] == "addr:self",
             "group": bool(r["is_group"]),
             "service": r["service"],
             "bbChat": r["bb_chat"],
@@ -235,7 +350,7 @@ class Store:
 
     def threads(self, limit: int = 300) -> list[dict]:
         rows = self.db.execute(
-            "SELECT t.* FROM threads t JOIN (SELECT thread, MAX(ts) m FROM messages GROUP BY thread) x "
+            "SELECT t.* FROM threads t JOIN (SELECT thread, MAX(ts) m FROM messages WHERE hidden=0 GROUP BY thread) x "
             "ON x.thread=t.id ORDER BY x.m DESC LIMIT ?", (limit,)).fetchall()
         return [self._thread_dict(r) for r in rows]
 
@@ -253,6 +368,11 @@ class Store:
             "error": r["error"], "via": r["via"], "attachments": json.loads(r["attachments"]),
             "reactions": json.loads(r["reactions"]), "unread": bool(r["unread"]),
             "effect": r["effect"], "guid": r["bb_guid"] or "",
+            "segments": _segments(r["text"], json.loads(r["runs"])) or (
+                # a text effect we sent, before the Mac has reported it back
+                [{"text": r["text"].replace(_OBJ, "").strip(), "styles": [], "effect": r["effect"][5:]}]
+                if r["effect"].startswith("text:") and r["text"].strip() else []),
+            "hidden": bool(r["hidden"]),
         }
 
     def message(self, mid: int) -> dict | None:
@@ -262,10 +382,10 @@ class Store:
     def messages(self, tid: str, limit: int = 300, before: float | None = None) -> list[dict]:
         if before is None:
             rows = self.db.execute(
-                "SELECT * FROM messages WHERE thread=? ORDER BY ts DESC LIMIT ?", (tid, limit)).fetchall()
+                "SELECT * FROM messages WHERE thread=? AND hidden=0 ORDER BY ts DESC LIMIT ?", (tid, limit)).fetchall()
         else:
             rows = self.db.execute(
-                "SELECT * FROM messages WHERE thread=? AND ts<? ORDER BY ts DESC LIMIT ?",
+                "SELECT * FROM messages WHERE thread=? AND hidden=0 AND ts<? ORDER BY ts DESC LIMIT ?",
                 (tid, before, limit)).fetchall()
         return [self._row(r) for r in reversed(rows)]
 
@@ -303,6 +423,7 @@ class Store:
         unread.
         """
         id_col = {"bluebubbles": "bb_guid", "iphone": "map_handle", "local": "temp_id"}[source]
+        m = dict(m, thread=self.canonical(m["thread"]))
         own_id = m.get(id_col)
         from_me = bool(m["from_me"])
         sender = "me" if from_me else C.key(m.get("sender_addr", ""))
@@ -332,13 +453,15 @@ class Store:
         # 3. New.
         cur = self.db.execute(
             "INSERT INTO messages(thread,from_me,sender,sender_addr,text,norm,ts,status,error,via,"
-            "bb_guid,map_handle,temp_id,attachments,unread,effect) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "bb_guid,map_handle,temp_id,attachments,unread,effect,runs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (m["thread"], int(from_me), sender, "" if from_me else m.get("sender_addr", ""),
              m.get("text", ""), norm, float(m["ts"]), m.get("status", ""), m.get("error", ""), source,
              m.get("bb_guid"), m.get("map_handle"), m.get("temp_id"),
              json.dumps(m.get("attachments") or []), int(bool(m.get("unread")) and not from_me),
-             m.get("effect") or ""))
+             m.get("effect") or "", json.dumps(m.get("runs") or [])))
         rid = cur.lastrowid
+        if m["thread"] == "addr:self":
+            self.hide_self_mirrors()
         if m.get("bb_guid"):
             self._apply_pending_reactions(rid, m["bb_guid"])
         self.db.commit()
@@ -359,6 +482,8 @@ class Store:
                 upd["attachments"] = json.dumps(m["attachments"])
             if m.get("effect") and m["effect"] != r["effect"]:
                 upd["effect"] = m["effect"]
+            if m.get("runs") and json.dumps(m["runs"]) != r["runs"]:
+                upd["runs"] = json.dumps(m["runs"])
         if m.get("text") and len(m["text"]) > len(r["text"]) and normalize(m["text"]).startswith(r["norm"]):
             upd["text"] = m["text"]
             upd["norm"] = normalize(m["text"])
@@ -448,3 +573,36 @@ class Store:
 
 def now() -> float:
     return time.time()
+
+
+def _segments(text: str, runs: list[dict]) -> list[dict]:
+    """The text cut into [{text, styles, effect}] pieces by its formatting runs, or [] when it
+    has none. Runs are UTF-16 ranges (Messages stores NSStrings); slicing is done in UTF-16 so
+    emoji before a run don't shift it."""
+    if not runs:
+        return []
+    u = (text or "").encode("utf-16-le")
+    n = len(u) // 2
+    cuts = sorted({0, n} | {max(0, min(n, r["start"])) for r in runs}
+                  | {max(0, min(n, r["start"] + r["length"])) for r in runs})
+    out = []
+    for a, b in zip(cuts, cuts[1:]):
+        if a >= b:
+            continue
+        piece = u[2 * a:2 * b].decode("utf-16-le", "replace").replace(_OBJ, "")
+        if not piece:
+            continue
+        styles, effect = [], ""
+        for r in runs:
+            if r["start"] <= a and b <= r["start"] + r["length"]:
+                styles += [x for x in r.get("styles", []) if x not in styles]
+                effect = r.get("effect") or effect
+        if out and out[-1]["styles"] == styles and out[-1]["effect"] == effect:
+            out[-1]["text"] += piece
+        else:
+            out.append({"text": piece, "styles": styles, "effect": effect})
+    # trim like the plain text is trimmed
+    if out:
+        out[0]["text"] = out[0]["text"].lstrip()
+        out[-1]["text"] = out[-1]["text"].rstrip()
+    return [o for o in out if o["text"]]

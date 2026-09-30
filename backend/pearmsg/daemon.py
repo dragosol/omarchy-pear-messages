@@ -164,6 +164,10 @@ class Daemon:
             self.bb_state = {"state": payload["state"], "detail": payload.get("detail", "")}
             if payload.get("info"):
                 self.bb_info = payload["info"]
+                # the Mac's own iMessage address is yours
+                own = [a for a in (self.bb_info.get("detected_imessage"), self.bb_info.get("detected_icloud")) if a]
+                if own and self.store.add_self(own):
+                    self._identity_changed()
             if payload["state"] == "online":
                 self.bb_online_at = time.time()
                 if self.client:
@@ -176,8 +180,15 @@ class Daemon:
         elif kind == "contacts":
             n = self.store.set_contacts(payload, "bluebubbles")
             log(f"BlueBubbles contacts: {n} addresses")
-            self._broadcast_threads()
+            self._identity_changed()
         return False
+
+    def _identity_changed(self) -> None:
+        """Contacts or your own addresses changed: conversations may now belong together."""
+        n = self.store.rethread()
+        if n:
+            log(f"merged {n} conversation(s) into their person's thread")
+        self._broadcast_threads()
 
     def _on_phone(self, kind, payload):
         if kind == "status":
@@ -190,7 +201,7 @@ class Daemon:
         elif kind == "contacts":
             n = self.store.set_contacts(payload, "iphone")
             log(f"iPhone contacts: {n} addresses")
-            self._broadcast_threads()
+            self._identity_changed()
 
     # ---------------------------------------------------------------- ingest
     def _ingest_bb(self, raw: list[dict]) -> None:
@@ -216,6 +227,8 @@ class Daemon:
                 fresh.append(rid)
         if self.store.merge_orphans():
             self._broadcast_threads()
+        if self.store.learn_self():
+            self._identity_changed()
         if newest:
             cur = int(float(self.store.get_meta("bb_since_ms", "0") or 0))
             self.store.set_meta("bb_since_ms", str(max(cur, int(newest))))
@@ -256,7 +269,7 @@ class Daemon:
         if not text:
             return {"ok": False, "error": "Nothing to send"}
         if not thread:
-            thread = addr_thread(to)
+            thread = self.store.canonical(addr_thread(to))
         t = self.store.thread(thread)
         group = bool(t and t["group"])
         address = to or (t["address"] if t else "") or (thread[5:] if thread.startswith("addr:") else "")
@@ -431,7 +444,12 @@ class Daemon:
         if not shutil.which("notify-send"):
             return
         icon = os.path.join(DATA, "app", "icon.svg")
+        launcher = os.path.join(DATA, "app", "launch.sh")
+        # A click opens this conversation. Omarchy's notifications (and Omapager) run the
+        # omarchy-exec-argv hint straight away, and it still works for a card restored after a
+        # shell restart; other notification daemons use the "default" action instead.
         args = ["notify-send", "-a", "Pear Messages", "-i", icon, "--action=default=Open",
+                "-h", "string:omarchy-exec-argv:" + json.dumps([launcher, m["thread"]]),
                 "-h", "string:x-canonical-private-synchronous:pear-" + m["thread"], title, body]
 
         def run():
@@ -450,9 +468,8 @@ class Daemon:
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         launcher = os.path.join(DATA, "app", "launch.sh")
-        env = dict(os.environ, PEAR_MESSAGES_OPEN=thread)
-        subprocess.Popen([launcher], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        subprocess.Popen([launcher] + ([thread] if thread else []), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
 
     # ---------------------------------------------------------------- pairing
     def _paired(self, p: dict) -> None:
@@ -772,6 +789,10 @@ class Daemon:
         n = self.store.merge_orphans()
         if n:
             log(f"merged {n} duplicate message(s) seen through both connections")
+        self.store.learn_self()
+        n = self.store.rethread()
+        if n:
+            log(f"merged {n} conversation(s) into their person's thread")
         # A send in flight when the daemon stopped never finished. Say so; one click retries it.
         stuck = self.store.db.execute(
             "UPDATE messages SET status='failed', error='Interrupted before it was sent' "

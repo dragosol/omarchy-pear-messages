@@ -228,6 +228,68 @@ class EffectsTest(unittest.TestCase):
         self.assertIn("effect", cols)
 
 
+class IdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        self.t = time.time() - 100
+
+    def _bb(self, guid, text, ts, addr, from_me=False):
+        return BB.to_message({"guid": guid, "text": text, "isFromMe": from_me,
+                              "handle": None if from_me else {"address": addr}, "dateCreated": int(ts * 1000),
+                              "chats": [{"guid": f"iMessage;-;{addr}", "style": 45, "participants": [{"address": addr}]}]})
+
+    def test_messaging_yourself_is_one_thread_shown_once(self):
+        # you text yourself at your number and at your email; Messages keeps a sent and a received copy
+        for i, (addr, text) in enumerate([("+16135550100", "Wow"), ("me@icloud.com", "Happy birthday!")]):
+            self.s.ingest(self._bb(f"O{i}", text, self.t + i * 10, addr, from_me=True), "bluebubbles")
+            self.s.ingest(self._bb(f"I{i}", text, self.t + i * 10, addr), "bluebubbles")
+        self.assertEqual(len(self.s.threads()), 2)
+        self.assertTrue(self.s.learn_self())
+        self.s.rethread()
+        threads = self.s.threads()
+        self.assertEqual([t["id"] for t in threads], ["addr:self"])
+        msgs = self.s.messages("addr:self")
+        self.assertEqual([(m["text"], m["fromMe"]) for m in msgs], [("Wow", True), ("Happy birthday!", True)])
+        # later self-messages go straight there, once
+        self.s.ingest(self._bb("I9", "again", self.t + 50, "me@icloud.com"), "bluebubbles")
+        self.s.ingest(self._bb("O9", "again", self.t + 50, "me@icloud.com", from_me=True), "bluebubbles")
+        self.assertEqual([m["text"] for m in self.s.messages("addr:self")][-1:], ["again"])
+        self.assertEqual(len(self.s.messages("addr:self")), 3)
+
+    def test_one_card_two_numbers_one_thread(self):
+        self.s.set_contacts([{"name": "Sam", "tels": ["+447700900123", "+447700900999"], "emails": []}], "iphone")
+        self.s.ingest(self._bb("A", "hi", self.t, "+447700900123"), "bluebubbles")
+        self.s.ingest(self._bb("B", "yo", self.t + 5, "+447700900999"), "bluebubbles")
+        self.assertEqual(len(self.s.threads()), 1)
+        self.assertEqual(self.s.threads()[0]["title"], "Sam")
+
+    def test_shared_landline_does_not_fuse_people(self):
+        self.s.set_contacts([{"name": "Ana", "tels": ["+15550001111", "+15550002222"], "emails": []},
+                             {"name": "Bo", "tels": ["+15550001111", "+15550003333"], "emails": []}], "iphone")
+        self.s.ingest(self._bb("A", "a", self.t, "+15550002222"), "bluebubbles")
+        self.s.ingest(self._bb("B", "b", self.t + 1, "+15550003333"), "bluebubbles")
+        self.s.ingest(self._bb("C", "c", self.t + 2, "+15550001111"), "bluebubbles")
+        self.assertEqual(len(self.s.threads()), 3)
+
+
+class TextEffectsTest(unittest.TestCase):
+    def test_runs_and_segments(self):
+        ab = [{"string": "Wow! 🤯 so big", "runs": [
+            {"range": [0, 8], "attributes": {"__kIMTextEffectAttributeName": 12, "__kIMMessagePartAttributeName": 0}},
+            {"range": [8, 3], "attributes": {"__kIMMessagePartAttributeName": 0}},
+            {"range": [11, 3], "attributes": {"__kIMTextBoldAttributeName": 1}}]}]
+        runs = BB.text_runs(ab)
+        self.assertEqual(runs, [{"start": 0, "length": 8, "styles": [], "effect": "explode"},
+                                {"start": 11, "length": 3, "styles": ["bold"], "effect": ""}])
+        segs = store._segments("Wow! 🤯 so big", runs)
+        self.assertEqual(segs, [{"text": "Wow! 🤯 ", "styles": [], "effect": "explode"},
+                                {"text": "so ", "styles": [], "effect": ""},
+                                {"text": "big", "styles": ["bold"], "effect": ""}])
+
+    def test_plain_text_has_no_segments(self):
+        self.assertEqual(store._segments("hello", []), [])
+
+
 class BBTest(unittest.TestCase):
     def test_reaction_parse(self):
         r = BB.to_message({"guid": "R", "associatedMessageGuid": "p:0/ABC", "associatedMessageType": 2001,

@@ -42,6 +42,13 @@ once.
   Effects play when a message arrives, and *Replay* plays one again. Sending reactions and effects
   needs BlueBubbles with its Private API turned on. When that isn't possible, because you're only
   connected through the iPhone or the Private API is off, the controls are greyed out and say why.
+- **Text effects and formatting.** iOS 18 **bold**, *italic*, underline and strikethrough show as
+  they were sent. Big, Small, Shake, Nod, Explode, Ripple, Bloom and Jitter animate letter by letter.
+  Phrases like "Happy birthday", "Congrats", "Happy New Year" and "pew pew" play their screen effect,
+  as they do on Apple devices, in several languages.
+- **One conversation per person.** Your own number and Apple Account email are one conversation, and
+  each message you send yourself shows once. A contact with several numbers or emails on one card is
+  one conversation too.
 - **Space to preview.** Click a photo, video or file, or just hover it, and press Space. It opens in
   GNOME's previewer (Sushi) if you have it, or a built-in viewer if you don't. Space or Esc closes it.
 - **Keeps your disk clean.** Recent photos are cached. Videos, and photos more than 200 messages up
@@ -54,7 +61,8 @@ once.
   - **iPhone:** *Pair iPhone* makes this computer visible and shows the pairing code to compare
     with your phone. It then tells you the one switch to flip on the iPhone.
 - **Notifications even when the window is closed.** A small background service keeps
-  receiving. Click a notification to open that conversation.
+  receiving. Click a notification to open Pear Messages on that conversation.
+- **A regular window.** It tiles like any other app, and opens at 1040×680 when floating.
 - **Follows your Omarchy theme.** It is built from Omarchy's own shell components.
 - **Keyboard first.** Ctrl+N starts a new message, Ctrl+F searches, and Alt+↑/↓ moves between
   conversations. Enter sends, Shift+Enter adds a new line, Space previews, Esc goes back.
