@@ -1093,7 +1093,7 @@ ShellRoot {
                                                 readonly property var segs: msgItem.m.segments || []
                                                 readonly property bool textFx: segs.some(sg => !!sg.effect)
                                                 // letters drawn one by one come out a little wider than the string
-                                                width: Math.min(measure.implicitWidth * (textFx ? 1.12 : 1) + (textFx ? 6 : 0), list.bubbleMax - 28) + 28
+                                                width: Math.min(textFx ? effText.naturalWidth + 2 : measure.implicitWidth, list.bubbleMax - 28) + 28
                                                 height: (textFx ? effText.height : body.implicitHeight) + 16
                                                 radius: Math.max(Theme.radius, 4)
                                                 color: msgItem.mine ? (msgItem.m.status === "failed" ? Theme.danger : Theme.accent) : Theme.panel
@@ -2149,6 +2149,12 @@ ShellRoot {
         if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
         if (root.preview === "reactok") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
         // fx_<Name>: play that screen effect, e.g. PEAR_MESSAGES_PREVIEW=fx_Confetti
+        if (root.preview === "textfx") {
+            const fxs = ["big", "small", "shake", "nod", "explode", "ripple", "bloom", "jitter"];
+            root.msgs = fxs.map((f, k) => ({ id: 100 + k, thread: "addr:1", fromMe: k % 2 === 1, sender: "+44", text: f + " effect 🎉",
+                ts: now - 60 + k, status: k % 2 ? "delivered" : "", reactions: {}, guid: "T" + k, attachments: [],
+                segments: [{ text: f.charAt(0).toUpperCase() + f.slice(1) + " effect 🎉", styles: [], effect: f }] }));
+        }
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {
             const want = root.preview.slice(3).replace(/_/g, " ");
