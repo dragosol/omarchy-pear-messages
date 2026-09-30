@@ -45,6 +45,24 @@ ShellRoot {
     // reactions / effects / previews
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
     property int newBelow: 0             // messages that arrived while you were scrolled up
+    property var pending: []             // files waiting to be sent: [{path, name, mime, size}]
+    property string olderState: ""       // "" | "loading" | "end"
+    property string olderNote: ""
+    function loadOlder() {
+        if (root.olderState !== "" || !root.current || root.composing || root.msgs.length === 0) return;
+        root.olderState = "loading";
+        root.send({ op: "older", thread: root.current, before: root.msgs[0].ts, count: 100 });
+    }
+    readonly property bool canAttach: !!root.abilities.attachments
+    function addFiles(files) {
+        if (!files || !files.length) return;
+        if (!root.canAttach) { root.flash = root.abilities.attachReason || "Attachments need BlueBubbles."; return; }
+        const have = root.pending.map(p => p.path);
+        const big = files.filter(f => f.size > 100 * 1024 * 1024);
+        if (big.length) root.flash = big[0].name + " is over 100 MB, which iMessage won't send.";
+        root.pending = root.pending.concat(files.filter(f => have.indexOf(f.path) < 0 && f.size <= 100 * 1024 * 1024));
+    }
+    function removePending(path) { root.pending = root.pending.filter(p => p.path !== path); }
     property bool effectPickerOpen: false
     property string pendingEffect: ""    // effect for the next send
     property var fxPlay: ({})            // message id -> nonce; a change replays its bubble effect
@@ -131,15 +149,29 @@ ShellRoot {
         return (att.mime || "").indexOf("video/") === 0 || /\.(mov|mp4|m4v|avi|mkv|webm|3gp)$/i.test(att.name || "");
     }
     // Photos more than 200 messages up the conversation only ever go to the temp folder.
-    function attTemp(att, msgIndex) { return root.isVideo(att) || msgIndex < root.msgs.length - 200; }
+    // Previews worth keeping on disk: the newest 20 photos/videos within the latest 100 messages.
+    // Everything further up is fetched as you scroll to it, into the temporary folder.
+    readonly property var keepGuids: {
+        const keep = {};
+        let n = 0;
+        for (let i = root.msgs.length - 1; i >= Math.max(0, root.msgs.length - 100) && n < 20; i--)
+            for (const a of (root.msgs[i].attachments || []))
+                if (a.guid && /^(image|video)\//.test(a.mime || "") && n < 20) { keep[a.guid] = true; n++; }
+        return keep;
+    }
+    function attTemp(att, msgIndex) { return !root.keepGuids[att.guid]; }
 
+    // Opening (Space, double-click) shows the original: a file you sent is already here,
+    // anything else is fetched from the Mac into the temporary folder first.
     function previewAttachment(att, msgIndex) {
-        if (!att || !att.guid) return false;
+        if (!att) return false;
+        if (att.path) { root.send({ op: "preview", path: att.path }); return true; }
+        if (!att.guid) return false;
         root.selAtt = att.guid;
-        const st = root.attachments[att.guid];
+        const st = root.attachments[att.guid + "#full"];
         if (st && st.path) { root.send({ op: "preview", path: st.path }); return true; }
-        root.pendingPreview = att.guid;
-        root.needAttachment(att, msgIndex);
+        root.pendingPreview = att.guid + "#full";
+        root.needAttachment(att, msgIndex, "full");
         return true;
     }
     function spacePreview() {
@@ -331,10 +363,17 @@ ShellRoot {
             }
             break;
         case "older":
-            if (d.thread === root.current && d.messages.length) {
+            if (d.thread !== root.current) break;
+            root.olderState = d.more ? "" : "end";
+            root.olderNote = d.note || "";
+            if (d.messages.length) {
+                // keep what you were looking at where it was
+                const have = new Set(root.msgs.map(m => m.id));
+                const add = d.messages.filter(m => !have.has(m.id));
+                if (!add.length) { if (!d.more) root.olderState = "end"; break; }
                 const keep = list.contentHeight - list.contentY;
-                root.msgs = d.messages.concat(root.msgs);
-                Qt.callLater(() => list.contentY = list.contentHeight - keep);
+                root.msgs = add.concat(root.msgs);
+                Qt.callLater(() => { list.forceLayout(); list.contentY = list.contentHeight - keep; });
             }
             break;
         case "messages": {
@@ -382,15 +421,31 @@ ShellRoot {
             root.bbTest = d;
             if (d.ok) bbPassword.text = "";
             break;
+        case "picked":
+            if (d.error) root.flash = d.error;
+            root.addFiles(d.files || []);
+            composer.forceActiveFocus();
+            break;
+        case "file_info":
+            root.addFiles(d.files || []);
+            break;
+        case "clipboard_image":
+            if (d.file) root.addFiles([d.file]);
+            break;
         case "bb_found":
             root.bbFinding = false;
             root.bbFound = d.servers;
             break;
         case "attachment": {
+            const key = d.kind === "full" ? d.guid + "#full" : d.guid;
             const a = Object.assign({}, root.attachments);
-            a[d.guid] = d.path ? { path: d.path, temp: !!d.temp } : { error: d.error || "failed" };
+            a[key] = d.path ? { path: d.path } : { error: d.error || "failed", big: !!d.big };
             root.attachments = a;
-            if (d.path && root.pendingPreview === d.guid) { root.pendingPreview = ""; root.send({ op: "preview", path: d.path }); }
+            if (root.pendingPreview === key) {
+                root.pendingPreview = "";
+                if (d.path) root.send({ op: "preview", path: d.path });
+                else root.flash = d.error || "Couldn't open it";
+            }
             break;
         }
         case "preview":
@@ -409,6 +464,8 @@ ShellRoot {
 
     function openThread(id) {
         root.newBelow = 0;
+        if (id !== root.current) { root.olderState = ""; root.olderNote = ""; }
+        if (id !== root.current) root.pending = [];
         root.composing = false;
         root.picker = null;
         root.effectPickerOpen = false;
@@ -441,28 +498,35 @@ ShellRoot {
 
     function sendCurrent() {
         const text = composer.text.trim();
-        if (!text) return;
+        const files = root.pending.map(p => p.path);
+        if (!text && !files.length) return;
+        if (files.length && !root.canAttach) { root.flash = root.abilities.attachReason; return; }
         if (root.composing) {
             const to = root.composeTo || toField.text.trim();
             if (!to) { root.flash = "Who is this to?"; toField.forceActiveFocus(); return; }
-            root.send({ op: "send", to: to, text: text, effect: root.pendingEffect });
+            root.send({ op: "send", to: to, text: text, effect: root.pendingEffect, files: files });
         } else if (root.current) {
-            root.send({ op: "send", thread: root.current, text: text, effect: root.pendingEffect });
+            root.send({ op: "send", thread: root.current, text: text, effect: root.pendingEffect, files: files });
         } else return;
         composer.text = "";
+        root.pending = [];
         root.pendingEffect = "";
         root.effectPickerOpen = false;
     }
 
-    function needAttachment(att, msgIndex) {
+    // kind "preview": the small picture shown in the conversation (photo / video thumbnail).
+    // kind "full": the original file, only when you open it. force: a big video's thumbnail.
+    function needAttachment(att, msgIndex, kind, force) {
+        kind = kind || "preview";
         if (!att.guid) return;
-        const cur = root.attachments[att.guid];
-        if (cur && (cur.path || cur.loading)) return;
+        const key = kind === "full" ? att.guid + "#full" : att.guid;
+        const cur = root.attachments[key];
+        if (cur && (cur.path || cur.loading || (cur.big && !force))) return;
         const a = Object.assign({}, root.attachments);
-        a[att.guid] = { loading: true };
+        a[key] = { loading: true };
         root.attachments = a;
-        root.send({ op: "attachment", guid: att.guid, name: att.name, mime: att.mime,
-                    temp: root.attTemp(att, msgIndex === undefined ? root.msgs.length : msgIndex) });
+        root.send({ op: "attachment", guid: att.guid, name: att.name, mime: att.mime, size: att.size || 0,
+                    kind: kind, force: !!force, temp: root.attTemp(att, msgIndex) });
     }
 
     // ------------------------------------------------------------------ formatting
@@ -591,6 +655,38 @@ ShellRoot {
                     font.pixelSize: Theme.fCaption
                 }
                 TapHandler { onTapped: root.builtinPreview = "" }
+            }
+
+            // drop files anywhere on the window to attach them
+            DropArea {
+                id: dropArea
+                anchors.fill: parent
+                z: 90
+                keys: ["text/uri-list"]
+                onDropped: drop => {
+                    const files = (drop.urls || []).map(u => decodeURIComponent(String(u).replace(/^file:\/\//, "")))
+                                                   .filter(f => f.length > 0);
+                    if (files.length) root.send({ op: "file_info", files: files });
+                    drop.accept();
+                }
+            }
+            Rectangle {
+                anchors.fill: parent
+                z: 91
+                visible: dropArea.containsDrag
+                color: Qt.rgba(Theme.bg.r, Theme.bg.g, Theme.bg.b, 0.85)
+                border.width: 2
+                border.color: root.canAttach ? Theme.accent : Theme.danger
+                Text {
+                    anchors.centerIn: parent
+                    width: parent.width * 0.7
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: root.canAttach ? "Drop to attach" : (root.abilities.attachReason || "Attachments need BlueBubbles.")
+                    color: root.canAttach ? Theme.fg : Theme.danger
+                    font.family: Theme.uiFont
+                    font.pixelSize: Theme.fHeading
+                }
             }
 
             RowLayout {
@@ -926,10 +1022,70 @@ ShellRoot {
                                 ScrollPhysics { id: msgPhys; flick: list }
                                 WheelHandler {
                                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-                                    onWheel: ev => msgPhys.wheel(ev)
+                                    onWheel: ev => {
+                                        // a mouse notch upward while already at the top counts as a pull
+                                        const notch = ev.pixelDelta.y === 0 && ev.angleDelta.y !== 0 && ev.angleDelta.y % 120 === 0;
+                                        if (notch && ev.angleDelta.y > 0 && list.contentY <= msgPhys.minY + 1 && !msgPhys.busy) {
+                                            list.wheelPulls++;
+                                            wheelPullReset.restart();
+                                            if (list.wheelPulls >= 2) { list.wheelPulls = 0; root.loadOlder(); }
+                                        }
+                                        msgPhys.wheel(ev);
+                                    }
+                                }
+                                readonly property real pullThreshold: 70
+                                readonly property real overscroll: Math.max(0, msgPhys.minY - contentY)
+                                property real pullPeak: 0
+                                property int wheelPulls: 0
+                                Timer { id: wheelPullReset; interval: 1400; onTriggered: list.wheelPulls = 0 }
+                                onOverscrollChanged: if (msgPhys.mode === "drag" && overscroll > pullPeak) pullPeak = overscroll
+                                Connections {
+                                    target: msgPhys
+                                    // fingers lifted after pulling far enough past the top
+                                    function onModeChanged() {
+                                        if (msgPhys.mode === "drag") return;
+                                        if (list.pullPeak >= list.pullThreshold) root.loadOlder();
+                                        list.pullPeak = 0;
+                                    }
                                 }
                                 function stopPhysics() { msgPhys.stopPhysics(); }
-                                header: Item { width: 1; height: 12 }
+                                // Pull for earlier messages: past the top on a touchpad, or two more
+                                // wheel notches once you're at the top.
+                                header: Item {
+                                    width: list.width
+                                    height: 46
+                                    readonly property real pull: Math.max(list.pullPeak, list.overscroll)
+                                    readonly property bool ready: pull >= list.pullThreshold || list.wheelPulls >= 1
+                                    Row {
+                                        anchors.centerIn: parent
+                                        spacing: 8
+                                        Text {
+                                            id: pullGlyph
+                                            text: root.olderState === "loading" ? "↻" : "↑"
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fBody
+                                            visible: root.olderState !== "end"
+                                            rotation: root.olderState === "loading" ? spin.angle
+                                                    : Math.min(180, 180 * parent.parent.pull / list.pullThreshold)
+                                            QtObject { id: spin; property real angle: 0 }
+                                            Timer {
+                                                interval: 16; repeat: true; running: root.olderState === "loading"
+                                                onTriggered: spin.angle = (spin.angle + 9) % 360
+                                            }
+                                        }
+                                        Text {
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                            text: root.olderState === "loading" ? "Loading earlier messages…"
+                                                : root.olderState === "end" ? (root.olderNote || "No earlier messages")
+                                                : parent.parent.ready ? (list.wheelPulls >= 1 && list.overscroll <= 0 ? "Scroll up once more to load earlier messages" : "Release to load earlier messages")
+                                                : "Pull for earlier messages"
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+                                }
                                 footer: Item { width: 1; height: 12 }
                                 readonly property real bubbleMax: Math.min(560, width * 0.72)
                                 readonly property int lastMine: {
@@ -991,12 +1147,8 @@ ShellRoot {
                                     // A bounce past the end still counts as at the end.
                                     if (userScrolling) checkPin();
                                     root.picker = null;
-                                    if (contentY <= originY + 40 && root.msgs.length >= 200 && !loadingOlder.running) {
-                                        loadingOlder.start();
-                                        root.send({ op: "older", thread: root.current, before: root.msgs[0].ts });
-                                    }
+
                                 }
-                                Timer { id: loadingOlder; interval: 800 }
 
                                 delegate: Item {
                                     id: msgItem
@@ -1045,16 +1197,18 @@ ShellRoot {
                                             delegate: Item {
                                                 id: attItem
                                                 required property var modelData
-                                                readonly property var st: root.attachments[modelData.guid] || ({})
-                                                readonly property bool isImage: (modelData.mime || "").indexOf("image/") === 0
-                                                                               && modelData.size < 25000000
+                                                readonly property var st: root.attachments[modelData.guid]
+                                                                          || (modelData.path ? { path: modelData.path } : ({}))
                                                 readonly property bool isVideo: root.isVideo(modelData)
+                                                // a file you sent is here already; a video you sent has no thumbnail yet
+                                                readonly property bool isImage: (modelData.mime || "").indexOf("image/") === 0
+                                                                               || (isVideo && !modelData.path)
                                                 readonly property bool selected: root.selAtt === modelData.guid
                                                 width: col.width
                                                 height: isImage && st.path ? img.height : fileChip.height
-                                                // Photos load by themselves (to the temp folder when far up the
-                                                // conversation); videos only when you ask to see one.
-                                                Component.onCompleted: if (isImage) root.needAttachment(modelData, msgItem.index)
+                                                // Previews (photo, video thumbnail) are fetched when the message comes
+                                                // into view - the list creates rows just before they scroll on screen.
+                                                Component.onCompleted: if (isImage && !modelData.path) root.needAttachment(modelData, msgItem.index)
 
                                                 function hover(on) {
                                                     if (on) root.hoverAtt = { att: attItem.modelData, index: msgItem.index };
@@ -1077,6 +1231,24 @@ ShellRoot {
                                                     TapHandler {
                                                         onTapped: root.selAtt = attItem.modelData.guid
                                                         onDoubleTapped: root.previewAttachment(attItem.modelData, msgItem.index)
+                                                    }
+                                                    // a video: play badge and size
+                                                    Rectangle {
+                                                        visible: attItem.isVideo
+                                                        anchors.centerIn: parent
+                                                        width: 46; height: 46; radius: 23
+                                                        color: Qt.rgba(0, 0, 0, 0.55)
+                                                        border.width: 1.5
+                                                        border.color: Qt.rgba(1, 1, 1, 0.8)
+                                                        Text { anchors.centerIn: parent; anchors.horizontalCenterOffset: 2; text: "▶"; color: "white"; font.pixelSize: 18 }
+                                                    }
+                                                    Rectangle {
+                                                        visible: attItem.isVideo && attItem.modelData.size > 0
+                                                        anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 6
+                                                        width: sizeText.implicitWidth + 12; height: sizeText.implicitHeight + 4
+                                                        radius: height / 2
+                                                        color: Qt.rgba(0, 0, 0, 0.55)
+                                                        Text { id: sizeText; anchors.centerIn: parent; text: root.fmtSize(attItem.modelData.size); color: "white"; font.pixelSize: Theme.fCaption }
                                                     }
                                                     Rectangle {
                                                         anchors.fill: parent
@@ -1105,7 +1277,8 @@ ShellRoot {
                                                         anchors.rightMargin: 14
                                                         verticalAlignment: Text.AlignVCenter
                                                         elide: Text.ElideMiddle
-                                                        text: (attItem.st.loading ? "Loading… " : attItem.st.error ? "Couldn't load " : attItem.isVideo ? "▶  " : "📎  ")
+                                                        text: attItem.st.big ? "▶  Video · " + root.fmtSize(attItem.modelData.size) + " — click for a preview"
+                                                            : (attItem.st.loading ? "Loading… " : attItem.st.error ? "Couldn't load " : attItem.isVideo ? "▶  " : "📎  ")
                                                               + (attItem.modelData.name || "Attachment")
                                                               + (attItem.modelData.size ? "  ·  " + root.fmtSize(attItem.modelData.size) : "")
                                                         color: attItem.st.error ? Theme.danger : Theme.fg
@@ -1114,7 +1287,11 @@ ShellRoot {
                                                     }
                                                     HoverHandler { id: chipHover; cursorShape: Qt.PointingHandCursor; onHoveredChanged: attItem.hover(hovered) }
                                                     TapHandler {
-                                                        onTapped: root.selAtt = attItem.modelData.guid
+                                                        onTapped: {
+                                                            root.selAtt = attItem.modelData.guid;
+                                                            // a big video's thumbnail is fetched when you ask for it
+                                                            if (attItem.st.big) root.needAttachment(attItem.modelData, msgItem.index, "preview", true);
+                                                        }
                                                         onDoubleTapped: root.previewAttachment(attItem.modelData, msgItem.index)
                                                     }
                                                 }
@@ -1644,6 +1821,76 @@ ShellRoot {
                             Timer { running: root.flash !== ""; interval: 6000; onTriggered: root.flash = "" }
                         }
 
+                        // files waiting to be sent
+                        Rectangle {
+                            Layout.fillWidth: true
+                            visible: root.pending.length > 0 && (root.current !== "" || root.composing)
+                            implicitHeight: 92
+                            color: Theme.bg
+                            Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Theme.line }
+                            ListView {
+                                anchors.fill: parent
+                                anchors.margins: 12
+                                anchors.leftMargin: 16
+                                orientation: ListView.Horizontal
+                                spacing: 10
+                                clip: true
+                                model: root.pending
+                                delegate: Rectangle {
+                                    id: chip
+                                    required property var modelData
+                                    readonly property bool image: (modelData.mime || "").indexOf("image/") === 0
+                                    width: image ? 68 : Math.min(240, chipLabel.implicitWidth + 58)
+                                    height: 68
+                                    radius: Math.max(Theme.radius, 6)
+                                    color: Theme.panel
+                                    border.width: 1
+                                    border.color: Theme.line
+                                    clip: true
+                                    Image {
+                                        visible: chip.image
+                                        anchors.fill: parent
+                                        source: chip.image ? "file://" + chip.modelData.path : ""
+                                        fillMode: Image.PreserveAspectCrop
+                                        sourceSize.width: 160
+                                        asynchronous: true
+                                    }
+                                    Column {
+                                        visible: !chip.image
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        x: 12
+                                        width: parent.width - 40
+                                        spacing: 2
+                                        Text {
+                                            id: chipLabel
+                                            width: parent.width
+                                            text: (/^video\//.test(chip.modelData.mime) ? "▶  " : "📎  ") + chip.modelData.name
+                                            elide: Text.ElideMiddle
+                                            color: Theme.fg
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fSmall
+                                        }
+                                        Text {
+                                            text: root.fmtSize(chip.modelData.size)
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                        }
+                                    }
+                                    Rectangle {   // remove
+                                        anchors.top: parent.top
+                                        anchors.right: parent.right
+                                        anchors.margins: 4
+                                        width: 20; height: 20; radius: 10
+                                        color: Qt.rgba(0, 0, 0, 0.6)
+                                        Text { anchors.centerIn: parent; text: "×"; color: "white"; font.pixelSize: 14 }
+                                        TapHandler { onTapped: root.removePending(chip.modelData.path) }
+                                        HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                    }
+                                }
+                            }
+                        }
+
                         // composer
                         Rectangle {
                             Layout.fillWidth: true
@@ -1656,6 +1903,17 @@ ShellRoot {
                                 anchors.margins: 12
                                 anchors.leftMargin: 16
                                 spacing: 10
+                                AppButton {
+                                    Layout.alignment: Qt.AlignBottom
+                                    text: "＋"
+                                    opacity: root.canAttach ? 1 : 0.4
+                                    tooltipText: root.canAttach ? "Attach photos or files — or drop them here, or paste an image"
+                                                                : (root.abilities.attachReason || "")
+                                    onClicked: {
+                                        if (!root.canAttach) { root.flash = root.abilities.attachReason; return; }
+                                        root.send({ op: "pick_files" });
+                                    }
+                                }
                                 ScrollView {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
@@ -1684,6 +1942,8 @@ ShellRoot {
                                         topPadding: 9
                                         bottomPadding: 9
                                         Keys.onPressed: function (ev) {
+                                            if (ev.key === Qt.Key_V && (ev.modifiers & Qt.ControlModifier) && root.canAttach)
+                                                root.send({ op: "clipboard_image" });
                                             if (ev.key === Qt.Key_Space && composer.text === "" && (root.builtinPreview || root.spacePreview())) {
                                                 if (root.builtinPreview) root.builtinPreview = "";
                                                 ev.accepted = true;
@@ -1737,7 +1997,7 @@ ShellRoot {
                                 AppButton {
                                     Layout.alignment: Qt.AlignBottom
                                     text: "Send"
-                                    enabled: composer.text.trim() !== "" && root.route !== "none"
+                                    enabled: (composer.text.trim() !== "" || root.pending.length > 0) && root.route !== "none"
                                     onClicked: root.sendCurrent()
                                 }
                             }
@@ -2226,9 +2486,10 @@ ShellRoot {
         if (root.preview === "pair") root.pair = { stage: "confirm", device: "Alex’s iPhone", code: "436952" };
         const reason = "Reactions and effects need BlueBubbles. You're connected through your iPhone over Bluetooth, which only carries plain text.";
         if (root.preview === "react" || root.preview === "effects" || root.preview === "iphone") {
-            root.status = Object.assign({}, root.status, { route: "iphone", abilities: { reactions: false, effects: false, reason: reason } });
+            root.status = Object.assign({}, root.status, { route: "iphone", abilities: { reactions: false, effects: false, reason: reason,
+                attachments: false, attachReason: "Attachments need BlueBubbles. Over Bluetooth your iPhone only sends text." } });
         } else {
-            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, reason: "" } });
+            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, reason: "", attachments: true, attachReason: "" } });
         }
         if (root.preview === "effects") root.effectPickerOpen = true;
         if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
@@ -2239,6 +2500,12 @@ ShellRoot {
             root.msgs = fxs.map((f, k) => ({ id: 100 + k, thread: "addr:1", fromMe: k % 2 === 1, sender: "+44", text: f + " effect 🎉",
                 ts: now - 60 + k, status: k % 2 ? "delivered" : "", reactions: {}, guid: "T" + k, attachments: [],
                 segments: [{ text: f.charAt(0).toUpperCase() + f.slice(1) + " effect 🎉", styles: [], effect: f }] }));
+        }
+        if (root.preview === "attach") {
+            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, reason: "", attachments: true, attachReason: "" } });
+            root.pending = [{ path: Qt.resolvedUrl("fx/balloon-blue.png").toString().replace("file://", ""), name: "balloon.png", mime: "image/png", size: 48213 },
+                            { path: "/tmp/Quarterly report final v3.pdf", name: "Quarterly report final v3.pdf", mime: "application/pdf", size: 2400000 },
+                            { path: "/tmp/IMG_2210.MOV", name: "IMG_2210.MOV", mime: "video/quicktime", size: 31000000 }];
         }
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {

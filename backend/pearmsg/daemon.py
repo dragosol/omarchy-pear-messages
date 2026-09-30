@@ -35,6 +35,7 @@ from . import contacts as C
 from . import iphone as IP
 from . import tailnet
 from . import tapback
+from . import media
 from .store import Store, addr_thread
 
 HOME = os.path.expanduser("~")
@@ -143,7 +144,10 @@ class Daemon:
         if want and not self.poller:
             self.client = BB.Client(creds["url"], creds["password"])
             since = int(float(self.store.get_meta("bb_since_ms", "0") or 0))
-            self.poller = BB.Poller(self.client, since, self._from_bb_thread)
+            # "backfill_v2": the default history (100 messages for the 20 latest chats, 20 for the
+            # rest) - taken once, including by installs that synced before it existed.
+            self.poller = BB.Poller(self.client, since, self._from_bb_thread,
+                                    backfill=self.store.get_meta("backfill_v2") != "done")
             self.poller.start()
         if not want:
             self.bb_state = {"state": "off", "detail": "" if creds.get("url") else "Not set up"}
@@ -178,6 +182,11 @@ class Daemon:
                 self._broadcast_status()
         elif kind == "messages":
             self._ingest_bb(payload)
+        elif kind == "backfill_failed":
+            log(f"history from the Mac didn't finish ({payload.get('error')}); will try again later")
+        elif kind == "backfilled":
+            self.store.set_meta("backfill_v2", "done")
+            log(f"history from the Mac: {payload.get('chats')} conversations")
         elif kind == "contacts":
             n = self.store.set_contacts(payload, "bluebubbles")
             log(f"BlueBubbles contacts: {n} addresses")
@@ -278,10 +287,13 @@ class Daemon:
             self._notify(rid)
 
     # ----------------------------------------------------------------- send
-    def send(self, thread: str, text: str, to: str = "", effect: str = "") -> dict:
+    def send(self, thread: str, text: str, to: str = "", effect: str = "", files: list | None = None) -> dict:
         text = (text or "").strip()
-        if not text:
+        files = [f for f in (files or []) if f and os.path.isfile(f)]
+        if not text and not files:
             return {"ok": False, "error": "Nothing to send"}
+        if files and not self.abilities()["attachments"]:
+            return {"ok": False, "error": self.abilities()["attachReason"]}
         if not thread:
             thread = self.store.canonical(addr_thread(to))
         t = self.store.thread(thread)
@@ -293,6 +305,13 @@ class Daemon:
             self.store.ensure_thread(thread, participants=[address] if address else [])
         if effect and not self.abilities()["effects"]:
             effect = ""
+        bb_chat = (t or {}).get("bbChat", "")
+        # Each file is its own message, then the text - the order Messages uses.
+        last = None
+        for f in files:
+            last = self._send_file(thread, address, bb_chat, f)
+        if not text:
+            return {"ok": True, "id": last, "thread": thread}
         temp = BB.new_temp_guid()
         _, rid = self.store.ingest({
             "temp_id": temp, "thread": thread, "from_me": True, "text": text,
@@ -300,6 +319,103 @@ class Daemon:
         self._after_ingest({thread: [rid]}, [])
         self._route(rid, thread, address, group, text, temp, (t or {}).get("bbChat", ""), effect)
         return {"ok": True, "id": rid, "thread": thread}
+
+    def _send_file(self, thread: str, address: str, bb_chat: str, path: str) -> int:
+        import mimetypes
+        temp = BB.new_temp_guid()
+        name = os.path.basename(path)
+        att = {"guid": "", "name": name, "mime": mimetypes.guess_type(name)[0] or "",
+               "size": os.path.getsize(path), "path": path}
+        _, rid = self.store.ingest({
+            "temp_id": temp, "thread": thread, "from_me": True, "text": "", "attachments": [att],
+            "ts": time.time(), "status": "sending"}, "local")
+        self._after_ingest({thread: [rid]}, [])
+        # A conversation the Mac hasn't seen yet can still be addressed by its would-be chat id.
+        chat = bb_chat or (f"any;-;{address}" if address else "")
+        client = self.client
+        private = bool(self.bb_info.get("private_api"))
+
+        def work():
+            try:
+                if not chat:
+                    raise BB.BBError("No address for this conversation")
+                res = client.send_attachment(chat, path, temp, private)
+                GLib.idle_add(done, res, "")
+            except (BB.BBError, OSError) as e:
+                GLib.idle_add(done, None, str(e))
+
+        def done(res, err):
+            if err:
+                self.store.set_status(rid, "failed", f"Couldn't send the file: {err}")
+            else:
+                if isinstance(res, dict) and res.get("guid"):
+                    n = BB.to_message({**res, "tempGuid": temp})
+                    if n and n.get("kind") == "message":
+                        n["temp_id"] = temp
+                        self.store.ingest(n, "bluebubbles")
+                self.store.set_status(rid, "sent", "", via="bluebubbles")
+            m = self.store.message(rid)
+            self._after_ingest({m["thread"] if m else thread: [rid]}, [])
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+        return rid
+
+    # ------------------------------------------------------------ picking files
+    def _pick_files(self, c, rid) -> None:
+        """The desktop's own file chooser, through xdg-desktop-portal."""
+        import random
+        try:
+            portal = self.ses.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+            fc = dbus.Interface(portal, "org.freedesktop.portal.FileChooser")
+        except dbus.DBusException as e:
+            self._send(c, {"ev": "picked", "re": rid, "files": [], "error": f"No file chooser: {e}"})
+            return
+        token = "pearmessages%d" % random.randint(0, 1 << 30)
+        sender = self.ses.get_unique_name()[1:].replace(".", "_")
+        handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+        def response(code, results, _match=[None]):
+            if _match[0] is not None:
+                _match[0].remove()
+            files = []
+            if code == 0:
+                import urllib.parse
+                for u in results.get("uris", []):
+                    u = str(u)
+                    if u.startswith("file://"):
+                        files.append(urllib.parse.unquote(urllib.parse.urlparse(u).path))
+            self._send(c, {"ev": "picked", "re": rid, "files": [self._file_info(f) for f in files]})
+
+        match = self.ses.add_signal_receiver(response, "Response", "org.freedesktop.portal.Request", path=handle)
+        response.__defaults__[0][0] = match
+        fc.OpenFile("", "Attach to message", {"multiple": dbus.Boolean(True), "handle_token": token},
+                    reply_handler=lambda h: None,
+                    error_handler=lambda e: self._send(c, {"ev": "picked", "re": rid, "files": [], "error": str(e)}))
+
+    def _file_info(self, path: str) -> dict:
+        import mimetypes
+        return {"path": path, "name": os.path.basename(path), "mime": mimetypes.guess_type(path)[0] or "",
+                "size": os.path.getsize(path) if os.path.isfile(path) else 0}
+
+    def _clipboard_image(self, c, rid) -> None:
+        """An image on the clipboard (a screenshot, say) saved to a file so it can be attached."""
+        def work():
+            info = None
+            try:
+                types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=3).stdout.split()
+                kind = next((t for t in ("image/png", "image/jpeg", "image/gif", "image/webp") if t in types), "")
+                if kind:
+                    d = os.path.join(RUNTIME, "outgoing")
+                    os.makedirs(d, mode=0o700, exist_ok=True)
+                    path = os.path.join(d, time.strftime("Pasted image %Y-%m-%d at %H.%M.%S.") + kind.split("/")[1].replace("jpeg", "jpg"))
+                    with open(path, "wb") as f:
+                        f.write(subprocess.run(["wl-paste", "--type", kind], capture_output=True, timeout=10).stdout)
+                    info = self._file_info(path)
+            except (OSError, subprocess.SubprocessError):
+                info = None
+            GLib.idle_add(lambda: (self._send(c, {"ev": "clipboard_image", "re": rid, "file": info}), False)[1])
+        threading.Thread(target=work, daemon=True).start()
 
     def retry(self, rid: int) -> None:
         m = self.store.message(rid)
@@ -386,8 +502,14 @@ class Daemon:
     def abilities(self) -> dict:
         """What can be sent beyond text right now, and if nothing, why - in words for the UI."""
         creds = _read_json(BB_CREDS, {})
+        # Attachments go through BlueBubbles' ordinary send (AppleScript is enough); the
+        # iPhone's Bluetooth link carries plain SMS text only.
+        attach = {"attachments": self.bb_online, "attachReason": "" if self.bb_online else (
+            "Attachments need BlueBubbles. Over Bluetooth your iPhone only sends text."
+            + (" BlueBubbles is offline right now." if creds.get("url") and self.settings["bluebubbles"]["enabled"] else "")
+            if self.phone_state.get("state") == "online" else "Attachments need BlueBubbles, and it isn't connected.")}
         if self.bb_online and self.bb_info.get("private_api"):
-            return {"reactions": True, "effects": True, "reason": ""}
+            return {"reactions": True, "effects": True, "reason": "", **attach}
         if self.bb_online:
             reason = ("Reactions and effects need BlueBubbles' Private API, which is off on your Mac. "
                       "Turn it on in BlueBubbles Server → Settings → Private API (it needs System "
@@ -399,7 +521,7 @@ class Daemon:
                 reason += " BlueBubbles is offline right now."
         else:
             reason = "Not connected."
-        return {"reactions": False, "effects": False, "reason": reason}
+        return {"reactions": False, "effects": False, "reason": reason, **attach}
 
     def react(self, c, rid, mid: int, kind: str) -> None:
         m = self.store.message(mid)
@@ -628,18 +750,22 @@ class Daemon:
             tid = req["thread"]
             c.viewing = tid
             reply({"ev": "thread", "thread": tid, "info": self.store.thread(tid),
-                   "messages": self.store.messages(tid, int(req.get("limit", 200)))})
+                   "messages": self.store.messages(tid, int(req.get("limit", 100)))})
             # Opening is not reading: the window opens conversations on its own (at start, on
             # reconnect, from a notification). Only a focused view marks read.
             if c.active and c.viewing == tid:
                 self._mark_read(tid)
         elif op == "older":
-            tid = req["thread"]
-            reply({"ev": "older", "thread": tid,
-                   "messages": self.store.messages(tid, 200, float(req["before"]))})
+            self._older(c, rid, req["thread"], float(req["before"]), int(req.get("count", 100)))
         elif op == "send":
             reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""),
-                                             req.get("effect", ""))})
+                                             req.get("effect", ""), req.get("files") or [])})
+        elif op == "pick_files":
+            self._pick_files(c, rid)
+        elif op == "clipboard_image":
+            self._clipboard_image(c, rid)
+        elif op == "file_info":
+            reply({"ev": "file_info", "files": [self._file_info(f) for f in req.get("files", []) if os.path.isfile(f)]})
         elif op == "react":
             self.react(c, rid, int(req["message"]), req.get("reaction", ""))
         elif op == "retry":
@@ -648,7 +774,8 @@ class Daemon:
             reply({"ev": "search", "q": req.get("q", ""), "results": self.store.search_contacts(req.get("q", ""))})
         elif op == "attachment":
             self._attachment(c, rid, req["guid"], req.get("name", ""), req.get("mime", ""),
-                             bool(req.get("temp")))
+                             None if req.get("force") else bool(req.get("temp")),
+                             req.get("kind", "preview"), req.get("size", 0))
         elif op == "preview":
             self._preview(c, rid, req.get("path", ""))
         # ---- settings / connection assistant
@@ -695,6 +822,47 @@ class Daemon:
         else:
             reply({"ev": "error", "error": f"unknown op {op!r}"})
 
+    def _older(self, c, rid, tid: str, before: float, count: int) -> None:
+        """Earlier messages for a conversation: what's stored here first; when that runs out,
+        ask the Mac (BlueBubbles) for the next ones. The iPhone keeps no history over Bluetooth."""
+        local = self.store.messages(tid, count, before)
+        if len(local) >= count:
+            self._send(c, {"ev": "older", "re": rid, "thread": tid, "messages": local, "more": True})
+            return
+        t = self.store.thread(tid) or {}
+        if not (self.bb_online and self.client):
+            self._send(c, {"ev": "older", "re": rid, "thread": tid, "messages": local, "more": False,
+                           "note": "" if local else "That's everything stored here. Earlier messages come from your Mac, through BlueBubbles, which isn't connected."})
+            return
+        # every chat on the Mac that belongs to this conversation
+        guids = [t.get("bbChat")] if t.get("bbChat") else []
+        if not t.get("group"):
+            for a in t.get("participants") or []:
+                guids += [f"iMessage;-;{a}", f"SMS;-;{a}", f"RCS;-;{a}"]
+        guids = list(dict.fromkeys(g for g in guids if g))
+        oldest = local[0]["ts"] if local else before
+        client = self.client
+
+        def work():
+            got = []
+            for g in guids:
+                try:
+                    got += client.chat_messages(g, limit=count, before_ms=int(oldest * 1000))
+                except BB.BBError:
+                    pass
+            GLib.idle_add(done, got)
+
+        def done(got):
+            if got:
+                self._ingest_bb(list(reversed(got)))
+            msgs = self.store.messages(tid, count, before)
+            self._send(c, {"ev": "older", "re": rid, "thread": tid, "messages": msgs,
+                           "more": bool(got) or len(msgs) >= count,
+                           "note": "" if msgs else "No earlier messages."})
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _mark_read(self, tid: str) -> None:
         if self.store.mark_read(tid):
             self._broadcast_threads()
@@ -738,42 +906,53 @@ class Daemon:
             GLib.idle_add(lambda: (self._send(c, {"ev": "bb_found", "re": rid, "servers": found}), False)[1])
         threading.Thread(target=work, daemon=True).start()
 
-    def _attachment(self, c, rid, guid, name, mime="", temp=False) -> None:
-        """Download an attachment from BlueBubbles.
-
-        Where it goes: videos, and anything the app marks `temp` (photos far up a conversation),
-        land in the runtime directory - memory-backed, gone at logout - so scrolling back
-        through years of history never fills the disk. Recent photos are kept in the cache.
-        """
+    def _attachment(self, c, rid, guid, name, mime="", temp=False, kind="preview", size=0) -> None:
+        """A photo/video preview (kind "preview") or the original file (kind "full"), from the
+        Mac, on demand. Previews of the newest photos in a conversation are kept (temp=False);
+        everything else, and every original, goes to the temporary folder (memory-backed,
+        cleared at logout). See media.py."""
         safe = "".join(ch for ch in (name or "file") if ch.isalnum() or ch in "._- ")[:80] or "file"
-        fname = f"{guid[:16]}-{safe}"
-        keep_dir = os.path.join(CACHE, "attachments")
-        temp_dir = os.path.join(RUNTIME, "attachments")
         is_video = (mime or "").startswith("video/") or safe.lower().endswith(
             (".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm", ".3gp"))
-        for d in (keep_dir, temp_dir):
+        is_image = (mime or "").startswith("image/")
+        keep_dir, temp_dir = os.path.join(CACHE, "previews"), os.path.join(RUNTIME, "previews")
+        if kind == "full":
+            fname, dirs = f"{guid[:16]}-{safe}", (os.path.join(RUNTIME, "attachments"),)
+            keep_dir = temp_dir = dirs[0]
+        else:
+            fname, dirs = f"{guid[:16]}-preview.jpg", (keep_dir, temp_dir)
+        for d in dirs + (os.path.join(CACHE, "attachments"),) if kind == "full" else dirs:
             if os.path.exists(os.path.join(d, fname)):
-                self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "path": os.path.join(d, fname)})
+                self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "kind": kind, "path": os.path.join(d, fname)})
                 return
-        d = temp_dir if (temp or is_video) else keep_dir
+        reply = lambda res: self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "kind": kind, **res})
+        if kind == "preview" and not (is_image or is_video):
+            reply({"error": "no preview"})
+            return
+        client = self.client
+        if not client or not self.bb_online:
+            reply({"error": "Pictures come from your Mac through BlueBubbles, which isn't connected"})
+            return
+        d = temp_dir if (temp or kind == "full") else keep_dir
         os.makedirs(d, mode=0o700, exist_ok=True)
         path = os.path.join(d, fname)
-        client = self.client
-        if not client:
-            self._send(c, {"ev": "attachment", "re": rid, "guid": guid,
-                           "error": "Attachments come from BlueBubbles, which is offline"})
-            return
 
         def work():
             try:
-                data = client.attachment(guid)
-                with open(path + ".part", "wb") as f:
-                    f.write(data)
-                os.replace(path + ".part", path)
-                res = {"path": path, "temp": d == temp_dir}
-            except (BB.BBError, OSError) as e:
+                if kind == "full":
+                    res = {"path": media.original(client, guid, path)}
+                elif is_video:
+                    scratch = os.path.join(RUNTIME, "previews")
+                    os.makedirs(scratch, mode=0o700, exist_ok=True)
+                    res = {"path": media.video_thumb(client, guid, int(size or 0), path, scratch,
+                                                     allow_big=bool(temp is None))}
+                else:
+                    res = {"path": media.photo_preview(client, guid, path)}
+            except media.MediaError as e:
+                res = {"error": str(e), "big": str(e) == "big"}
+            except (OSError, subprocess.SubprocessError) as e:
                 res = {"error": str(e)}
-            GLib.idle_add(lambda: (self._send(c, {"ev": "attachment", "re": rid, "guid": guid, **res}), False)[1])
+            GLib.idle_add(lambda: (reply(res), False)[1])
         threading.Thread(target=work, daemon=True).start()
 
     def _preview(self, c, rid, path: str) -> None:

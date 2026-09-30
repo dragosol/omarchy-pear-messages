@@ -106,8 +106,16 @@ class Client:
         return self._req("GET", "/server/info") or {}
 
     def chats(self, limit: int = 200) -> list[dict]:
-        return self._req("POST", "/chat/query", {
-            "limit": limit, "offset": 0, "with": ["participants", "lastMessage"], "sort": "lastmessage"}) or []
+        """Newest conversations first. The server takes at most 1000 per request, so pages."""
+        out: list[dict] = []
+        while len(out) < limit:
+            page = self._req("POST", "/chat/query", {
+                "limit": min(500, limit - len(out)), "offset": len(out),
+                "with": ["participants", "lastMessage"], "sort": "lastmessage"}) or []
+            out += page
+            if len(page) < min(500, limit - len(out) + len(page)):
+                break
+        return out
 
     def messages_after(self, after_ms: int, limit: int = 200) -> list[dict]:
         return self._req("POST", "/message/query", {
@@ -163,12 +171,56 @@ class Client:
             "chatGuid": chat_guid, "selectedMessageGuid": message_guid,
             "selectedMessageText": message_text, "reaction": reaction, "partIndex": 0}, timeout=20) or {}
 
+    def send_attachment(self, chat_guid: str, path: str, temp_guid: str, private_api: bool) -> dict:
+        """Upload a file into a chat (POST /message/attachment, multipart). Works through
+        AppleScript too, so it doesn't need the Private API."""
+        import mimetypes
+        import os
+        name = os.path.basename(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        boundary = "----pearmessages" + uuid.uuid4().hex
+        fields = {"chatGuid": chat_guid, "tempGuid": temp_guid, "name": name,
+                  "method": "private-api" if private_api else "apple-script"}
+        parts = []
+        for k, v in fields.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        safe = name.replace('"', "'")
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="attachment"; filename="{safe}"\r\n'
+                      f"Content-Type: {mime}\r\n\r\n").encode() + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        q = urllib.parse.urlencode({"password": self.password})
+        req = urllib.request.Request(f"{self.url}/api/v1/message/attachment?{q}", method="POST", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                                              "User-Agent": "PearMessages/1.0"})
+        timeout = 60 + len(data) / 200_000     # a minute, plus time to upload
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read()).get("message") or str(e)
+            except Exception:
+                msg = str(e)
+            raise BBError(f"{msg} (HTTP {e.code})") from None
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+            raise BBError(f"Can't reach the server: {getattr(e, 'reason', e)}") from None
+        if isinstance(d, dict) and d.get("status", 200) >= 400:
+            raise BBError(d.get("message") or "server error")
+        return (d.get("data") if isinstance(d, dict) else None) or {}
+
     def mark_read(self, chat_guid: str) -> None:
         self._req("POST", f"/chat/{urllib.parse.quote(chat_guid, safe='')}/read", {})
 
-    def attachment(self, guid: str) -> bytes:
-        return self._req("GET", f"/attachment/{urllib.parse.quote(guid, safe='')}/download",
-                         raw=True, timeout=120)
+    def attachment(self, guid: str, preview_width: int = 0) -> bytes:
+        """The file, or with preview_width a picture resized on the Mac (a few tens of KB
+        instead of a multi-MB original; HEIC comes back as JPEG)."""
+        path = f"/attachment/{urllib.parse.quote(guid, safe='')}/download"
+        if preview_width:
+            path += f"?width={int(preview_width)}&quality=good"
+        return self._req("GET", path, raw=True, timeout=120)
 
 
 # iMessage effects, by the id Messages stores. Bubble effects animate one message; screen
@@ -295,7 +347,14 @@ class Poller(threading.Thread):
     `emit` is called on this thread; the daemon marshals it onto its main loop.
     """
 
-    def __init__(self, client: Client, since_ms: int, emit, interval: float = 3.0):
+    # How much history to take from the Mac by default: the latest RECENT_DEPTH messages of
+    # the RECENT_CHATS most recent conversations, OTHER_DEPTH of every other one. More comes
+    # when you pull at the top of a conversation.
+    RECENT_CHATS = 20
+    RECENT_DEPTH = 100
+    OTHER_DEPTH = 20
+
+    def __init__(self, client: Client, since_ms: int, emit, interval: float = 3.0, backfill: bool = False):
         super().__init__(daemon=True, name="bluebubbles")
         self.client = client
         self.since_ms = since_ms
@@ -304,6 +363,34 @@ class Poller(threading.Thread):
         self._stop = threading.Event()
         self.wake = threading.Event()
         self.info: dict = {}
+        self.backfill = backfill or not since_ms
+
+    def _backfill(self) -> None:
+        """The default history, one conversation at a time (newest conversations first, so the
+        ones you'll open first fill first). Sent on in batches to keep the window calm."""
+        start_ms = int(time.time() * 1000)
+        chats = self.client.chats(limit=2000)
+        batch, newest = [], 0
+        for k, chat in enumerate(chats):
+            if self._stop.is_set():
+                return
+            depth = self.RECENT_DEPTH if k < self.RECENT_CHATS else self.OTHER_DEPTH
+            try:
+                msgs = self.client.chat_messages(chat.get("guid", ""), limit=depth)
+            except BBError:
+                continue
+            for m in msgs:
+                m.setdefault("chats", [chat])
+            newest = max([newest] + [m.get("dateCreated") or 0 for m in msgs])
+            batch.extend(reversed(msgs))
+            if len(batch) >= 400 or k == len(chats) - 1:
+                self.emit("messages", batch)
+                batch = []
+        if batch:
+            self.emit("messages", batch)
+        self.since_ms = max(self.since_ms, newest or start_ms)
+        self.backfill = False
+        self.emit("backfilled", {"chats": len(chats)})
 
     def stop(self) -> None:
         self._stop.set()
@@ -321,11 +408,14 @@ class Poller(threading.Thread):
                     online = True
                     backoff = 5.0
                     self.emit("status", {"state": "online", "info": self.info})
-                    if not self.since_ms:
-                        # First connection ever: take the recent history in one go.
-                        msgs = self.client.recent_messages(1000)
-                        self.emit("messages", list(reversed(msgs)))
-                        self.since_ms = max((m.get("dateCreated") or 0) for m in msgs) if msgs else int(time.time() * 1000)
+                    if self.backfill:
+                        # History is a nice-to-have: a failure here must never take the
+                        # connection down. It's tried again next time the Mac connects.
+                        try:
+                            self._backfill()
+                        except Exception as e:
+                            self.backfill = False
+                            self.emit("backfill_failed", {"error": str(e)})
                 if time.time() - synced_contacts > 6 * 3600:
                     try:
                         self.emit("contacts", self.client.contacts())

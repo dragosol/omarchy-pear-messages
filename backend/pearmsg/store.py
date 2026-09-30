@@ -485,7 +485,12 @@ class Store:
             if m["thread"] != r["thread"] and (m["thread"].startswith("chat:") or r["thread"].startswith("addr:")):
                 upd["thread"] = m["thread"]
             if m.get("attachments"):
-                upd["attachments"] = json.dumps(m["attachments"])
+                atts = [dict(a) for a in m["attachments"]]
+                # a file we sent: keep pointing at the copy on this computer, no need to download it
+                local = [a for a in json.loads(r["attachments"]) if a.get("path")]
+                for a, l in zip(atts, local):
+                    a.setdefault("path", l["path"])
+                upd["attachments"] = json.dumps(atts)
             if m.get("effect") and m["effect"] != r["effect"]:
                 upd["effect"] = m["effect"]
             if m.get("runs") and json.dumps(m["runs"]) != r["runs"]:
