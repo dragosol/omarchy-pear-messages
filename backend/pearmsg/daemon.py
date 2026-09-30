@@ -610,7 +610,9 @@ class Daemon:
             reply({"ev": "threads", "threads": self.store.threads()})
         elif op == "view":
             c.viewing = req.get("thread", "")
-            c.active = bool(req.get("active", True))
+            # Read means you looked: the window has focus and this conversation is on screen.
+            # Anything missing counts as not looking.
+            c.active = req.get("active") is True
             if c.viewing and c.active:
                 self._mark_read(c.viewing)
         elif op == "open":
@@ -618,7 +620,10 @@ class Daemon:
             c.viewing = tid
             reply({"ev": "thread", "thread": tid, "info": self.store.thread(tid),
                    "messages": self.store.messages(tid, int(req.get("limit", 200)))})
-            self._mark_read(tid)
+            # Opening is not reading: the window opens conversations on its own (at start, on
+            # reconnect, from a notification). Only a focused view marks read.
+            if c.active and c.viewing == tid:
+                self._mark_read(tid)
         elif op == "older":
             tid = req["thread"]
             reply({"ev": "older", "thread": tid,

@@ -331,6 +331,7 @@ class Phone:
         self.sync_again = False
         self.transfers: dict[str, tuple] = {}
         self.first_sync = True
+        self.keep_unread: set[str] = set()
         sesbus.add_signal_receiver(self._obex_added, "InterfacesAdded",
                                    "org.freedesktop.DBus.ObjectManager", OBEX)
         sesbus.add_signal_receiver(self._obex_removed, "InterfacesRemoved",
@@ -494,6 +495,10 @@ class Phone:
         def got(tpath, props):
             self.transfers[str(tpath)] = (target, h, p, rest, done, subject)
         msg = dbus.Interface(self.ses.get_object(OBEX, path), "org.bluez.obex.Message1")
+        if not p.get("Read", False):
+            # Downloading a message can mark it read on the phone (MAP GetMessage). It isn't -
+            # you haven't seen it - so put it back once the download is done.
+            self.keep_unread.add(path)
         msg.Get(target, False, reply_handler=got,
                 error_handler=lambda e: self._got_body(target, h, p, rest, done, subject, ok=False))
 
@@ -507,7 +512,20 @@ class Phone:
             args = self.transfers.pop(str(path))
             self._got_body(*args, ok=(st == "complete"))
 
+    def _restore_unread(self, handle: str) -> None:
+        path = f"{self.session}/message{handle}"
+        if path not in self.keep_unread or not self.session:
+            return
+        self.keep_unread.discard(path)
+        try:
+            props = dbus.Interface(self.ses.get_object(OBEX, path), "org.freedesktop.DBus.Properties")
+            props.Set("org.bluez.obex.Message1", "Read", dbus.Boolean(False),
+                      reply_handler=lambda: None, error_handler=lambda e: None)
+        except dbus.DBusException:
+            pass
+
     def _got_body(self, target, h, p, rest, done, subject, ok=True):
+        self._restore_unread(h)
         text = subject
         if ok:
             try:

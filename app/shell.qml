@@ -196,6 +196,7 @@ ShellRoot {
         }
         function state(): string {
             return JSON.stringify({ current: root.current, msgs: root.msgs.length, fx: screenFx.current,
+                                    focused: root.focused, onScreen: root.onScreen,
                                     auto: root.autoEffect("Happy New Year!") });
         }
     }
@@ -229,8 +230,14 @@ ShellRoot {
         return id;
     }
 
+    // Messages count as read only while you can actually see them: the window has keyboard focus
+    // and the conversation is on screen (not behind Settings, not while composing a new one).
+    readonly property bool focused: win.visible && Qt.application.state === Qt.ApplicationActive
+    readonly property string onScreen: (root.composing || root.settingsOpen) ? "" : root.current
+    onFocusedChanged: root.reportView()
+    onOnScreenChanged: root.reportView()
     function reportView() {
-        root.send({ op: "view", thread: root.composing ? "" : root.current, active: win.visible && scope.Window.active });
+        root.send({ op: "view", thread: root.onScreen, active: root.focused === true });
     }
 
     function onEvent(line) {
@@ -293,7 +300,7 @@ ShellRoot {
                 const atEnd = list.followEnd || list.atYEnd || list.contentHeight <= list.height;
                 root.msgs = next;
                 if (atEnd) list.stickToEnd();
-                if (win.visible && scope.Window.active) root.send({ op: "view", thread: root.current, active: true });
+                if (root.focused && root.onScreen) root.send({ op: "view", thread: root.onScreen, active: true });
             }
             break;
         }
@@ -471,7 +478,6 @@ ShellRoot {
             focus: true
             Rectangle { anchors.fill: parent; color: Theme.bg; z: -1 }
 
-            Window.onActiveChanged: root.reportView()
 
             Keys.onPressed: function (ev) {
                 const ctrl = ev.modifiers & Qt.ControlModifier;
