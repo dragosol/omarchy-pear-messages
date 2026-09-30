@@ -955,7 +955,7 @@ ShellRoot {
                                             id: bubbleRow
                                             visible: msgItem.m.text !== ""
                                             width: parent.width
-                                            height: bubble.height + (msgItem.reacts.length ? 10 : 0)
+                                            height: bubble.height + (msgItem.reacts.length ? 18 : 0)
                                             HoverHandler { id: bubbleHover }
 
                                             Rectangle {
@@ -1072,7 +1072,7 @@ ShellRoot {
                                             Rectangle {
                                                 visible: (bubbleHover.hovered || (!!root.picker && root.picker.id === msgItem.m.id))
                                                          && msgItem.m.status !== "sending"
-                                                width: 28; height: 28; radius: 14
+                                                width: 32; height: 32; radius: 16
                                                 anchors.verticalCenter: bubble.verticalCenter
                                                 x: msgItem.mine ? bubble.x - width - 6 : bubble.x + bubble.width + 6
                                                 color: reactHover.hovered ? Theme.hover : Theme.bg
@@ -1082,7 +1082,7 @@ ShellRoot {
                                                     anchors.centerIn: parent
                                                     text: "☺"
                                                     color: root.reactBlock(msgItem.m) ? Theme.faint : Theme.fg
-                                                    font.pixelSize: Theme.fBody
+                                                    font.pixelSize: Math.round(Theme.fBody * 1.3)
                                                 }
                                                 HoverHandler { id: reactHover; cursorShape: Qt.PointingHandCursor }
                                                 TapHandler { onTapped: root.openPicker(msgItem.m, bubble) }
@@ -1091,25 +1091,25 @@ ShellRoot {
                                             Rectangle {
                                                 visible: msgItem.reacts.length > 0
                                                 anchors.top: parent.top
-                                                anchors.topMargin: -6
-                                                x: msgItem.mine ? bubble.x - width + 12 : bubble.x + bubble.width - 12
-                                                height: 22
-                                                width: reactRow.implicitWidth + 12
-                                                radius: 11
+                                                anchors.topMargin: -8
+                                                x: msgItem.mine ? bubble.x - width + 14 : bubble.x + bubble.width - 14
+                                                height: 34
+                                                width: Math.max(height, reactRow.implicitWidth + 16)
+                                                radius: height / 2
                                                 color: Theme.bg
                                                 border.width: 1
                                                 border.color: (msgItem.m.reactions || {}).me ? Theme.accent : Theme.line
                                                 Row {
                                                     id: reactRow
                                                     anchors.centerIn: parent
-                                                    spacing: 2
+                                                    spacing: 3
                                                     Repeater {
                                                         model: msgItem.reacts
                                                         Text {
                                                             required property var modelData
                                                             text: root.reactionGlyph(msgItem.m.reactions[modelData])
                                                             color: modelData === "me" ? Theme.accent : Theme.fg
-                                                            font.pixelSize: Theme.fSmall
+                                                            font.pixelSize: Math.round(Theme.fBody * 1.45)
                                                         }
                                                     }
                                                 }
@@ -1245,7 +1245,7 @@ ShellRoot {
                                             model: root.reactionKinds
                                             Rectangle {
                                                 required property string modelData
-                                                width: 38; height: 38; radius: 19
+                                                width: 50; height: 50; radius: 25
                                                 opacity: pickerBox.block ? 0.35 : 1
                                                 color: pickerBox.mine === modelData ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.3)
                                                      : kindHover.hovered && !pickerBox.block ? Theme.hover : "transparent"
@@ -1253,7 +1253,7 @@ ShellRoot {
                                                     anchors.centerIn: parent
                                                     text: root.reactionGlyph(parent.modelData)
                                                     color: Theme.fg
-                                                    font.pixelSize: Theme.fBody + 4
+                                                    font.pixelSize: Math.round(Theme.fBody * 1.85)
                                                 }
                                                 HoverHandler { id: kindHover; cursorShape: pickerBox.block ? Qt.ForbiddenCursor : Qt.PointingHandCursor }
                                                 TapHandler {
