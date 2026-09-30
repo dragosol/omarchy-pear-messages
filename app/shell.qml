@@ -184,6 +184,22 @@ ShellRoot {
         }
         onError: if (root.preview === "") reconnect.start()
     }
+    // For testing from a shell:  quickshell ipc -p <app dir> call pearmessages effect Confetti
+    IpcHandler {
+        target: "pearmessages"
+        function effect(name: string): string {
+            const id = Object.keys(root.effectNames).find(k => root.effectNames[k].toLowerCase() === name.toLowerCase());
+            if (!id) return "unknown effect";
+            root.playEffect({ id: -1, text: "Pear Messages", effect: id });
+            return "playing " + root.effectNames[id] + "; overlay=" + screenFx.current + " visible=" + screenFx.visible
+                   + " size=" + screenFx.width + "x" + screenFx.height;
+        }
+        function state(): string {
+            return JSON.stringify({ current: root.current, msgs: root.msgs.length, fx: screenFx.current,
+                                    auto: root.autoEffect("Happy New Year!") });
+        }
+    }
+
     // Tells us when fingers touch the touchpad - the one event Qt's Wayland client never
     // delivers (see touch_watch.py). Prints only "touch".
     Process {
@@ -257,6 +273,10 @@ ShellRoot {
             const next = root.msgs.slice();
             for (const m of d.messages) {
                 const i = next.findIndex(x => x.id === m.id);
+                if (m.hidden) {                    // the received copy of a message you sent yourself
+                    if (i >= 0) { next.splice(i, 1); changed = true; }
+                    continue;
+                }
                 if (m.thread === root.current) {
                     if (i >= 0) next[i] = m; else next.push(m);
                     changed = true;
@@ -1037,7 +1057,12 @@ ShellRoot {
                                                 }
                                                 SequentialAnimation {
                                                     id: slamAnim
-                                                    NumberAnimation { target: bubble; property: "scale"; from: 2.6; to: 1; duration: 380; easing.type: Easing.OutBack; easing.overshoot: 2.4 }
+                                                    PropertyAction { target: bubble; property: "opacity"; value: 0 }
+                                                    ParallelAnimation {
+                                                        NumberAnimation { target: bubble; property: "scale"; from: 3.2; to: 1; duration: 300; easing.type: Easing.InQuad }
+                                                        NumberAnimation { target: bubble; property: "opacity"; from: 0; to: 1; duration: 160 }
+                                                    }
+                                                    ScriptAction { script: shock.go() }
                                                     SequentialAnimation {
                                                         loops: 2
                                                         NumberAnimation { target: list; property: "anchors.leftMargin"; to: 22; duration: 40 }
@@ -1131,6 +1156,24 @@ ShellRoot {
                                                             }
                                                         }
                                                     }
+                                                }
+                                            }
+
+                                            // Slam's shockwave: a ring leaving the bubble as it lands
+                                            Rectangle {
+                                                id: shock
+                                                anchors.centerIn: bubble
+                                                width: bubble.width; height: bubble.height
+                                                radius: bubble.radius + 4
+                                                color: "transparent"
+                                                border.width: 3
+                                                border.color: bubble.color
+                                                opacity: 0
+                                                function go() { shockAnim.restart(); }
+                                                ParallelAnimation {
+                                                    id: shockAnim
+                                                    NumberAnimation { target: shock; property: "scale"; from: 1; to: 1.5; duration: 520; easing.type: Easing.OutCubic }
+                                                    NumberAnimation { target: shock; property: "opacity"; from: 0.8; to: 0; duration: 520; easing.type: Easing.OutQuad }
                                                 }
                                             }
 
@@ -1993,13 +2036,13 @@ ShellRoot {
     // ------------------------------------------------------------------ preview data
     Timer {
         id: snapshotTimer
-        interval: 1500
+        interval: Number(Quickshell.env("PEAR_MESSAGES_SNAPSHOT_MS") || 1500)
         onTriggered: scope.grabToImage(function (r) { r.saveToFile(root.snapshotPath); Qt.quit(); })
     }
 
     Component.onCompleted: {
         // Development: a snapshot of the real window (connected to the running service).
-        if (root.preview === "" && root.snapshotPath) { snapshotTimer.interval = 4000; snapshotTimer.start(); }
+        if (root.preview === "" && root.snapshotPath) { snapshotTimer.interval = Number(Quickshell.env("PEAR_MESSAGES_SNAPSHOT_MS") || 4000); snapshotTimer.start(); }
         if (root.preview === "") return;
         const now = Date.now() / 1000;
         root.status = {

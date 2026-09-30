@@ -133,6 +133,7 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('bb_since_ms','0')")
         self.db.commit()
         self._identity: dict[str, str] | None = None
+        self.newly_hidden: list[int] = []
         os.chmod(path, 0o600)
 
     # ------------------------------------------------------------------ meta
@@ -239,12 +240,16 @@ class Store:
 
     def hide_self_mirrors(self) -> int:
         """In your own conversation each message exists twice (sent + received). Show it once."""
-        n = self.db.execute(
-            "UPDATE messages SET hidden=1, unread=0 WHERE thread='addr:self' AND from_me=0 AND hidden=0 "
+        ids = [r[0] for r in self.db.execute(
+            "SELECT id FROM messages WHERE thread='addr:self' AND from_me=0 AND hidden=0 "
             "AND EXISTS (SELECT 1 FROM messages o WHERE o.thread='addr:self' AND o.from_me=1 "
-            "AND o.norm=messages.norm AND messages.ts - o.ts BETWEEN -3 AND ?)", (SELF_MIRROR_WINDOW,)).rowcount
+            "AND o.norm=messages.norm AND messages.ts - o.ts BETWEEN -3 AND ?)", (SELF_MIRROR_WINDOW,))]
+        for i in ids:
+            self.db.execute("UPDATE messages SET hidden=1, unread=0 WHERE id=?", (i,))
         self.db.commit()
-        return n
+        # the daemon tells open windows, which may already be showing them
+        self.newly_hidden.extend(ids)
+        return len(ids)
 
     def contact_name(self, addr: str) -> str:
         r = self.db.execute("SELECT name FROM contacts WHERE key=?", (C.key(addr),)).fetchone()

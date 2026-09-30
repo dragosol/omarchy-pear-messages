@@ -254,6 +254,11 @@ class Daemon:
         self._after_ingest(changed, fresh)
 
     def _after_ingest(self, changed: dict, fresh: list[int]) -> None:
+        if self.store.newly_hidden:
+            changed = {k: list(v) for k, v in changed.items()}
+            for i in self.store.newly_hidden:
+                changed.setdefault("addr:self", []).append(i)
+            self.store.newly_hidden = []
         if not changed:
             return
         for tid, ids in changed.items():
