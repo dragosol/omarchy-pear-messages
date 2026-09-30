@@ -36,6 +36,7 @@ from . import iphone as IP
 from . import tailnet
 from . import tapback
 from . import media
+from . import linkpreview
 from .store import Store, addr_thread
 
 HOME = os.path.expanduser("~")
@@ -52,6 +53,7 @@ DEFAULTS = {
     "bluebubbles": {"enabled": True},
     "notifications": True,
     "notificationPreview": True,
+    "linkPreviews": True,
 }
 
 
@@ -105,6 +107,7 @@ class Daemon:
         self.settings = load_settings()
         self.store = Store(os.path.join(DATA, "messages.db"))
         self.conns: list[Conn] = []
+        self._link_waiting: dict[str, list] = {}
         self.bb_state = {"state": "off", "detail": ""}
         self.bb_info: dict = {}
         self.bb_online_at = 0.0
@@ -642,7 +645,7 @@ class Daemon:
                 "keepAudio": self.settings["iphone"].get("keepAudio", True),
                 "paired": phones,
             },
-            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview")},
+            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews")},
             "abilities": self.abilities(),
             "pairing": self.pairing.active,
         }
@@ -760,6 +763,8 @@ class Daemon:
         elif op == "send":
             reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""),
                                              req.get("effect", ""), req.get("files") or [])})
+        elif op == "link_preview":
+            self._link_preview(c, req.get("url", ""))
         elif op == "pick_files":
             self._pick_files(c, rid)
         elif op == "clipboard_image":
@@ -780,7 +785,7 @@ class Daemon:
             self._preview(c, rid, req.get("path", ""))
         # ---- settings / connection assistant
         elif op == "settings":
-            for k in ("notifications", "notificationPreview"):
+            for k in ("notifications", "notificationPreview", "linkPreviews"):
                 if k in req:
                     self.settings[k] = bool(req[k])
             for group in ("iphone", "bluebubbles"):
@@ -861,6 +866,36 @@ class Daemon:
                            "note": "" if msgs else "No earlier messages."})
             return False
 
+        threading.Thread(target=work, daemon=True).start()
+
+    def _link_preview(self, c, url: str) -> None:
+        """A link's title/description, from the cache or fetched once (whoever else asks for the
+        same link while it's being fetched gets the same answer)."""
+        if not url or not self.settings.get("linkPreviews", True):
+            return
+        cached = self.store.link_preview(url)
+        if cached is not None:
+            self._send(c, {"ev": "link_preview", **cached})
+            return
+        waiting = self._link_waiting.setdefault(url, [])
+        waiting.append(c)
+        if len(waiting) > 1:
+            return
+
+        def work():
+            try:
+                p = linkpreview.fetch(url)
+            except Exception:
+                p = None
+            GLib.idle_add(done, p)
+
+        def done(p):
+            self.store.save_link_preview(url, p)
+            ev = {"ev": "link_preview", "url": url, "ok": bool(p), **(p or {})}
+            for conn in self._link_waiting.pop(url, []):
+                if conn in self.conns:
+                    self._send(conn, ev)
+            return False
         threading.Thread(target=work, daemon=True).start()
 
     def _mark_read(self, tid: str) -> None:

@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS pending_reactions (
     PRIMARY KEY (target, sender)
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- text-only link previews, fetched on demand (ok=0: the page had none / couldn't be read)
+CREATE TABLE IF NOT EXISTS link_previews (
+    url TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+    site TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL, fetched REAL NOT NULL
+);
 """
 
 # Two copies of one message must land within this many seconds of each other. The iPhone
@@ -530,6 +535,21 @@ class Store:
             n += 1
         self.db.commit()
         return n
+
+    def link_preview(self, url: str) -> dict | None:
+        r = self.db.execute("SELECT * FROM link_previews WHERE url=?", (url,)).fetchone()
+        if r is None:
+            return None
+        # a page that had nothing is asked again after a day; a good preview is kept
+        if not r["ok"] and time.time() - r["fetched"] > 86400:
+            return None
+        return {"url": url, "ok": bool(r["ok"]), "title": r["title"], "description": r["description"], "site": r["site"]}
+
+    def save_link_preview(self, url: str, p: dict | None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO link_previews VALUES(?,?,?,?,?,?)",
+                        (url, (p or {}).get("title", ""), (p or {}).get("description", ""),
+                         (p or {}).get("site", ""), 1 if p else 0, time.time()))
+        self.db.commit()
 
     def set_effect(self, mid: int, effect: str) -> None:
         self.db.execute("UPDATE messages SET effect=? WHERE id=?", (effect, mid))

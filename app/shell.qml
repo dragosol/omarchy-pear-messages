@@ -46,6 +46,19 @@ ShellRoot {
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
     property int newBelow: 0             // messages that arrived while you were scrolled up
     property var pending: []             // files waiting to be sent: [{path, name, mime, size}]
+    property var linkPreviews: ({})      // url -> {ok, title, description, site} | {loading}
+    readonly property bool linkPreviewsOn: !root.status.settings || root.status.settings.linkPreviews !== false
+    function firstUrl(text) {
+        const m = (text || "").match(/https?:\/\/[^\s<>"]+[^\s<>".,;:!?)\]']/);
+        return m ? m[0] : "";
+    }
+    function needLinkPreview(url) {
+        if (!url || !root.linkPreviewsOn || root.linkPreviews[url]) return;
+        const l = Object.assign({}, root.linkPreviews);
+        l[url] = { loading: true };
+        root.linkPreviews = l;
+        root.send({ op: "link_preview", url: url });
+    }
     property string olderState: ""       // "" | "loading" | "end"
     property string olderNote: ""
     function loadOlder() {
@@ -421,6 +434,12 @@ ShellRoot {
             root.bbTest = d;
             if (d.ok) bbPassword.text = "";
             break;
+        case "link_preview": {
+            const l = Object.assign({}, root.linkPreviews);
+            l[d.url] = d;
+            root.linkPreviews = l;
+            break;
+        }
         case "picked":
             if (d.error) root.flash = d.error;
             root.addFiles(d.files || []);
@@ -1503,6 +1522,63 @@ ShellRoot {
                                             }
                                         }
 
+                                        // link preview: text only, fetched when the message comes into view
+                                        Rectangle {
+                                            id: linkCard
+                                            readonly property string url: root.firstUrl(msgItem.m.text)
+                                            readonly property var lp: url ? root.linkPreviews[url] : null
+                                            visible: !!lp && lp.ok === true
+                                            Component.onCompleted: if (url) root.needLinkPreview(url)
+                                            anchors.right: msgItem.mine ? parent.right : undefined
+                                            width: Math.min(list.bubbleMax, 340)
+                                            height: visible ? lpCol.implicitHeight + 20 : 0
+                                            radius: Math.max(Theme.radius, 4)
+                                            color: lpHover.hovered ? Theme.hover : Theme.panel
+                                            border.width: 1
+                                            border.color: Theme.line
+                                            Rectangle { width: 3; height: parent.height; color: Theme.accent; visible: linkCard.visible }
+                                            Column {
+                                                id: lpCol
+                                                x: 14; y: 10
+                                                width: parent.width - 26
+                                                spacing: 3
+                                                Text {
+                                                    width: parent.width
+                                                    text: linkCard.lp ? (linkCard.lp.site || "") : ""
+                                                    visible: text !== ""
+                                                    elide: Text.ElideRight
+                                                    color: Theme.dim
+                                                    font.family: Theme.uiFont
+                                                    font.pixelSize: Theme.fCaption
+                                                }
+                                                Text {
+                                                    width: parent.width
+                                                    text: linkCard.lp ? (linkCard.lp.title || "") : ""
+                                                    visible: text !== ""
+                                                    wrapMode: Text.Wrap
+                                                    maximumLineCount: 2
+                                                    elide: Text.ElideRight
+                                                    color: Theme.fg
+                                                    font.family: Theme.uiFont
+                                                    font.pixelSize: Theme.fSmall
+                                                    font.weight: Font.DemiBold
+                                                }
+                                                Text {
+                                                    width: parent.width
+                                                    text: linkCard.lp ? (linkCard.lp.description || "") : ""
+                                                    visible: text !== ""
+                                                    wrapMode: Text.Wrap
+                                                    maximumLineCount: 3
+                                                    elide: Text.ElideRight
+                                                    color: Theme.dim
+                                                    font.family: Theme.uiFont
+                                                    font.pixelSize: Theme.fCaption
+                                                }
+                                            }
+                                            HoverHandler { id: lpHover; cursorShape: Qt.PointingHandCursor }
+                                            TapHandler { onTapped: Qt.openUrlExternally(linkCard.url) }
+                                        }
+
                                         // "Sent with Slam · Replay" - click to watch it again
                                         Text {
                                             visible: !!root.effectNames[msgItem.m.effect || ""] && !(msgItem.m.effect || "").startsWith("text:")
@@ -2404,6 +2480,13 @@ ShellRoot {
                                 }
                                 O.Toggle {
                                     Layout.fillWidth: true
+                                    label: "Link previews"
+                                    description: "Show a link's title and description (text only). This computer fetches the page when the message comes into view."
+                                    checked: root.linkPreviewsOn
+                                    onClicked: root.send({ op: "settings", linkPreviews: !root.linkPreviewsOn })
+                                }
+                                O.Toggle {
+                                    Layout.fillWidth: true
                                     label: "Show message text"
                                     description: "Off shows only who it's from."
                                     checked: !!(root.status.settings && root.status.settings.notificationPreview)
@@ -2507,6 +2590,9 @@ ShellRoot {
                             { path: "/tmp/Quarterly report final v3.pdf", name: "Quarterly report final v3.pdf", mime: "application/pdf", size: 2400000 },
                             { path: "/tmp/IMG_2210.MOV", name: "IMG_2210.MOV", mime: "video/quicktime", size: 31000000 }];
         }
+        root.linkPreviews = { "https://example.com/ramen": { ok: true, site: "The Infatuation",
+            title: "Menya Ramen on King St — the tonkotsu everyone's queueing for",
+            description: "A 20-seat counter with a 3-hour broth, a short menu and a line out the door by 7pm. Here's what to order." } };
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {
             const want = root.preview.slice(3).replace(/_/g, " ");
