@@ -1,0 +1,16 @@
+[Unit]
+Description=Pear Messages (BlueBubbles + iPhone over Bluetooth)
+Documentation=https://github.com/dragosol/omarchy-pear-messages
+After=graphical-session.target
+Wants=obex.service
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=%h/.local/share/pear-messages/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -B -m pearmsg daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

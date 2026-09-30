@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dragosol.pear-messages",
+  "name": "Pear Messages",
+  "version": "1.0.0",
+  "author": "dragosol",
+  "license": "MIT",
+  "homepage": "https://github.com/dragosol/omarchy-pear-messages",
+  "description": "iMessage and SMS in a native Omarchy window. Connects to a Mac running BlueBubbles for your full history, group chats, photos and reactions, and falls back to your iPhone over Bluetooth when the Mac can't be reached, with no Mac needed for that part. A message that arrives both ways shows once. A connection assistant in Settings finds your Mac and pairs your iPhone, and your iPhone keeps its own audio. Not affiliated with Apple.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "plugin/Service.qml"
+  }
+}

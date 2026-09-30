@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#1d2021"/>
+  <!-- stem and leaf -->
+  <path d="M64 30 C64 24 66 19 70 15" fill="none" stroke="#8a6a44" stroke-width="4" stroke-linecap="round"/>
+  <path d="M68 22 C76 14 88 14 94 18 C88 26 78 29 68 22 Z" fill="#7fb34a"/>
+  <!-- pear body -->
+  <path d="M64 30
+           C54 30 50 38 50 47
+           C50 55 44 60 39 68
+           C33 78 34 95 44 104
+           C51 110 58 112 64 112
+           C70 112 77 110 84 104
+           C94 95 95 78 89 68
+           C84 60 78 55 78 47
+           C78 38 74 30 64 30 Z" fill="#b9d25a"/>
+  <!-- speech bubble: it holds messages -->
+  <path d="M50 70 H78 A6 6 0 0 1 84 76 V88 A6 6 0 0 1 78 94 H62 L54 101 L55 94 H50 A6 6 0 0 1 44 88 V76 A6 6 0 0 1 50 70 Z" fill="#1d2021"/>
+  <circle cx="55" cy="82" r="2.6" fill="#b9d25a"/>
+  <circle cx="64" cy="82" r="2.6" fill="#b9d25a"/>
+  <circle cx="73" cy="82" r="2.6" fill="#b9d25a"/>
+  <!-- highlight -->
+  <path d="M42 70 C40 76 40 82 42 88" fill="none" stroke="#e3ef9c" stroke-width="4" stroke-linecap="round" opacity="0.8"/>
+</svg>
