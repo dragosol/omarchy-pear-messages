@@ -44,6 +44,7 @@ ShellRoot {
 
     // reactions / effects / previews
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
+    property int newBelow: 0             // messages that arrived while you were scrolled up
     property bool effectPickerOpen: false
     property string pendingEffect: ""    // effect for the next send
     property var fxPlay: ({})            // message id -> nonce; a change replays its bubble effect
@@ -340,6 +341,7 @@ ShellRoot {
                     if (i >= 0) next[i] = m; else next.push(m);
                     changed = true;
                     // A message arriving now (or one just sent) plays its effect, as on the phone.
+                    if (i < 0 && !m.fromMe && !list.followEnd) root.newBelow++;
                     if (i < 0 && Date.now() / 1000 - m.ts < 90 && (m.effect || root.autoEffect(m.text)))
                         Qt.callLater(() => root.playEffect(m, true));
                 } else if (i >= 0) {           // merged into another thread (a group chat)
@@ -397,6 +399,7 @@ ShellRoot {
     }
 
     function openThread(id) {
+        root.newBelow = 0;
         root.composing = false;
         root.picker = null;
         root.effectPickerOpen = false;
@@ -547,6 +550,7 @@ ShellRoot {
                 } else if (ctrl && ev.key === Qt.Key_N) { root.startCompose(); ev.accepted = true; }
                 else if (ctrl && ev.key === Qt.Key_Comma) { root.settingsOpen = !root.settingsOpen; ev.accepted = true; }
                 else if (ctrl && ev.key === Qt.Key_F) { search.forceActiveFocus(); ev.accepted = true; }
+                else if (ev.key === Qt.Key_End && (ctrl || !composer.activeFocus)) { list.goToBottom(); ev.accepted = true; }
                 else if ((ev.modifiers & Qt.AltModifier) && (ev.key === Qt.Key_Down || ev.key === Qt.Key_Up)) {
                     const list = root.shownThreads;
                     let i = list.findIndex(t => t.id === root.current);
@@ -930,6 +934,24 @@ ShellRoot {
                 // list at the right place with nothing drawn. So pin, then pin again as it settles.
                 function stickToEnd() { followEnd = true; msgPhys.stopPhysics(); settle.left = 8; settle.restart(); }
                 function pinEnd() { list.forceLayout(); list.positionViewAtEnd(); }
+                // Glide back to the newest message. From far up, jump most of the way first so
+                // the glide is a short, readable one rather than a blur through the history.
+                function goToBottom() {
+                    msgPhys.stopPhysics();
+                    list.forceLayout();
+                    const target = msgPhys.maxY;
+                    if (target - list.contentY > list.height * 2.5) list.contentY = target - list.height * 1.5;
+                    toBottom.to = target;
+                    toBottom.restart();
+                }
+                NumberAnimation {
+                    id: toBottom
+                    target: list; property: "contentY"
+                    duration: 420; easing.type: Easing.OutCubic
+                    onFinished: list.stickToEnd()
+                }
+                readonly property bool farFromEnd: contentHeight > height && contentY < msgPhys.maxY - 160
+                onFollowEndChanged: if (followEnd) root.newBelow = 0
                 Timer {
                     id: settle
                     property int left: 0
@@ -1372,6 +1394,48 @@ ShellRoot {
                                         }
                                     }
                                 }
+                            }
+
+                            // "go to bottom": shows once you've scrolled up away from the newest messages
+                            Rectangle {
+                                id: toBottomBtn
+                                z: 55
+                                readonly property bool shown: list.farFromEnd && root.current !== "" && !root.composing
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: parent.height - height - 14 + (shown ? 0 : 16)
+                                opacity: shown ? 1 : 0
+                                visible: opacity > 0.01
+                                Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+                                Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+                                height: 36
+                                width: btnRow.implicitWidth + 28
+                                radius: height / 2
+                                color: btnHover.hovered ? Qt.lighter(Theme.bg, 1.9) : Qt.lighter(Theme.bg, 1.5)
+                                border.width: 1
+                                border.color: root.newBelow > 0 ? Theme.accent : Theme.line
+                                Row {
+                                    id: btnRow
+                                    anchors.centerIn: parent
+                                    spacing: 8
+                                    Text {
+                                        text: "↓"
+                                        color: root.newBelow > 0 ? Theme.accent : Theme.fg
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fBody
+                                        font.weight: Font.DemiBold
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                    Text {
+                                        text: root.newBelow > 0 ? (root.newBelow === 1 ? "1 new message" : root.newBelow + " new messages")
+                                                                : "Go to bottom"
+                                        color: Theme.fg
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fSmall
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
+                                HoverHandler { id: btnHover; cursorShape: Qt.PointingHandCursor }
+                                TapHandler { onTapped: list.goToBottom() }
                             }
 
                             ScreenEffects { id: screenFx }
