@@ -9,11 +9,25 @@ import qs.Commons
 // looked close on one theme and wrong on the next - the exact failure Omapager Pro's
 // DeedButton calls out. Names are kept so shell.qml needs no wholesale rewrite.
 Singleton {
-    readonly property color bg:           Color.popups.background
-    readonly property color fg:           Color.popups.text
+    // A regular window, so the theme's own background and text (what terminals and editors
+    // use), not the popup surface Pear Passwords draws on.
+    readonly property color bg:           Color.background
+    readonly property color fg:           Color.foreground
     readonly property color dim:          Color.muted
     readonly property color faint:        Color.muted
     readonly property color accent:       Color.accent
+    // Text on an accent-coloured surface (your own bubbles): whichever of the theme's background
+    // or foreground stands out more against the accent, so light and dark themes both read.
+    readonly property color onAccent:     contrast(Color.accent, Color.background) >= contrast(Color.accent, Color.foreground)
+                                          ? Color.background : Color.foreground
+    function luminance(c) {
+        const f = v => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+    }
+    function contrast(a, b) {
+        const la = luminance(a), lb = luminance(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    }
     readonly property color danger:       Color.urgent
     // Rows: the same selected fill Omarchy's own menus use.
     readonly property color selected:     Color.menu.selectedBackground

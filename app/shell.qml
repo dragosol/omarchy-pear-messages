@@ -184,6 +184,51 @@ ShellRoot {
         }
         onError: if (root.preview === "") reconnect.start()
     }
+    // ------------------------------------------------------------------ Omarchy theme
+    // Omarchy pushes a theme switch to its own shell over IPC (`shell applyTheme`); a standalone
+    // window never hears it and would keep the theme it started with. So this watches the
+    // current theme itself and applies a switch the way the shell does: reload colors.toml and
+    // shell.toml into Omarchy's Color singleton, then refresh Style. Everything here is drawn
+    // from those, so the whole window follows.
+    readonly property string themeDir: Quickshell.env("HOME") + "/.local/state/omarchy/current"
+    property string appliedTheme: ""
+    FileView {
+        id: themeColors
+        path: root.themeDir + "/theme/colors.toml"
+        blockLoading: true
+        watchChanges: true
+        printErrors: false
+        onFileChanged: themeSettle.restart()
+    }
+    FileView {
+        id: themeShell
+        path: root.themeDir + "/theme/shell.toml"
+        blockLoading: true
+        watchChanges: true
+        printErrors: false
+        onFileChanged: themeSettle.restart()
+    }
+    // theme-set replaces files one after another; wait for it to finish before applying.
+    Timer { id: themeSettle; interval: 300; onTriggered: root.applyTheme() }
+    // A file that's deleted and recreated can lose its watch, so also look every few seconds.
+    Timer {
+        interval: 3000; repeat: true; running: true
+        onTriggered: {
+            themeColors.reload();
+            if (themeColors.text() !== root.appliedTheme) root.applyTheme();
+        }
+    }
+    function applyTheme() {
+        themeColors.reload();
+        themeShell.reload();
+        const colors = themeColors.text();
+        if (!colors) return;
+        root.appliedTheme = colors;
+        Color.loadColors(colors);
+        Color.loadShell(themeShell.text() || "");
+        Style.scheduleRefresh();
+    }
+
     // For testing from a shell:  quickshell ipc -p <app dir> call pearmessages effect Confetti
     IpcHandler {
         target: "pearmessages"
@@ -195,7 +240,9 @@ ShellRoot {
                    + " size=" + screenFx.width + "x" + screenFx.height;
         }
         function state(): string {
-            return JSON.stringify({ connected: sock.connected, threads: root.threads.length,
+            return JSON.stringify({ theme: { bg: String(Theme.bg), fg: String(Theme.fg), accent: String(Theme.accent),
+                                             panel: String(Theme.panel), font: Theme.uiFont, radius: Theme.radius },
+                                    connected: sock.connected, threads: root.threads.length,
                                     current: root.current, msgs: root.msgs.length, fx: screenFx.current,
                                     focused: root.focused, onScreen: root.onScreen,
                                     auto: root.autoEffect("Happy New Year!") });
@@ -1116,11 +1163,11 @@ ShellRoot {
                                                     wrapMode: TextEdit.Wrap
                                                     textFormat: TextEdit.RichText
                                                     visible: !bubble.textFx
-                                                    text: bubble.segs.length ? root.styledHtml(bubble.segs, msgItem.mine ? Theme.bg : Theme.accent)
-                                                                             : root.linkify(msgItem.m.text, msgItem.mine ? Theme.bg : Theme.accent)
-                                                    color: msgItem.mine ? Theme.bg : Theme.fg
+                                                    text: bubble.segs.length ? root.styledHtml(bubble.segs, msgItem.mine ? Theme.onAccent : Theme.accent)
+                                                                             : root.linkify(msgItem.m.text, msgItem.mine ? Theme.onAccent : Theme.accent)
+                                                    color: msgItem.mine ? Theme.onAccent : Theme.fg
                                                     selectedTextColor: msgItem.mine ? Theme.accent : Theme.bg
-                                                    selectionColor: msgItem.mine ? Theme.bg : Theme.accent
+                                                    selectionColor: msgItem.mine ? Theme.onAccent : Theme.accent
                                                     font.family: Theme.uiFont
                                                     font.pixelSize: Theme.fBody
                                                     onLinkActivated: link => Qt.openUrlExternally(link)
@@ -1155,7 +1202,7 @@ ShellRoot {
                                                         Rectangle {
                                                             required property int index
                                                             width: 2; height: 2; radius: 1
-                                                            color: msgItem.mine ? Theme.bg : Theme.fg
+                                                            color: msgItem.mine ? Theme.onAccent : Theme.fg
                                                             x: Math.random() * inkDots.width
                                                             y: Math.random() * inkDots.height
                                                             SequentialAnimation on opacity {
@@ -2052,6 +2099,7 @@ ShellRoot {
     }
 
     Component.onCompleted: {
+        root.appliedTheme = themeColors.text();
         // Development: a snapshot of the real window (connected to the running service).
         if (root.preview === "" && root.snapshotPath) { snapshotTimer.interval = Number(Quickshell.env("PEAR_MESSAGES_SNAPSHOT_MS") || 4000); snapshotTimer.start(); }
         if (root.preview === "") return;
