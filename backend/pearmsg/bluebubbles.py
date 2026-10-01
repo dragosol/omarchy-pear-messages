@@ -211,6 +211,11 @@ class Client:
             raise BBError(d.get("message") or "server error")
         return (d.get("data") if isinstance(d, dict) else None) or {}
 
+    def logs(self, count: int = 200) -> str:
+        """The server's recent log (the only place it says *why* Messages didn't send)."""
+        d = self._req("GET", f"/server/logs?count={int(count)}", timeout=15)
+        return d if isinstance(d, str) else json.dumps(d)
+
     def mark_read(self, chat_guid: str) -> None:
         self._req("POST", f"/chat/{urllib.parse.quote(chat_guid, safe='')}/read", {})
 
@@ -453,3 +458,27 @@ class Poller(threading.Thread):
                 self.wake.wait(backoff)
                 self.wake.clear()
                 backoff = min(backoff * 2, 60.0)
+
+
+# What the Mac's log says when Messages won't send, in words for the person at the Mac.
+SEND_PROBLEMS = [
+    (("-1743", "Not authorized to send Apple events"),
+     "BlueBubbles isn't allowed to control Messages on your Mac. On the Mac: System Settings → "
+     "Privacy & Security → Automation → BlueBubbles → turn on Messages."),
+    (("-1712", "AppleEvent timed out"),
+     "Messages on your Mac isn't answering BlueBubbles, so nothing sends through the Mac. On the Mac: "
+     "unlock it, quit BlueBubbles and open it again from Applications, and click Allow when it asks "
+     "to control Messages. Also check System Settings → Privacy & Security → Full Disk Access and "
+     "Accessibility for BlueBubbles."),
+]
+
+
+def diagnose_send(log_text: str) -> str:
+    """The most recent known send problem in the server's log, or ""."""
+    best, where = "", -1
+    for keys, words in SEND_PROBLEMS:
+        for k in keys:
+            i = log_text.rfind(k)
+            if i > where:
+                best, where = words, i
+    return best

@@ -611,7 +611,7 @@ ShellRoot {
     }
     function routeLabel() {
         if (root.route === "bluebubbles")
-            return "BlueBubbles" + (root.bb.link === "tailscale" ? " · Tailscale" : "");
+            return "BlueBubbles" + (root.bb.sendProblem ? " · can't send" : root.bb.link === "tailscale" ? " · Tailscale" : "");
         if (root.route === "iphone") return (root.phone.name || "iPhone") + " · Bluetooth";
         if (!root.linked && root.preview === "") return "Pear Messages service isn't running";
         return "Not connected";
@@ -2252,6 +2252,16 @@ ShellRoot {
                                                   + (root.bb.link === "tailscale" ? " · over Tailscale" : "")
                                                   + (root.bb.privateApi ? " · Private API on" : "")
                                             color: Theme.fg
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fSmall
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            visible: root.bb.state === "online" && !!root.bb.sendProblem
+                                            wrapMode: Text.WordWrap
+                                            text: "Reading works, but your Mac isn't sending. " + (root.bb.sendProblem || "")
+                                                  + " Plain texts go through your iPhone meanwhile."
+                                            color: Theme.danger
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fSmall
                                         }

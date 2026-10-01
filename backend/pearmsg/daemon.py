@@ -116,6 +116,9 @@ class Daemon:
         self._in_flight: set[int] = set()
         self._retry_at: dict[int, float] = {}
         self._mac_tries: dict[int, int] = {}
+        # set when the Mac's log shows Messages won't send for BlueBubbles; cleared by a send
+        # that works. While it stands, text goes through the iPhone straight away.
+        self.bb_send_problem = ""
         self.bb_state = {"state": "off", "detail": ""}
         self.bb_info: dict = {}
         self.bb_online_at = 0.0
@@ -384,7 +387,9 @@ class Daemon:
         if o is None or rid in self._in_flight:
             return
         self._retry_at.pop(rid, None)
-        if self.bb_online and self.client:
+        if self.bb_send_problem and self._phone_can_take(o):
+            self._via_phone(o)
+        elif self.bb_online and self.client:
             self._via_bb(o)
         elif self._phone_can_take(o):
             self._via_phone(o)
@@ -453,8 +458,27 @@ class Daemon:
                 self._mac_tries.pop(rid, None)
                 self.store.set_status(rid, "sent", "", via="bluebubbles")
                 self._changed(o)
+                if self.bb_send_problem:
+                    self.bb_send_problem = ""
+                    self._broadcast_status()
                 return False
             log(f"BlueBubbles didn't send #{rid}: {err}")
+            # Ask the Mac why before trying again: some reasons no amount of retrying fixes.
+            threading.Thread(target=lambda: GLib.idle_add(after_diagnosis, _diagnose(client), err, slow),
+                             daemon=True).start()
+            return False
+
+        def after_diagnosis(problem, err, slow):
+            if problem:
+                if problem != self.bb_send_problem:
+                    self.bb_send_problem = problem
+                    log(f"BlueBubbles can't send: {problem}")
+                    self._broadcast_status()
+                if self._phone_can_take(o):
+                    self._via_phone(o)
+                else:
+                    self._fail(o, problem)
+                return False
             if not slow:
                 # the Mac answered and said no
                 if self._phone_can_take(o):
@@ -513,6 +537,10 @@ class Daemon:
         if not m or not m["fromMe"] or m["status"] not in ("failed", "queued"):
             return
         self._mac_tries.pop(rid, None)
+        if self.bb_send_problem:
+            # you may have fixed it on the Mac: give BlueBubbles another go
+            self.bb_send_problem = ""
+            self._broadcast_status()
         self._dispatch(rid)
 
     def cancel(self, rid: int) -> None:
@@ -721,6 +749,7 @@ class Daemon:
                 "enabled": self.settings["bluebubbles"]["enabled"], "url": creds.get("url", ""),
                 "link": self.bb_link,
                 "privateApi": bool(self.bb_info.get("private_api")),
+                "sendProblem": self.bb_send_problem,
                 "serverVersion": self.bb_info.get("server_version", ""),
                 "macOS": self.bb_info.get("os_version", ""),
             },
@@ -1236,6 +1265,13 @@ def _sent_meanwhile(client, text: str, since_ms: int) -> dict | None:
             pass
         time.sleep(2.5)
     return None
+
+
+def _diagnose(client) -> str:
+    try:
+        return BB.diagnose_send(client.logs(300))
+    except Exception:
+        return ""
 
 
 def _quiet(fn, *a):
