@@ -259,6 +259,8 @@ class Daemon:
                 fresh.append(rid)
         if self.store.merge_orphans():
             self._broadcast_threads()
+        for tid, rid in self.store.merge_local_sends():
+            self._broadcast({"ev": "messages", "thread": tid, "messages": [{"id": rid, "thread": tid, "hidden": True}]})
         if self.store.learn_self():
             self._identity_changed()
         if newest:

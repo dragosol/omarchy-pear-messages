@@ -407,7 +407,15 @@ class Store:
                 (tid, before, limit)).fetchall()
         return [self._row(r) for r in reversed(rows)]
 
-    def _find_twin(self, *, from_me: bool, sender: str, norm: str, ts: float, id_col: str) -> sqlite3.Row | None:
+    def _find_twin(self, *, from_me: bool, sender: str, norm: str, ts: float, id_col: str,
+                   names: list | None = None) -> sqlite3.Row | None:
+        if from_me and not norm and names:
+            # a file you sent: same file name, sent within the hour (a send can wait in the queue)
+            for r in self.db.execute(
+                    f"SELECT * FROM messages WHERE from_me=1 AND {id_col} IS NULL AND norm='' "
+                    "AND ts BETWEEN ? AND ? ORDER BY ABS(ts-?) LIMIT 20", (ts - 3600, ts + 3600, ts)).fetchall():
+                if {a.get("name") for a in json.loads(r["attachments"])} & set(names):
+                    return r
         win = MATCH_WINDOW if norm else MATCH_WINDOW_EMPTY
         base = (f"SELECT * FROM messages WHERE from_me=? AND {id_col} IS NULL "
                 "AND ts BETWEEN ? AND ? " + ("" if from_me else "AND sender=? "))
@@ -463,7 +471,8 @@ class Store:
                 return "merged", r["id"]
 
         # 2. The same message from the other connection.
-        twin = self._find_twin(from_me=from_me, sender=sender, norm=norm, ts=float(m["ts"]), id_col=id_col)
+        twin = self._find_twin(from_me=from_me, sender=sender, norm=norm, ts=float(m["ts"]), id_col=id_col,
+                               names=[a.get("name") for a in (m.get("attachments") or []) if a.get("name")])
         if twin is not None:
             self._update(twin, m, source, merge_id=(id_col, own_id))
             return "merged", twin["id"]
@@ -526,6 +535,27 @@ class Store:
                 self._apply_pending_reactions(r["id"], upd["bb_guid"])
             self.db.commit()
 
+    def merge_local_sends(self) -> list[tuple[str, int]]:
+        """Your sends that the Mac reported back as a separate message (no receipt to match on):
+        keep the Mac's copy, which has the real details, and drop the local one. Returns the
+        (thread, id) of each removed row."""
+        gone = []
+        for r in self.db.execute("SELECT * FROM messages WHERE from_me=1 AND temp_id IS NOT NULL AND bb_guid IS NULL "
+                                 "AND map_handle IS NULL AND status IN ('sent','delivered','read')").fetchall():
+            names = [a.get("name") for a in json.loads(r["attachments"]) if a.get("name")]
+            for c in self.db.execute(
+                    "SELECT * FROM messages WHERE from_me=1 AND bb_guid IS NOT NULL AND temp_id IS NULL AND hidden=0 "
+                    "AND ts BETWEEN ? AND ? ORDER BY ABS(ts-?) LIMIT 20", (r["ts"] - 60, r["ts"] + 3600, r["ts"])).fetchall():
+                same_text = r["norm"] and c["norm"] == r["norm"]
+                same_file = not r["norm"] and names and {a.get("name") for a in json.loads(c["attachments"])} & set(names)
+                if same_text or same_file:
+                    self.db.execute("DELETE FROM messages WHERE id=?", (r["id"],))
+                    self.db.execute("UPDATE messages SET temp_id=? WHERE id=?", (r["temp_id"], c["id"]))
+                    gone.append((r["thread"], r["id"]))
+                    break
+        self.db.commit()
+        return gone
+
     def merge_orphans(self) -> int:
         """Merge iPhone-only rows into BlueBubbles-only rows that are the same message.
         Returns how many duplicates were removed."""
@@ -582,6 +612,10 @@ class Store:
         self.db.commit()
 
     def set_status(self, mid: int, status: str, error: str = "", via: str | None = None) -> None:
+        if status == "sent":
+            # the time a message went is when it was sent, not when it first started waiting
+            self.db.execute("UPDATE messages SET ts=? WHERE id=? AND bb_guid IS NULL AND map_handle IS NULL",
+                            (time.time(), mid))
         if via:
             self.db.execute("UPDATE messages SET status=?, error=?, via=? WHERE id=?", (status, error, via, mid))
         else:
