@@ -54,6 +54,7 @@ DEFAULTS = {
     "notifications": True,
     "notificationPreview": True,
     "linkPreviews": True,
+    "typingAnimation": True,
 }
 
 
@@ -721,7 +722,7 @@ class Daemon:
                 "keepAudio": self.settings["iphone"].get("keepAudio", True),
                 "paired": phones,
             },
-            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews")},
+            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation")},
             "abilities": self.abilities(),
             "pairing": self.pairing.active,
         }
@@ -863,7 +864,7 @@ class Daemon:
             self._preview(c, rid, req.get("path", ""))
         # ---- settings / connection assistant
         elif op == "settings":
-            for k in ("notifications", "notificationPreview", "linkPreviews"):
+            for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation"):
                 if k in req:
                     self.settings[k] = bool(req[k])
             for group in ("iphone", "bluebubbles"):

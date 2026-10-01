@@ -48,6 +48,7 @@ ShellRoot {
     property var pending: []             // files waiting to be sent: [{path, name, mime, size}]
     property var linkPreviews: ({})      // url -> {ok, title, description, site} | {loading}
     readonly property bool linkPreviewsOn: !root.status.settings || root.status.settings.linkPreviews !== false
+    readonly property bool typingAnimation: !root.status.settings || root.status.settings.typingAnimation !== false
     function firstUrl(text) {
         const m = (text || "").match(/https?:\/\/[^\s<>"]+[^\s<>".,;:!?)\]']/);
         return m ? m[0] : "";
@@ -2035,6 +2036,13 @@ ShellRoot {
                                     TextArea {
                                         id: composer
                                         wrapMode: TextEdit.Wrap
+                                        // with typing animation on, the letters are drawn by TypingLetters
+                                        TypingLetters {
+                                            id: typing
+                                            field: composer
+                                            enabled: root.typingAnimation
+                                            color: Theme.fg
+                                        }
                                         placeholderText: {
                                             const group = root.currentInfo && root.currentInfo.group;
                                             if (root.route === "bluebubbles") return "iMessage";
@@ -2042,7 +2050,8 @@ ShellRoot {
                                             return "Not connected";
                                         }
                                         placeholderTextColor: Theme.dim
-                                        color: Theme.fg
+                                        color: typing.active ? "transparent" : Theme.fg
+                                        selectedTextColor: typing.active ? "transparent" : Theme.fg
                                         font.family: Theme.uiFont
                                         font.pixelSize: Theme.fBody
                                         selectByMouse: true
@@ -2516,6 +2525,13 @@ ShellRoot {
                                     description: "Also when this window is closed."
                                     checked: !!(root.status.settings && root.status.settings.notifications)
                                     onClicked: root.send({ op: "settings", notifications: !root.status.settings.notifications })
+                                }
+                                O.Toggle {
+                                    Layout.fillWidth: true
+                                    label: "Animated typing"
+                                    description: "Letters pop in as you type and shrink away when you delete them, like the overview search."
+                                    checked: root.typingAnimation
+                                    onClicked: root.send({ op: "settings", typingAnimation: !root.typingAnimation })
                                 }
                                 O.Toggle {
                                     Layout.fillWidth: true
