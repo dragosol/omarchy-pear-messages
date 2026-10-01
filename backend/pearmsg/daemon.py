@@ -108,6 +108,9 @@ class Daemon:
         self.store = Store(os.path.join(DATA, "messages.db"))
         self.conns: list[Conn] = []
         self._link_waiting: dict[str, list] = {}
+        self._in_flight: set[int] = set()
+        self._retry_at: dict[int, float] = {}
+        self._mac_tries: dict[int, int] = {}
         self.bb_state = {"state": "off", "detail": ""}
         self.bb_info: dict = {}
         self.bb_online_at = 0.0
@@ -183,6 +186,8 @@ class Daemon:
             if prev != payload["state"]:
                 log(f"BlueBubbles: {payload['state']} {payload.get('detail', '')}")
                 self._broadcast_status()
+                if payload["state"] == "online":
+                    GLib.timeout_add_seconds(2, lambda: (self._flush(), False)[1])
         elif kind == "messages":
             self._ingest_bb(payload)
         elif kind == "backfill_failed":
@@ -209,6 +214,8 @@ class Daemon:
                 self.phone_state = payload
                 log(f"iPhone: {payload['state']} {payload.get('detail', '')}")
                 self._broadcast_status()
+                if payload["state"] == "online":
+                    GLib.timeout_add_seconds(2, lambda: (self._flush(), False)[1])
         elif kind == "messages":
             self._ingest_phone(payload["messages"], payload.get("initial", False))
         elif kind == "contacts":
@@ -290,7 +297,17 @@ class Daemon:
             self._notify(rid)
 
     # ----------------------------------------------------------------- send
+    # ------------------------------------------------------------------ sending
+    # Every outgoing message goes through _dispatch, which picks its route now:
+    #   BlueBubbles when it's online (the only way for files, group chats and effects);
+    #   the iPhone for one-to-one text when BlueBubbles can't;
+    #   otherwise it waits - status "queued", with what it's waiting for in words - and goes
+    #   by itself as soon as a connection that can carry it is back.
+    # "failed" is kept for real refusals, and for a Mac that keeps not sending.
+    MAX_MAC_TRIES = 4
+
     def send(self, thread: str, text: str, to: str = "", effect: str = "", files: list | None = None) -> dict:
+        import mimetypes
         text = (text or "").strip()
         files = [f for f in (files or []) if f and os.path.isfile(f)]
         if not text and not files:
@@ -300,69 +317,206 @@ class Daemon:
         if not thread:
             thread = self.store.canonical(addr_thread(to))
         t = self.store.thread(thread)
-        group = bool(t and t["group"])
-        address = to or (t["address"] if t else "") or (thread[5:] if thread.startswith("addr:") else "")
-        if thread.startswith("addr:") and t and t["participants"]:
-            address = to or t["participants"][0]
         if not t:
-            self.store.ensure_thread(thread, participants=[address] if address else [])
+            self.store.ensure_thread(thread, participants=[to] if to else [])
+        elif to:
+            self.store.ensure_thread(thread, participants=[to])
         if effect and not self.abilities()["effects"]:
             effect = ""
-        bb_chat = (t or {}).get("bbChat", "")
+        ids = []
         # Each file is its own message, then the text - the order Messages uses.
-        last = None
         for f in files:
-            last = self._send_file(thread, address, bb_chat, f)
-        if not text:
-            return {"ok": True, "id": last, "thread": thread}
-        temp = BB.new_temp_guid()
-        _, rid = self.store.ingest({
-            "temp_id": temp, "thread": thread, "from_me": True, "text": text,
-            "ts": time.time(), "status": "sending", "effect": effect}, "local")
-        self._after_ingest({thread: [rid]}, [])
-        self._route(rid, thread, address, group, text, temp, (t or {}).get("bbChat", ""), effect)
-        return {"ok": True, "id": rid, "thread": thread}
+            name = os.path.basename(f)
+            ids.append(self._new_outgoing(thread, "", attachments=[{
+                "guid": "", "name": name, "mime": mimetypes.guess_type(name)[0] or "",
+                "size": os.path.getsize(f), "path": f}]))
+        if text:
+            ids.append(self._new_outgoing(thread, text, effect=effect))
+        for rid in ids:
+            self._dispatch(rid)
+        return {"ok": True, "id": ids[-1], "thread": thread}
 
-    def _send_file(self, thread: str, address: str, bb_chat: str, path: str) -> int:
-        import mimetypes
-        temp = BB.new_temp_guid()
-        name = os.path.basename(path)
-        att = {"guid": "", "name": name, "mime": mimetypes.guess_type(name)[0] or "",
-               "size": os.path.getsize(path), "path": path}
+    def _new_outgoing(self, thread: str, text: str, effect: str = "", attachments=None) -> int:
         _, rid = self.store.ingest({
-            "temp_id": temp, "thread": thread, "from_me": True, "text": "", "attachments": [att],
-            "ts": time.time(), "status": "sending"}, "local")
+            "temp_id": BB.new_temp_guid(), "thread": thread, "from_me": True, "text": text,
+            "attachments": attachments or [], "ts": time.time(), "status": "sending", "effect": effect}, "local")
         self._after_ingest({thread: [rid]}, [])
-        # A conversation the Mac hasn't seen yet can still be addressed by its would-be chat id.
-        chat = bb_chat or (f"any;-;{address}" if address else "")
+        return rid
+
+    def _outgoing(self, rid: int) -> dict | None:
+        row = self.store.db.execute("SELECT * FROM messages WHERE id=?", (rid,)).fetchone()
+        if row is None or not row["from_me"]:
+            return None
+        t = self.store.thread(row["thread"]) or {}
+        files = [a for a in json.loads(row["attachments"]) if a.get("path") and not a.get("guid")]
+        parts = t.get("participants") or []
+        temp = row["temp_id"]
+        if not temp:
+            temp = BB.new_temp_guid()
+            self.store.db.execute("UPDATE messages SET temp_id=? WHERE id=?", (temp, rid))
+            self.store.db.commit()
+        return {"rid": rid, "thread": row["thread"], "text": row["text"], "effect": row["effect"], "temp": temp,
+                "file": files[0]["path"] if files else "", "group": bool(t.get("group")),
+                "address": parts[0] if parts and not t.get("group") else "", "bb_chat": t.get("bbChat", "")}
+
+    def _changed(self, o: dict) -> None:
+        m = self.store.message(o["rid"])
+        self._after_ingest({m["thread"] if m else o["thread"]: [o["rid"]]}, [])
+
+    def _waiting_for(self, o: dict) -> str:
+        if o["file"]:
+            return "Sends when BlueBubbles connects (photos and files go through your Mac)"
+        if o["group"]:
+            return "Sends when BlueBubbles connects (group chats go through your Mac)"
+        return "Sends when BlueBubbles or your iPhone connects"
+
+    def _dispatch(self, rid: int) -> None:
+        o = self._outgoing(rid)
+        if o is None or rid in self._in_flight:
+            return
+        self._retry_at.pop(rid, None)
+        if self.bb_online and self.client:
+            self._via_bb(o)
+        elif self._phone_can_take(o):
+            self._via_phone(o)
+        else:
+            self._queue(o, self._waiting_for(o))
+
+    def _phone_can_take(self, o: dict) -> bool:
+        return (not o["file"] and not o["group"] and bool(o["address"]) and bool(o["text"])
+                and self.phone_state.get("state") == "online")
+
+    def _queue(self, o: dict, why: str, retry_in: float = 0) -> None:
+        self.store.set_status(o["rid"], "queued", why)
+        if retry_in:
+            self._retry_at[o["rid"]] = time.time() + retry_in
+        self._changed(o)
+
+    def _fail(self, o: dict, why: str) -> None:
+        self._mac_tries.pop(o["rid"], None)
+        self._retry_at.pop(o["rid"], None)
+        self.store.set_status(o["rid"], "failed", why)
+        self._changed(o)
+
+    def _via_bb(self, o: dict) -> None:
+        rid = o["rid"]
+        self._in_flight.add(rid)
+        self.store.set_status(rid, "sending", "")
+        self._changed(o)
         client = self.client
         private = bool(self.bb_info.get("private_api"))
+        # A conversation the Mac hasn't seen yet can still be addressed by its would-be chat id.
+        chat = o["bb_chat"] or (f"any;-;{o['address']}" if o["address"] else "")
 
         def work():
+            started_ms = int(time.time() * 1000)
             try:
                 if not chat:
                     raise BB.BBError("No address for this conversation")
-                res = client.send_attachment(chat, path, temp, private)
-                GLib.idle_add(done, res, "")
-            except (BB.BBError, OSError) as e:
-                GLib.idle_add(done, None, str(e))
+                if o["file"]:
+                    res = client.send_attachment(chat, o["file"], o["temp"], private)
+                elif o["bb_chat"]:
+                    res = client.send(o["bb_chat"], o["text"], o["temp"], private, o["effect"])
+                else:
+                    res = client.new_chat(o["address"], o["text"], o["temp"], private, o["effect"])
+                GLib.idle_add(done, res, "", False)
+            except BB.BBError as e:
+                slow = "timed out" in str(e) or "Can't reach" in str(e)
+                # A timeout doesn't mean it wasn't sent: the Mac can be slow to answer while
+                # Messages sends. Look before going another way, or it arrives twice.
+                if slow and o["text"]:
+                    sent = _sent_meanwhile(client, o["text"], started_ms)
+                    if sent is not None:
+                        GLib.idle_add(done, sent, "", False)
+                        return
+                GLib.idle_add(done, None, str(e), slow)
+            except OSError as e:
+                GLib.idle_add(done, None, f"Can't read the file: {e.strerror or e}", False)
 
-        def done(res, err):
-            if err:
-                self.store.set_status(rid, "failed", f"Couldn't send the file: {err}")
-            else:
+        def done(res, err, slow):
+            self._in_flight.discard(rid)
+            if not err:
                 if isinstance(res, dict) and res.get("guid"):
-                    n = BB.to_message({**res, "tempGuid": temp})
+                    n = BB.to_message({**res, "tempGuid": o["temp"]})
                     if n and n.get("kind") == "message":
-                        n["temp_id"] = temp
+                        n["temp_id"] = o["temp"]
                         self.store.ingest(n, "bluebubbles")
+                self._mac_tries.pop(rid, None)
                 self.store.set_status(rid, "sent", "", via="bluebubbles")
-            m = self.store.message(rid)
-            self._after_ingest({m["thread"] if m else thread: [rid]}, [])
+                self._changed(o)
+                return False
+            log(f"BlueBubbles didn't send #{rid}: {err}")
+            if not slow:
+                # the Mac answered and said no
+                if self._phone_can_take(o):
+                    self._via_phone(o)
+                else:
+                    self._fail(o, f"Your Mac refused it: {err}")
+                return False
+            tries = self._mac_tries[rid] = self._mac_tries.get(rid, 0) + 1
+            if self._phone_can_take(o):
+                self._via_phone(o)
+            elif tries >= self.MAX_MAC_TRIES:
+                self._fail(o, "Your Mac isn't sending messages. On the Mac, give BlueBubbles Accessibility "
+                              "and Automation → Messages permission, then retry.")
+            else:
+                self._queue(o, "Your Mac hasn't sent it yet. Trying again in a moment", retry_in=40 * tries)
             return False
 
         threading.Thread(target=work, daemon=True).start()
-        return rid
+
+    def _via_phone(self, o: dict) -> None:
+        rid = o["rid"]
+        self._in_flight.add(rid)
+        self.store.set_status(rid, "sending", "Sending through your iPhone")
+        self._changed(o)
+
+        def done(ok, err):
+            self._in_flight.discard(rid)
+            if ok:
+                note = ""
+                if o["effect"]:
+                    # the iPhone's Bluetooth link carries plain text only
+                    self.store.set_effect(rid, "")
+                    note = "Sent without the effect (your iPhone can't send effects over Bluetooth)"
+                self._mac_tries.pop(rid, None)
+                self.store.set_status(rid, "sent", note, via="iphone")
+                self._changed(o)
+            elif _read_json(BB_CREDS, {}).get("url"):
+                self._queue(o, "Your iPhone didn't take it. Sends when BlueBubbles connects")
+            else:
+                self._fail(o, "Your iPhone didn't accept it")
+        self.phone.send(o["address"], o["text"], done)
+
+    def _flush(self) -> bool:
+        """Send whatever is waiting and now has a way to go (and is due, if it's a retry)."""
+        now = time.time()
+        for (rid,) in self.store.db.execute("SELECT id FROM messages WHERE status='queued' ORDER BY ts").fetchall():
+            if self._retry_at.get(rid, 0) > now:
+                continue
+            o = self._outgoing(rid)
+            if o and ((self.bb_online and self.client) or self._phone_can_take(o)):
+                self._dispatch(rid)
+        return True
+
+    def retry(self, rid: int) -> None:
+        m = self.store.message(rid)
+        if not m or not m["fromMe"] or m["status"] not in ("failed", "queued"):
+            return
+        self._mac_tries.pop(rid, None)
+        self._dispatch(rid)
+
+    def cancel(self, rid: int) -> None:
+        """Take back a message that hasn't gone yet."""
+        row = self.store.db.execute("SELECT thread, status, bb_guid, map_handle FROM messages WHERE id=?", (rid,)).fetchone()
+        if row is None or row["status"] not in ("queued", "failed") or row["bb_guid"] or row["map_handle"] \
+                or rid in self._in_flight:
+            return
+        self.store.db.execute("DELETE FROM messages WHERE id=?", (rid,))
+        self.store.db.commit()
+        self._broadcast({"ev": "messages", "thread": row["thread"],
+                         "messages": [{"id": rid, "thread": row["thread"], "hidden": True}]})
+        self._broadcast_threads()
 
     # ------------------------------------------------------------ picking files
     def _pick_files(self, c, rid) -> None:
@@ -420,94 +574,16 @@ class Daemon:
             GLib.idle_add(lambda: (self._send(c, {"ev": "clipboard_image", "re": rid, "file": info}), False)[1])
         threading.Thread(target=work, daemon=True).start()
 
-    def retry(self, rid: int) -> None:
-        m = self.store.message(rid)
-        if not m or not m["fromMe"] or m["status"] != "failed":
-            return
-        t = self.store.thread(m["thread"]) or {}
-        self.store.set_status(rid, "sending")
-        self._after_ingest({m["thread"]: [rid]}, [])
-        temp = self.store.db.execute("SELECT temp_id FROM messages WHERE id=?", (rid,)).fetchone()[0] \
-            or BB.new_temp_guid()
-        addr = (t.get("participants") or [""])[0] if not t.get("group") else ""
-        self._route(rid, m["thread"], addr, bool(t.get("group")), m["text"], temp, t.get("bbChat", ""),
-                    m.get("effect", ""))
-
-    def _route(self, rid, thread, address, group, text, temp, bb_chat, effect: str = "") -> None:
-        def fail(err):
-            self.store.set_status(rid, "failed", err)
-            self._after_ingest({thread: [rid]}, [])
-
-        def via_phone(prev_err=""):
-            if group:
-                return fail(prev_err or "Group chats need BlueBubbles, and it's offline")
-            if self.phone_state.get("state") != "online" or not address:
-                return fail(prev_err or "No connection: BlueBubbles is offline and the iPhone isn't connected")
-
-            def done(ok, err):
-                if ok:
-                    note = ""
-                    if effect:
-                        # The iPhone's Bluetooth link carries plain text only.
-                        self.store.set_effect(rid, "")
-                        note = "Sent without the effect: BlueBubbles couldn't send it, and the iPhone can't send effects over Bluetooth"
-                    self.store.set_status(rid, "sent", note, via="iphone")
-                    self._after_ingest({thread: [rid]}, [])
-                else:
-                    fail(err)
-            self.phone.send(address, text, done)
-
-        if self.bb_online and self.client:
-            client = self.client
-            private = bool(self.bb_info.get("private_api"))
-
-            def work():
-                started_ms = int(time.time() * 1000)
-                try:
-                    if bb_chat:
-                        res = client.send(bb_chat, text, temp, private, effect)
-                    elif address:
-                        res = client.new_chat(address, text, temp, private, effect)
-                    else:
-                        raise BB.BBError("No address for this conversation")
-                    GLib.idle_add(ok_bb, res)
-                except BB.BBError as e:
-                    # A timeout doesn't mean it wasn't sent: the Mac can be slow to answer while
-                    # Messages sends. Look before falling back, or the recipient gets it twice.
-                    if "timed out" in str(e):
-                        sent = _sent_meanwhile(client, text, started_ms)
-                        if sent is not None:
-                            GLib.idle_add(ok_bb, sent)
-                            return
-                    GLib.idle_add(err_bb, str(e))
-
-            def ok_bb(res):
-                if isinstance(res, dict) and res.get("guid"):
-                    n = BB.to_message({**res, "tempGuid": temp})
-                    if n and n.get("kind") == "message":
-                        n["temp_id"] = temp
-                        self.store.ingest(n, "bluebubbles")
-                self.store.set_status(rid, "sent", "", via="bluebubbles")
-                m = self.store.message(rid)
-                self._after_ingest({m["thread"] if m else thread: [rid]}, [])
-                return False
-
-            def err_bb(e):
-                log(f"BlueBubbles send failed: {e}; trying the iPhone")
-                via_phone(f"BlueBubbles: {e}")
-                return False
-
-            threading.Thread(target=work, daemon=True).start()
-        else:
-            via_phone()
-
     # ------------------------------------------------------- reactions / effects
     def abilities(self) -> dict:
         """What can be sent beyond text right now, and if nothing, why - in words for the UI."""
         creds = _read_json(BB_CREDS, {})
         # Attachments go through BlueBubbles' ordinary send (AppleScript is enough); the
         # iPhone's Bluetooth link carries plain SMS text only.
-        attach = {"attachments": self.bb_online, "attachReason": "" if self.bb_online else (
+        bb_set_up = bool(creds.get("url")) and self.settings["bluebubbles"]["enabled"]
+        attach = {"attachments": self.bb_online or bb_set_up,
+                  "attachNote": "" if self.bb_online else "BlueBubbles is offline. Files will send when it connects.",
+                  "attachReason": "" if (self.bb_online or bb_set_up) else (
             "Attachments need BlueBubbles. Over Bluetooth your iPhone only sends text."
             + (" BlueBubbles is offline right now." if creds.get("url") and self.settings["bluebubbles"]["enabled"] else "")
             if self.phone_state.get("state") == "online" else "Attachments need BlueBubbles, and it isn't connected.")}
@@ -775,6 +851,8 @@ class Daemon:
             self.react(c, rid, int(req["message"]), req.get("reaction", ""))
         elif op == "retry":
             self.retry(int(req["message"]))
+        elif op == "cancel":
+            self.cancel(int(req["message"]))
         elif op == "search":
             reply({"ev": "search", "q": req.get("q", ""), "results": self.store.search_contacts(req.get("q", ""))})
         elif op == "attachment":
@@ -1029,13 +1107,15 @@ class Daemon:
         n = self.store.rethread()
         if n:
             log(f"merged {n} conversation(s) into their person's thread")
-        # A send in flight when the daemon stopped never finished. Say so; one click retries it.
+        # A send in flight when the daemon stopped never finished: it waits and goes again as
+        # soon as a connection can carry it.
         stuck = self.store.db.execute(
-            "UPDATE messages SET status='failed', error='Interrupted before it was sent' "
+            "UPDATE messages SET status='queued', error='Interrupted. Sending again' "
             "WHERE status='sending'").rowcount
         self.store.db.commit()
         if stuck:
-            log(f"{stuck} unfinished send(s) marked for retry")
+            log(f"{stuck} unfinished send(s) queued again")
+        GLib.timeout_add_seconds(15, self._flush)
         self.serve()
         self.apply_settings()
         # Transfers finishing (sends, contact pulls) are reported by the phone module; this

@@ -175,7 +175,7 @@ class DedupTest(unittest.TestCase):
     def test_reaction_before_message(self):
         self.s.react("G1", "+447700900123", "love")
         _, rid = self.s.ingest(self._bb("G1", "x", self.t), "bluebubbles")
-        self.assertEqual(self.s.message(rid)["reactions"], {"+447700900123": "love"})
+        self.assertEqual(self.s.message(rid)["reactions"], {store.C.key("+447700900123"): "love"})
 
     def test_sms_and_imessage_chats_are_one_thread(self):
         self.s.ingest(self._bb("G1", "a", self.t, chat={"guid": "SMS;-;+447700900123", "style": 45,
@@ -329,6 +329,34 @@ class TapbackTextTest(unittest.TestCase):
         msgs = s.messages(th)
         self.assertEqual(len(msgs), 1)
         self.assertEqual(list(msgs[0]["reactions"].values()), ["love"])
+
+
+class EnrichmentTest(unittest.TestCase):
+    def test_bluetooth_message_gets_mac_details_later(self):
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        t = time.time() - 300
+        th = store.addr_thread("+16135550100")
+        # while BlueBubbles was offline: plain text from the iPhone, and its reaction as text
+        _, rid = s.ingest({"map_handle": "h1", "thread": th, "from_me": False, "sender_addr": "+16135550100",
+                           "text": "Wow! huge news", "ts": t}, "iphone")
+        s.react_row(rid, "+1 (613) 555-0100", "love")
+        # the Mac catches up: the same message with its text effect, a photo and the real reaction
+        n = BB.to_message({"guid": "G1", "text": "Wow! huge news", "isFromMe": False, "handle": {"address": "+16135550100"},
+                           "dateCreated": int((t + 2) * 1000), "expressiveSendStyleId": "com.apple.MobileSMS.expressivesend.impact",
+                           "attributedBody": [{"string": "Wow! huge news", "runs": [{"range": [0, 4], "attributes": {"__kIMTextEffectAttributeName": 12}}]}],
+                           "attachments": [{"guid": "A1", "mimeType": "image/jpeg", "transferName": "p.jpg", "totalBytes": 10}],
+                           "chats": [{"guid": "iMessage;-;+16135550100", "style": 45, "participants": [{"address": "+16135550100"}]}]})
+        self.assertEqual(s.ingest(n, "bluebubbles")[0], "merged")
+        r = BB.to_message({"guid": "R1", "associatedMessageGuid": "p:0/G1", "associatedMessageType": "love",
+                           "isFromMe": False, "handle": {"address": "+16135550100"}})
+        s.react(r["target"], r["sender"], r["reaction"])
+        m = s.messages(th)[0]
+        self.assertEqual(len(s.messages(th)), 1)
+        self.assertEqual(m["via"], "both")
+        self.assertEqual(m["effect"], "com.apple.MobileSMS.expressivesend.impact")
+        self.assertEqual(m["segments"][0]["effect"], "explode")
+        self.assertEqual([a["guid"] for a in m["attachments"]], ["A1"])
+        self.assertEqual(m["reactions"], {store.C.key("+16135550100"): "love"})   # one heart, not two
 
 
 class BBTest(unittest.TestCase):

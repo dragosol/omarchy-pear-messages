@@ -424,10 +424,20 @@ class Poller(threading.Thread):
                     synced_contacts = time.time()
                 # Overlap by a minute: a message can be written to the Mac's database a little
                 # after its own dateCreated; the store drops the repeats by guid.
-                msgs = self.client.messages_after(self.since_ms - 60_000)
-                if msgs:
-                    self.since_ms = max(self.since_ms, max((m.get("dateCreated") or 0) for m in msgs))
+                # Everything since the last look, page by page - after a while offline that can be
+                # a lot, and the messages that came in over Bluetooth meanwhile get their
+                # reactions, effects and photos from here.
+                after = self.since_ms - 60_000
+                while not self._stop.is_set():
+                    msgs = self.client.messages_after(after, limit=200)
+                    if not msgs:
+                        break
+                    newest = max((m.get("dateCreated") or 0) for m in msgs)
+                    self.since_ms = max(self.since_ms, newest)
                     self.emit("messages", msgs)
+                    if len(msgs) < 200 or newest <= after:
+                        break
+                    after = newest - 1
                 self.wake.wait(self.interval)
                 self.wake.clear()
             except BBError as e:

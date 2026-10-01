@@ -133,6 +133,13 @@ class Store:
                 resync = resync or col in ("effect", "runs")
         if "card" not in {r[1] for r in self.db.execute("PRAGMA table_info(contacts)")}:
             self.db.execute("ALTER TABLE contacts ADD COLUMN card TEXT NOT NULL DEFAULT ''")
+        if self.get_meta("reaction_keys_v1") != "done":
+            for rid, rx in self.db.execute("SELECT id, reactions FROM messages WHERE reactions!='{}'").fetchall():
+                d = json.loads(rx)
+                nd = {(k if k in ("me", "?") else C.key(k)): v for k, v in d.items()}
+                if nd != d:
+                    self.db.execute("UPDATE messages SET reactions=? WHERE id=?", (json.dumps(nd), rid))
+            self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reaction_keys_v1','done')")
         if resync:
             # re-read recent history from BlueBubbles once, to fill in what older versions dropped
             self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('bb_since_ms','0')")
@@ -565,6 +572,9 @@ class Store:
     # ------------------------------------------------------------- reactions
     def react(self, target_guid: str, sender: str, kind: str) -> int | None:
         """kind '' removes. Returns the message row the reaction landed on."""
+        # one key per person, whichever connection reported it (the Mac and the iPhone write
+        # the same number differently)
+        sender = sender if sender in ("me", "?") else C.key(sender)
         r = self.db.execute("SELECT id, reactions FROM messages WHERE bb_guid=?", (target_guid,)).fetchone()
         if r is None:
             if kind:
@@ -608,6 +618,7 @@ class Store:
         return None
 
     def react_row(self, rid: int, sender: str, kind: str) -> None:
+        sender = sender if sender in ("me", "?") else C.key(sender)
         r = self.db.execute("SELECT reactions FROM messages WHERE id=?", (rid,)).fetchone()
         if r is None:
             return

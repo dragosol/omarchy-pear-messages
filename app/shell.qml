@@ -714,6 +714,7 @@ ShellRoot {
 
                 // ================================================= sidebar
                 Rectangle {
+                    id: sidebar
                     Layout.preferredWidth: 320
                     Layout.fillHeight: true
                     color: Theme.bg
@@ -754,7 +755,13 @@ ShellRoot {
                             model: root.shownThreads
                             spacing: 2
                             interactive: false
-                            ScrollBar.vertical: AppScrollBar {}
+                            ScrollBar.vertical: AppScrollBar {
+                                // in the sidebar's margin, clear of names, times and unread dots
+                                parent: sidebar
+                                x: sidebar.width - width - 1
+                                y: 12 + threadList.y
+                                height: threadList.height
+                            }
                             ScrollPhysics { id: threadPhys; flick: threadList }
                             WheelHandler {
                                 acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
@@ -1037,7 +1044,14 @@ ShellRoot {
                                 model: root.msgs
                                 spacing: 3
                                 interactive: false
-                                ScrollBar.vertical: AppScrollBar { id: msgBar }
+                                ScrollBar.vertical: AppScrollBar {
+                                    id: msgBar
+                                    // in the conversation's right margin, clear of your bubbles
+                                    parent: msgArea
+                                    x: msgArea.width - width - 1
+                                    y: list.y
+                                    height: list.height
+                                }
                                 ScrollPhysics { id: msgPhys; flick: list }
                                 WheelHandler {
                                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
@@ -1179,7 +1193,7 @@ ShellRoot {
                                     readonly property bool showStamp: !prev || m.ts - prev.ts > 1800
                                     readonly property bool showSender: root.currentInfo && root.currentInfo.group && !mine
                                                                        && (!prev || prev.fromMe || prev.sender !== m.sender || showStamp)
-                                    readonly property bool showStatus: mine && (index === list.lastMine || m.status === "failed")
+                                    readonly property bool showStatus: mine && (index === list.lastMine || m.status === "failed" || m.status === "queued")
                                     readonly property var reacts: Object.keys(m.reactions || {})
                                     width: list.width
                                     height: col.implicitHeight + (prev && prev.fromMe !== mine ? 8 : 0)
@@ -1222,7 +1236,7 @@ ShellRoot {
                                                 // a file you sent is here already; a video you sent has no thumbnail yet
                                                 readonly property bool isImage: (modelData.mime || "").indexOf("image/") === 0
                                                                                || (isVideo && !modelData.path)
-                                                readonly property bool selected: root.selAtt === modelData.guid
+                                                readonly property bool selected: !!modelData.guid && root.selAtt === modelData.guid
                                                 width: col.width
                                                 height: isImage && st.path ? img.height : fileChip.height
                                                 // Previews (photo, video thumbnail) are fetched when the message comes
@@ -1336,7 +1350,7 @@ ShellRoot {
                                                 height: (textFx ? effText.height : body.implicitHeight) + 16
                                                 radius: Math.max(Theme.radius, 4)
                                                 color: msgItem.mine ? (msgItem.m.status === "failed" ? Theme.danger : Theme.accent) : Theme.panel
-                                                opacity: msgItem.m.status === "sending" ? 0.6 : 1
+                                                opacity: msgItem.m.status === "sending" || msgItem.m.status === "queued" ? 0.6 : 1
                                                 transformOrigin: msgItem.mine ? Item.BottomRight : Item.BottomLeft
 
                                                 // ---- bubble effects
@@ -1596,28 +1610,52 @@ ShellRoot {
                                             }
                                         }
 
-                                        Text {
+                                        // Where a message of yours stands. Waiting is not failing: a message that
+                                        // can't go yet says what it's waiting for and goes by itself.
+                                        Row {
                                             visible: msgItem.showStatus
                                             anchors.right: parent.right
-                                            rightPadding: 4
-                                            text: {
-                                                const s = msgItem.m.status;
-                                                const via = msgItem.m.via === "iphone" ? " · via iPhone" : "";
-                                                if (s === "failed") return "Not delivered — click to retry" + (msgItem.m.error ? "  (" + msgItem.m.error + ")" : "");
-                                                if (s === "sending") return "Sending…";
-                                                return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via
-                                                       + (msgItem.m.error ? " — " + msgItem.m.error : "");
+                                            spacing: 10
+                                            readonly property string st: msgItem.m.status
+                                            Text {
+                                                id: statusText
+                                                rightPadding: 2
+                                                width: Math.min(implicitWidth, col.width - statusActions.width - 12)
+                                                wrapMode: Text.Wrap
+                                                maximumLineCount: 2
+                                                elide: Text.ElideRight
+                                                horizontalAlignment: Text.AlignRight
+                                                color: parent.st === "failed" ? Theme.danger : Theme.dim
+                                                font.family: Theme.uiFont
+                                                font.pixelSize: Theme.fCaption
+                                                text: {
+                                                    const m = msgItem.m, s = parent.st;
+                                                    if (s === "failed") return "Couldn't send" + (m.error ? " · " + m.error : "");
+                                                    if (s === "queued") return "⏳ " + (m.error || "Waiting to send");
+                                                    if (s === "sending") return m.error ? m.error + "…" : "Sending…";
+                                                    const via = m.via === "iphone" ? " · via iPhone" : "";
+                                                    return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via
+                                                           + (m.error ? " · " + m.error : "");
+                                                }
                                             }
-                                            color: msgItem.m.status === "failed" ? Theme.danger : Theme.dim
-                                            font.family: Theme.uiFont
-                                            font.pixelSize: Theme.fCaption
-                                            width: Math.min(implicitWidth, col.width)
-                                            elide: Text.ElideRight
-                                            MouseArea {
-                                                anchors.fill: parent
-                                                enabled: msgItem.m.status === "failed"
-                                                cursorShape: Qt.PointingHandCursor
-                                                onClicked: root.send({ op: "retry", message: msgItem.m.id })
+                                            Row {
+                                                id: statusActions
+                                                spacing: 10
+                                                visible: parent.st === "failed" || parent.st === "queued"
+                                                Repeater {
+                                                    model: parent.parent.st === "failed" ? [["Retry", "retry"], ["Delete", "cancel"]]
+                                                         : parent.parent.st === "queued" ? [["Send now", "retry"], ["Cancel", "cancel"]] : []
+                                                    Text {
+                                                        required property var modelData
+                                                        text: modelData[0]
+                                                        color: actHover.hovered ? Theme.fg : Theme.accent
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fCaption
+                                                        font.underline: actHover.hovered
+                                                        HoverHandler { id: actHover; cursorShape: Qt.PointingHandCursor }
+                                                        TapHandler { onTapped: root.send({ op: modelData[1], message: msgItem.m.id }) }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1983,8 +2021,9 @@ ShellRoot {
                                     Layout.alignment: Qt.AlignBottom
                                     text: "＋"
                                     opacity: root.canAttach ? 1 : 0.4
-                                    tooltipText: root.canAttach ? "Attach photos or files — or drop them here, or paste an image"
-                                                                : (root.abilities.attachReason || "")
+                                    tooltipText: !root.canAttach ? (root.abilities.attachReason || "")
+                                               : root.abilities.attachNote ? root.abilities.attachNote
+                                               : "Attach photos or files — or drop them here, or paste an image"
                                     onClicked: {
                                         if (!root.canAttach) { root.flash = root.abilities.attachReason; return; }
                                         root.send({ op: "pick_files" });
@@ -2593,6 +2632,14 @@ ShellRoot {
         root.linkPreviews = { "https://example.com/ramen": { ok: true, site: "The Infatuation",
             title: "Menya Ramen on King St — the tonkotsu everyone's queueing for",
             description: "A 20-seat counter with a 3-hour broth, a short menu and a line out the door by 7pm. Here's what to order." } };
+        if (root.preview === "status") {
+            root.msgs = root.msgs.slice(0, 3).concat([
+                { id: 71, thread: "addr:1", fromMe: true, text: "here's the plan", ts: now - 90, status: "queued", error: "Sends when BlueBubbles or your iPhone connects", attachments: [], reactions: {} },
+                { id: 72, thread: "addr:1", fromMe: true, text: "", ts: now - 80, status: "queued", error: "Sends when BlueBubbles connects (photos and files go through your Mac)", reactions: {},
+                  attachments: [{ guid: "", name: "balloon.png", mime: "image/png", size: 48213, path: Qt.resolvedUrl("fx/balloon-red.png").toString().replace("file://", "") }] },
+                { id: 73, thread: "addr:1", fromMe: true, text: "did you get it?", ts: now - 60, status: "failed", error: "Your Mac isn't sending messages. On the Mac, give BlueBubbles Accessibility and Automation → Messages permission, then retry.", attachments: [], reactions: {} },
+                { id: 74, thread: "addr:1", fromMe: true, text: "on my way", ts: now - 30, status: "sending", error: "Sending through your iPhone", attachments: [], reactions: {} }]);
+        }
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {
             const want = root.preview.slice(3).replace(/_/g, " ");
