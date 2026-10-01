@@ -1,14 +1,14 @@
 # Pear Messages
 
-iMessage and SMS in a native Omarchy window.
+Every bubble, blue or green, in a native Omarchy window.
 
 ![Pear Messages](preview.png)
 
-Pear Messages talks to your messages two ways and shows them as one:
+Pear Messages reaches your conversations two ways and shows them as one:
 
 - **BlueBubbles**: a Mac signed in to Messages, running the free
-  [BlueBubbles Server](https://bluebubbles.app). Your full history, group chats, photos,
-  reactions, delivered and read.
+  [BlueBubbles Server](https://bluebubbles.app). Your full history, group chats, photos and
+  videos, reactions, effects, delivered and read.
 - **Your iPhone over Bluetooth**: no Mac needed. New messages arrive the moment they come
   in, and you can reply to one-to-one chats. Your iPhone decides whether each one goes as
   iMessage or SMS.
@@ -20,52 +20,68 @@ once.
 ![The window](docs/window.png)
 
 > Pear Messages is an independent project. It is not made, endorsed or supported by Apple.
-> iMessage and iPhone are Apple's trademarks, used here only to say what this works with.
+> iMessage, iPhone and Mac are Apple's trademarks, used here only to say what this works with.
 
 ## What it does
 
+**Your conversations**
 - **One history from two connections.** Each message is recognised by who sent it, which way
   it went, its text and when. The copy that arrives second is merged into the first, even
-  when the iPhone has cut a long text short. BlueBubbles' copy wins on the details it knows
-  better: the exact time, the group chat it belongs to, photos.
-- **Falls back without double-sending.** A send goes through BlueBubbles first. If that fails,
-  it goes through the iPhone instead. If BlueBubbles only timed out, Pear Messages first checks
-  whether the Mac sent it anyway, so the other person never gets it twice.
-- **Your iPhone keeps its own audio.** A paired iPhone normally starts playing music and calls
-  through the computer. Pear Messages drops those audio connections the moment they appear, and
-  leaves the link for messages up.
-- **Reactions and effects.** Hover a message and press ☺ to react ♥ 👍 👎 😂 ‼ ?, including iOS 18
-  emoji reactions. ✦ next to Send picks an effect:
-  - **Bubble:** Slam, Loud, Gentle, Invisible Ink.
-  - **Screen:** Echo, Spotlight, Balloons, Confetti, Love, Lasers, Fireworks, Celebration, Shooting Star.
+  when the iPhone has cut a long text short. When BlueBubbles catches up after time away, the
+  messages that came over Bluetooth gain their photos, reactions and effects.
+- **One conversation per person.** Your own number and email are one conversation, and each
+  message you send yourself shows once. A contact with several numbers or emails on one card
+  is one conversation too.
+- **History on demand.** By default your 20 most recent conversations bring their last 100
+  messages and the rest their last 20. Pull past the top of a conversation for 100 more.
+- **Photos, videos and files.** Previews load as messages come into view: photos resized on the
+  Mac, videos as a thumbnail frame. The originals download only when you open them. Press Space
+  (or double-click) to preview in GNOME's previewer, Sushi, or a built-in viewer.
+- **Link previews.** A link shows its site, title and description, as text only, fetched when
+  the message comes into view. Links to your own network are never fetched.
+- **Reactions and effects.** Hover a message and press ☺ to react ♥ 👍 👎 😂 ‼ ?. ✦ next to
+  Send picks an effect: bubble effects (Slam, Loud, Gentle, Invisible Ink), text effects (Big,
+  Small, Shake, Nod, Explode, Ripple, Bloom, Jitter) and screen effects (Confetti, Balloons,
+  Fireworks, Lasers, Love, Celebration, Echo, Spotlight, Shooting Star). Received effects play as
+  they arrive, and "Happy birthday", "Congrats", "Happy New Year" and friends play their effect
+  in several languages. Sending reactions and effects needs BlueBubbles' Private API. When
+  that isn't available, the controls are greyed out and say why.
+- **Reactions that arrive as text** over Bluetooth ("Loved “…”", or the same in French,
+  Spanish, German…) become real reactions.
 
-  Effects play when a message arrives, and *Replay* plays one again. Sending reactions and effects
-  needs BlueBubbles with its Private API turned on. When that isn't possible, because you're only
-  connected through the iPhone or the Private API is off, the controls are greyed out and say why.
-- **Text effects and formatting.** iOS 18 **bold**, *italic*, underline and strikethrough show as
-  they were sent. Big, Small, Shake, Nod, Explode, Ripple, Bloom and Jitter animate letter by letter.
-  Phrases like "Happy birthday", "Congrats", "Happy New Year" and "pew pew" play their screen effect,
-  as they do on Apple devices, in several languages.
-- **One conversation per person.** Your own number and Apple Account email are one conversation, and
-  each message you send yourself shows once. A contact with several numbers or emails on one card is
-  one conversation too.
-- **Space to preview.** Click a photo, video or file, or just hover it, and press Space. It opens in
-  GNOME's previewer (Sushi) if you have it, or a built-in viewer if you don't. Space or Esc closes it.
-- **Keeps your disk clean.** Recent photos are cached. Videos, and photos more than 200 messages up
-  a conversation, only go to a temporary folder that is cleared when you log out.
-- **Scrolling like Pear Passwords.** A mouse wheel glides. A touchpad follows your fingers, coasts,
-  and rubber-bands at the ends. Resting a finger on the touchpad stops a coast.
-- **A connection assistant in Settings.**
-  - **BlueBubbles:** *Find my Mac* looks for a server on your Tailscale network. You can also
-    type any address: LAN, Tailscale, or a tunnel. It checks the server and saves it.
-  - **iPhone:** *Pair iPhone* makes this computer visible and shows the pairing code to compare
-    with your phone. It then tells you the one switch to flip on the iPhone.
+**Sending**
+- **Send photos and files.** Use ＋, drop them on the window or paste an image. They go through
+  BlueBubbles, with any text after them.
+- **Messages wait instead of failing.** A message that can't go yet says what it's waiting for
+  ("Sends when BlueBubbles connects") and sends itself when it can, with Send now and Cancel.
+  If the Mac is reachable but Messages there isn't sending, Pear Messages reads BlueBubbles' log
+  and tells you what to fix.
+- **Falls back without double-sending.** Plain text goes through your iPhone when the Mac can't
+  take it. If BlueBubbles only timed out, Pear Messages first checks whether the Mac sent it
+  anyway.
+- **Sending…, Delivered, Read**, and the time of any message when you hover it.
+
+**On your desktop**
 - **Notifications even when the window is closed.** A small background service keeps
   receiving. Click a notification to open Pear Messages on that conversation.
-- **A regular window.** It tiles like any other app, and opens at 1040×680 when floating.
-- **Follows your Omarchy theme.** It is built from Omarchy's own shell components.
+- **Read means read.** Only the conversation you're looking at, in the focused window, is
+  marked read.
+- **Your iPhone keeps its own audio.** A paired iPhone normally starts playing music and calls
+  through the computer. Pear Messages drops those audio connections the moment they appear.
+- **Follows your Omarchy theme**, live when you switch, built from Omarchy's own components.
+  It's a regular window: it tiles like any other app.
+- **Feels native.** Pear Passwords' scrolling physics, a conversation that stays on the newest
+  message until you scroll away, a "Go to bottom" button that counts new messages, and letters
+  that pop in as you type. That last one can be turned off.
+- **Storage you control.** Settings sets how much history comes from the Mac, how much is kept
+  here, whether photo previews and video thumbnails load by themselves, and how much space
+  previews may use.
+- **A connection assistant in Settings.** *Find my Mac* looks for BlueBubbles on your Tailscale
+  network, or type any address. *Pair iPhone* shows the pairing code to compare with your phone
+  and the one switch to flip on it.
 - **Keyboard first.** Ctrl+N starts a new message, Ctrl+F searches, and Alt+↑/↓ moves between
-  conversations. Enter sends, Shift+Enter adds a new line, Space previews, Esc goes back.
+  conversations. Enter sends, Shift+Enter adds a new line, Space previews, End goes to the
+  newest message, and Esc goes back.
 
 ### What each connection can do
 
@@ -113,13 +129,19 @@ After `omarchy plugin update`, run `./install.sh` again to pick up the new versi
 
 ### Setting up BlueBubbles
 
-1. On the Mac, install [BlueBubbles Server](https://bluebubbles.app/downloads/) and follow its setup.
-   Grant it **Full Disk Access**, plus **Accessibility** and **Automation → Messages**, which it
-   needs to send. Set a server password.
+1. On the Mac, install [BlueBubbles Server](https://bluebubbles.app/downloads/) and follow its setup:
+   turn on **Full Disk Access** for it and set a server password. Open it from Applications, not
+   from a terminal or ssh. The first time it sends, the Mac asks to let BlueBubbles control
+   **Messages**: click **Allow**.
 2. Make the Mac reachable from this computer. [Tailscale](https://tailscale.com) on both is the
    easiest, and *Find my Mac* will find it. A LAN address or a BlueBubbles tunnel URL works too.
 3. In Pear Messages → Settings → BlueBubbles, enter the address and password, then press **Connect**.
    Your history loads straight away.
+
+**If messages come in but nothing sends:** Pear Messages reads BlueBubbles' log and says why in
+Settings. Most often a permission prompt is waiting on the Mac and nobody can answer it, because the
+screen is locked. Unlock the Mac, answer the prompt, and keep it from locking while it's serving
+BlueBubbles.
 
 On Tailscale, you can make the server answer *only* over Tailscale with a firewall rule on the
 Mac. BlueBubbles itself always listens on every network:
