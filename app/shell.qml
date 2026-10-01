@@ -1218,31 +1218,11 @@ ShellRoot {
                                     readonly property var reacts: Object.keys(m.reactions || {})
                                     width: list.width
                                     height: col.implicitHeight + (prev && prev.fromMe !== mine ? 8 : 0)
-                                    // The time, under the message while the pointer is on it. It floats over the gap
-                                    // (and the start of the next message) instead of making room: hovering must
-                                    // never move the conversation.
+                                    // The time, beside the message while the pointer is on it, in the open space
+                                    // next to the bubble: hovering must never move the conversation or cover the
+                                    // next message.
                                     HoverHandler { id: msgHover }
-                                    z: msgHover.hovered ? 5 : 0
-                                    Rectangle {
-                                        visible: msgHover.hovered && !msgItem.showStatus
-                                        z: 20
-                                        y: msgItem.height + 1
-                                        anchors.right: msgItem.mine ? parent.right : undefined
-                                        x: msgItem.mine ? 0 : 8
-                                        width: hoverTime.implicitWidth + 12
-                                        height: hoverTime.implicitHeight + 4
-                                        radius: height / 2
-                                        color: Theme.bg
-                                        opacity: 0.95
-                                        Text {
-                                            id: hoverTime
-                                            anchors.centerIn: parent
-                                            text: root.stampTime(msgItem.m.ts)
-                                            color: Theme.dim
-                                            font.family: Theme.uiFont
-                                            font.pixelSize: Theme.fCaption
-                                        }
-                                    }
+                                    readonly property bool showTime: msgHover.hovered && !showStatus
 
                                     Column {
                                         id: col
@@ -1276,6 +1256,7 @@ ShellRoot {
                                             delegate: Item {
                                                 id: attItem
                                                 required property var modelData
+                                                required property int index
                                                 readonly property var st: root.attachments[modelData.guid]
                                                                           || (modelData.path ? { path: modelData.path } : ({}))
                                                 readonly property bool isVideo: root.isVideo(modelData)
@@ -1343,6 +1324,13 @@ ShellRoot {
                                                         border.color: Theme.accent
                                                     }
                                                 }
+                                                SideTime {
+                                                    target: img.visible ? img : fileChip
+                                                    mine: msgItem.mine
+                                                    visible: msgItem.showTime && msgItem.m.text === ""
+                                                             && attItem.index === (msgItem.m.attachments || []).length - 1
+                                                    text: root.stampTime(msgItem.m.ts)
+                                                }
                                                 Rectangle {
                                                     id: fileChip
                                                     visible: !(attItem.isImage && attItem.st.path)
@@ -1390,6 +1378,12 @@ ShellRoot {
                                             width: parent.width
                                             height: bubble.height + (msgItem.reacts.length ? 18 : 0)
                                             HoverHandler { id: bubbleHover }
+                                            SideTime {
+                                                target: bubble
+                                                mine: msgItem.mine
+                                                visible: msgItem.showTime
+                                                text: root.stampTime(msgItem.m.ts)
+                                            }
 
                                             Rectangle {
                                                 id: bubble
@@ -2719,6 +2713,20 @@ ShellRoot {
     }
 
     // A labelled row of mutually exclusive options (Omarchy buttons, the picked one selected).
+    // the time beside a message, on the side with room (left of yours, right of theirs)
+    component SideTime: Text {
+        property Item target
+        property bool mine
+        anchors.verticalCenter: target ? target.verticalCenter : undefined
+        anchors.right: mine && target ? target.left : undefined
+        anchors.left: !mine && target ? target.right : undefined
+        anchors.leftMargin: 10
+        anchors.rightMargin: 10
+        color: Theme.dim
+        font.family: Theme.uiFont
+        font.pixelSize: Theme.fCaption
+    }
+
     component Choice: ColumnLayout {
         id: choice
         property string label: ""

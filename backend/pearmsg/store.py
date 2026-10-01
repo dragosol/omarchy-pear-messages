@@ -461,8 +461,8 @@ class Store:
         if own_id:
             r = self.db.execute(f"SELECT * FROM messages WHERE {id_col}=?", (own_id,)).fetchone()
             if r is not None:
-                self._update(r, m, source)
-                return "updated", r["id"]
+                # the poller looks back a minute, so most repeats change nothing
+                return ("updated" if self._update(r, m, source) else "same"), r["id"]
         # A send we started carries our temp id through BlueBubbles, so it matches exactly.
         if m.get("temp_id") and source != "local":
             r = self.db.execute("SELECT * FROM messages WHERE temp_id=?", (m["temp_id"],)).fetchone()
@@ -494,7 +494,7 @@ class Store:
         self.db.commit()
         return "new", rid
 
-    def _update(self, r: sqlite3.Row, m: dict, source: str, merge_id: tuple | None = None) -> None:
+    def _update(self, r: sqlite3.Row, m: dict, source: str, merge_id: tuple | None = None) -> bool:
         upd: dict = {}
         if merge_id and merge_id[1]:
             upd[merge_id[0]] = merge_id[1]
@@ -528,12 +528,14 @@ class Store:
                 upd[k] = m[k]
         if m.get("unread") is False and r["unread"]:
             upd["unread"] = 0
+        upd = {k: v for k, v in upd.items() if r[k] != v}
         if upd:
             self.db.execute("UPDATE messages SET " + ",".join(f"{k}=?" for k in upd) + " WHERE id=?",
                             (*upd.values(), r["id"]))
             if "bb_guid" in upd:
                 self._apply_pending_reactions(r["id"], upd["bb_guid"])
             self.db.commit()
+        return bool(upd)
 
     def merge_local_sends(self) -> list[tuple[str, int]]:
         """Your sends that the Mac reported back as a separate message (no receipt to match on):

@@ -252,6 +252,8 @@ class Daemon:
                     changed.setdefault(msg["thread"], []).append(rid)
                 continue
             what, rid = self.store.ingest(n, "bluebubbles")
+            if what == "same":
+                continue
             msg = self.store.message(rid)
             changed.setdefault(msg["thread"], []).append(rid)
             # Old history on first sync is not "new"; only recent incoming messages notify.
@@ -287,6 +289,8 @@ class Daemon:
                         changed.setdefault(target["thread"], []).append(target["id"])
                     continue
             what, rid = self.store.ingest(n, "iphone")
+            if what == "same":
+                continue
             msg = self.store.message(rid)
             changed.setdefault(msg["thread"], []).append(rid)
             if what == "new" and not initial and time.time() - n["ts"] < 600:

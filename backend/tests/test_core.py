@@ -137,7 +137,7 @@ class DedupTest(unittest.TestCase):
     def test_repeat_is_update(self):
         self.s.ingest(self._bb("G1", "ok", self.t), "bluebubbles")
         what, _ = self.s.ingest(self._bb("G1", "ok", self.t), "bluebubbles")
-        self.assertEqual(what, "updated")
+        self.assertEqual(what, "same")  # nothing new: no broadcast
 
     def test_group_message_moves_to_group(self):
         chat = {"guid": "iMessage;+;chat99", "style": 43, "displayName": "Family",

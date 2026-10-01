@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pearmsg"
-version = "1.0.0"
+version = "1.0.1"
 description = "Pear Messages backend: iMessage/SMS through BlueBubbles or an iPhone over Bluetooth"
 requires-python = ">=3.11"
 license = {text = "MIT"}
