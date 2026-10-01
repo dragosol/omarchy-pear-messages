@@ -369,6 +369,7 @@ class Poller(threading.Thread):
         self.wake = threading.Event()
         self.info: dict = {}
         self.backfill = backfill or not since_ms
+        self._receipts_at = 0.0
 
     def _backfill(self) -> None:
         """The default history, one conversation at a time (newest conversations first, so the
@@ -443,6 +444,16 @@ class Poller(threading.Thread):
                     if len(msgs) < 200 or newest <= after:
                         break
                     after = newest - 1
+                # Delivered / read happen after a message exists, and the query above only finds
+                # new ones - so look at the last couple of hours of yours again now and then.
+                if time.time() - self._receipts_at > 15:
+                    self._receipts_at = time.time()
+                    recent = self.client._req("POST", "/message/query", {
+                        "limit": 200, "offset": 0, "sort": "DESC", "after": int((time.time() - 7200) * 1000),
+                        "with": WITH_MSG}) or []
+                    mine = [m for m in recent if m.get("isFromMe") and not m.get("dateRead")]
+                    if mine:
+                        self.emit("messages", mine)
                 self.wake.wait(self.interval)
                 self.wake.clear()
             except BBError as e:

@@ -1054,6 +1054,8 @@ ShellRoot {
                                 anchors.rightMargin: 16
                                 clip: true
                                 model: root.msgs
+                                // rows above the view stay laid out, so their heights are real, not estimates
+                                cacheBuffer: 2400
                                 spacing: 3
                                 interactive: false
                                 ScrollBar.vertical: AppScrollBar {
@@ -1172,8 +1174,15 @@ ShellRoot {
                         if (--left <= 0) stop();
                     }
                 }
-                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running) { settle.left = 3; settle.restart(); }
-                onHeightChanged: if (followEnd && !msgPhys.busy) { settle.left = 3; settle.restart(); }
+                // While pinned, growth (a new message, a photo arriving, Big text swelling its bubble
+                // every frame) is followed by setting the position to the exact end. Not
+                // positionViewAtEnd: it re-estimates the whole list from average row heights, and
+                // called every frame it now and then lands far up the conversation for a frame or
+                // two - the jumping. That's kept for opening a conversation (stickToEnd).
+                function followGrowth() { contentY = Math.max(originY, originY + contentHeight - height); }
+                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running) followGrowth()
+                onOriginYChanged: if (followEnd && !msgPhys.busy && !settle.running) followGrowth()
+                onHeightChanged: if (followEnd && !msgPhys.busy) followGrowth()
                 // Pinned to the newest message unless YOU scroll away: only your own scrolling
                 // (wheel, touchpad, the scrollbar) un-pins or re-pins it. A new message, a photo
                 // loading, older history arriving - content moving by itself never un-pins it.
@@ -1209,6 +1218,31 @@ ShellRoot {
                                     readonly property var reacts: Object.keys(m.reactions || {})
                                     width: list.width
                                     height: col.implicitHeight + (prev && prev.fromMe !== mine ? 8 : 0)
+                                    // The time, under the message while the pointer is on it. It floats over the gap
+                                    // (and the start of the next message) instead of making room: hovering must
+                                    // never move the conversation.
+                                    HoverHandler { id: msgHover }
+                                    z: msgHover.hovered ? 5 : 0
+                                    Rectangle {
+                                        visible: msgHover.hovered && !msgItem.showStatus
+                                        z: 20
+                                        y: msgItem.height + 1
+                                        anchors.right: msgItem.mine ? parent.right : undefined
+                                        x: msgItem.mine ? 0 : 8
+                                        width: hoverTime.implicitWidth + 12
+                                        height: hoverTime.implicitHeight + 4
+                                        radius: height / 2
+                                        color: Theme.bg
+                                        opacity: 0.95
+                                        Text {
+                                            id: hoverTime
+                                            anchors.centerIn: parent
+                                            text: root.stampTime(msgItem.m.ts)
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                        }
+                                    }
 
                                     Column {
                                         id: col
@@ -1652,7 +1686,8 @@ ShellRoot {
                                                     if (s === "queued") return "⏳ " + (m.error || "Waiting to send");
                                                     if (s === "sending") return m.error ? m.error + "…" : "Sending…";
                                                     const via = m.via === "iphone" ? " · via iPhone" : "";
-                                                    return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via
+                                                    const when = msgHover.hovered ? root.stampTime(m.ts) + " · " : "";
+                                                    return when + ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] + via
                                                            + (m.error ? " · " + m.error : "");
                                                 }
                                             }
