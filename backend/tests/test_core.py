@@ -359,6 +359,21 @@ class EnrichmentTest(unittest.TestCase):
         self.assertEqual(m["reactions"], {store.C.key("+16135550100"): "love"})   # one heart, not two
 
 
+class PruneTest(unittest.TestCase):
+    def test_limits_keep_unread_and_unsent(self):
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        th = store.addr_thread("+16135550100")
+        t = time.time() - 1000
+        for i in range(10):
+            s.ingest({"bb_guid": f"G{i}", "thread": th, "from_me": False, "sender_addr": "+16135550100",
+                      "text": f"m{i}", "ts": t + i}, "bluebubbles")
+        s.ingest({"temp_id": "q", "thread": th, "from_me": True, "text": "waiting", "ts": t - 5, "status": "queued"}, "local")
+        s.db.execute("UPDATE messages SET unread=1 WHERE bb_guid='G0'")
+        self.assertEqual(s.prune(per_chat=4, total=0), 5)          # G1..G5 go; G0 is unread, the queued one stays
+        left = {m["text"] for m in s.messages(th)}
+        self.assertEqual(left, {"m0", "waiting", "m6", "m7", "m8", "m9"})
+
+
 class BBTest(unittest.TestCase):
     def test_reaction_parse(self):
         r = BB.to_message({"guid": "R", "associatedMessageGuid": "p:0/ABC", "associatedMessageType": 2001,

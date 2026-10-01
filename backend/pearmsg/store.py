@@ -558,6 +558,25 @@ class Store:
                          (p or {}).get("site", ""), 1 if p else 0, time.time()))
         self.db.commit()
 
+    def prune(self, per_chat: int, total: int) -> int:
+        """Drop the oldest messages beyond the limits (0 = none). Kept regardless: unread
+        messages and yours that haven't gone yet. Returns how many were removed."""
+        keep_rule = "unread=0 AND status NOT IN ('queued','sending','failed')"
+        n = 0
+        if per_chat > 0:
+            for (tid,) in self.db.execute("SELECT thread FROM messages GROUP BY thread HAVING COUNT(*) > ?",
+                                          (per_chat,)).fetchall():
+                n += self.db.execute(
+                    f"DELETE FROM messages WHERE thread=? AND {keep_rule} AND id NOT IN "
+                    "(SELECT id FROM messages WHERE thread=? ORDER BY ts DESC LIMIT ?)",
+                    (tid, tid, per_chat)).rowcount
+        if total > 0:
+            n += self.db.execute(
+                f"DELETE FROM messages WHERE {keep_rule} AND id NOT IN "
+                "(SELECT id FROM messages ORDER BY ts DESC LIMIT ?)", (total,)).rowcount
+        self.db.commit()
+        return n
+
     def set_effect(self, mid: int, effect: str) -> None:
         self.db.execute("UPDATE messages SET effect=? WHERE id=?", (effect, mid))
         self.db.commit()

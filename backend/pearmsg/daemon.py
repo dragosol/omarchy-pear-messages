@@ -55,6 +55,10 @@ DEFAULTS = {
     "notificationPreview": True,
     "linkPreviews": True,
     "typingAnimation": True,
+    # what's taken from the Mac by default, and what's kept here (0 = no limit)
+    "history": {"recentChats": 20, "recentDepth": 100, "otherDepth": 20},
+    "keep": {"perChat": 0, "total": 0},
+    "media": {"photos": True, "videoThumbs": "small", "keepPreviews": 20, "cacheMB": 500},
 }
 
 
@@ -155,6 +159,10 @@ class Daemon:
             # rest) - taken once, including by installs that synced before it existed.
             self.poller = BB.Poller(self.client, since, self._from_bb_thread,
                                     backfill=self.store.get_meta("backfill_v2") != "done")
+            h = self.settings["history"]
+            self.poller.RECENT_CHATS = int(h["recentChats"])
+            self.poller.RECENT_DEPTH = int(h["recentDepth"])
+            self.poller.OTHER_DEPTH = int(h["otherDepth"])
             self.poller.start()
         if not want:
             self.bb_state = {"state": "off", "detail": "" if creds.get("url") else "Not set up"}
@@ -722,7 +730,9 @@ class Daemon:
                 "keepAudio": self.settings["iphone"].get("keepAudio", True),
                 "paired": phones,
             },
-            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation")},
+            "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews",
+                                                       "typingAnimation", "history", "keep", "media")},
+            "bbSetUp": bool(creds.get("url") and creds.get("password")),
             "abilities": self.abilities(),
             "pairing": self.pairing.active,
         }
@@ -842,6 +852,20 @@ class Daemon:
                                              req.get("effect", ""), req.get("files") or [])})
         elif op == "link_preview":
             self._link_preview(c, req.get("url", ""))
+        elif op == "storage":
+            reply({"ev": "storage", **self._storage()})
+        elif op == "clear_media":
+            for d in (os.path.join(CACHE, "previews"), os.path.join(CACHE, "attachments"),
+                      os.path.join(RUNTIME, "previews"), os.path.join(RUNTIME, "attachments")):
+                shutil.rmtree(d, ignore_errors=True)
+            reply({"ev": "storage", **self._storage()})
+        elif op == "resync_history":
+            # take the default history from the Mac again, with the current settings
+            self.store.set_meta("backfill_v2", "")
+            if self.poller:
+                self.poller.stop()
+                self.poller = None
+            self.apply_settings()
         elif op == "pick_files":
             self._pick_files(c, rid)
         elif op == "clipboard_image":
@@ -867,12 +891,22 @@ class Daemon:
             for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation"):
                 if k in req:
                     self.settings[k] = bool(req[k])
-            for group in ("iphone", "bluebubbles"):
+            for group in ("iphone", "bluebubbles", "history", "keep", "media"):
                 for k, v in (req.get(group) or {}).items():
-                    if k in DEFAULTS[group]:
-                        self.settings[group][k] = v
+                    if k not in DEFAULTS[group]:
+                        continue
+                    d = DEFAULTS[group][k]
+                    if isinstance(d, bool):
+                        v = bool(v)
+                    elif isinstance(d, int):
+                        v = max(0, min(int(v), 1_000_000))
+                    elif k == "videoThumbs" and v not in ("all", "small", "never"):
+                        continue
+                    self.settings[group][k] = v
             _write_json(SETTINGS, self.settings, 0o644)
             self.apply_settings()
+            if req.get("keep") or req.get("media"):
+                self._prune()
         elif op == "bb_test":
             self._bb_test(c, rid, req.get("url", ""), req.get("password"), bool(req.get("save")))
         elif op == "bb_find":
@@ -977,6 +1011,50 @@ class Daemon:
             return False
         threading.Thread(target=work, daemon=True).start()
 
+    def _prune(self) -> bool:
+        """Keep what Settings says: messages per conversation / in total, and the media cache
+        under its size. Oldest first; never anything unread or still on its way out."""
+        k = self.settings["keep"]
+        n = self.store.prune(int(k["perChat"]), int(k["total"]))
+        if n:
+            log(f"kept within the limits: removed {n} old message(s) (they can be pulled back from the Mac)")
+            self._broadcast_threads()
+        self._prune_media()
+        return True
+
+    def _prune_media(self) -> None:
+        cap = int(self.settings["media"]["cacheMB"]) * 1024 * 1024
+        d = os.path.join(CACHE, "previews")
+        try:
+            files = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(d) if e.is_file()]
+        except OSError:
+            return
+        total = sum(f[1] for f in files)
+        for _, size, path in sorted(files):        # least recently used first
+            if total <= cap:
+                break
+            try:
+                os.unlink(path)
+                total -= size
+            except OSError:
+                pass
+
+    def _storage(self) -> dict:
+        def size(d):
+            t = 0
+            for root_, _, fs in os.walk(d):
+                for f in fs:
+                    try:
+                        t += os.path.getsize(os.path.join(root_, f))
+                    except OSError:
+                        pass
+            return t
+        db = os.path.join(DATA, "messages.db")
+        return {"messages": self.store.db.execute("SELECT COUNT(*) FROM messages WHERE hidden=0").fetchone()[0],
+                "dbBytes": sum(os.path.getsize(p) for p in (db, db + "-wal") if os.path.exists(p)),
+                "mediaBytes": size(os.path.join(CACHE, "previews")) + size(os.path.join(CACHE, "attachments")),
+                "tempBytes": size(os.path.join(RUNTIME, "previews")) + size(os.path.join(RUNTIME, "attachments"))}
+
     def _mark_read(self, tid: str) -> None:
         if self.store.mark_read(tid):
             self._broadcast_threads()
@@ -1062,6 +1140,7 @@ class Daemon:
                                                      allow_big=bool(temp is None))}
                 else:
                     res = {"path": media.photo_preview(client, guid, path)}
+                GLib.idle_add(lambda: (self._prune_media(), False)[1])
             except media.MediaError as e:
                 res = {"error": str(e), "big": str(e) == "big"}
             except (OSError, subprocess.SubprocessError) as e:
@@ -1117,6 +1196,7 @@ class Daemon:
         if stuck:
             log(f"{stuck} unfinished send(s) queued again")
         GLib.timeout_add_seconds(15, self._flush)
+        GLib.timeout_add_seconds(600, self._prune)
         self.serve()
         self.apply_settings()
         # Transfers finishing (sends, contact pulls) are reported by the phone module; this

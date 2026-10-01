@@ -49,6 +49,12 @@ ShellRoot {
     property var linkPreviews: ({})      // url -> {ok, title, description, site} | {loading}
     readonly property bool linkPreviewsOn: !root.status.settings || root.status.settings.linkPreviews !== false
     readonly property bool typingAnimation: !root.status.settings || root.status.settings.typingAnimation !== false
+    readonly property var sHistory: (root.status.settings && root.status.settings.history) || ({ recentChats: 20, recentDepth: 100, otherDepth: 20 })
+    readonly property var sKeep: (root.status.settings && root.status.settings.keep) || ({ perChat: 0, total: 0 })
+    readonly property var sMedia: (root.status.settings && root.status.settings.media) || ({ photos: true, videoThumbs: "small", keepPreviews: 20, cacheMB: 500 })
+    readonly property bool bbSetUp: !!root.status.bbSetUp
+    property var storage: ({})
+    function fmtCount(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n); }
     function firstUrl(text) {
         const m = (text || "").match(/https?:\/\/[^\s<>"]+[^\s<>".,;:!?)\]']/);
         return m ? m[0] : "";
@@ -168,9 +174,10 @@ ShellRoot {
     readonly property var keepGuids: {
         const keep = {};
         let n = 0;
-        for (let i = root.msgs.length - 1; i >= Math.max(0, root.msgs.length - 100) && n < 20; i--)
+        const max = root.sMedia.keepPreviews;
+        for (let i = root.msgs.length - 1; i >= Math.max(0, root.msgs.length - 100) && n < max; i--)
             for (const a of (root.msgs[i].attachments || []))
-                if (a.guid && /^(image|video)\//.test(a.mime || "") && n < 20) { keep[a.guid] = true; n++; }
+                if (a.guid && /^(image|video)\//.test(a.mime || "") && n < max) { keep[a.guid] = true; n++; }
         return keep;
     }
     function attTemp(att, msgIndex) { return !root.keepGuids[att.guid]; }
@@ -343,6 +350,7 @@ ShellRoot {
     readonly property bool focused: win.visible && Qt.application.state === Qt.ApplicationActive
     readonly property string onScreen: (root.composing || root.settingsOpen) ? "" : root.current
     onFocusedChanged: root.reportView()
+    onSettingsOpenChanged: if (root.settingsOpen) root.send({ op: "storage" })
     onOnScreenChanged: root.reportView()
     function reportView() {
         root.send({ op: "view", thread: root.onScreen, active: root.focused === true });
@@ -441,6 +449,9 @@ ShellRoot {
             root.linkPreviews = l;
             break;
         }
+        case "storage":
+            root.storage = d;
+            break;
         case "picked":
             if (d.error) root.flash = d.error;
             root.addFiles(d.files || []);
@@ -1242,7 +1253,11 @@ ShellRoot {
                                                 height: isImage && st.path ? img.height : fileChip.height
                                                 // Previews (photo, video thumbnail) are fetched when the message comes
                                                 // into view - the list creates rows just before they scroll on screen.
-                                                Component.onCompleted: if (isImage && !modelData.path) root.needAttachment(modelData, msgItem.index)
+                                                // (Settings can turn off automatic photo previews or video thumbnails; then a
+                                                // click loads one.)
+                                                readonly property bool auto: isVideo ? root.sMedia.videoThumbs !== "never" : root.sMedia.photos
+                                                Component.onCompleted: if (isImage && !modelData.path && auto)
+                                                                           root.needAttachment(modelData, msgItem.index, "preview", isVideo && root.sMedia.videoThumbs === "all")
 
                                                 function hover(on) {
                                                     if (on) root.hoverAtt = { att: attItem.modelData, index: msgItem.index };
@@ -1311,7 +1326,8 @@ ShellRoot {
                                                         anchors.rightMargin: 14
                                                         verticalAlignment: Text.AlignVCenter
                                                         elide: Text.ElideMiddle
-                                                        text: attItem.st.big ? "▶  Video · " + root.fmtSize(attItem.modelData.size) + " — click for a preview"
+                                                        text: (attItem.st.big || (!attItem.st.path && !attItem.st.loading && !attItem.auto && attItem.isImage))
+                                                              ? (attItem.isVideo ? "▶  Video · " : "🖼  Photo · ") + root.fmtSize(attItem.modelData.size) + " — click for a preview"
                                                             : (attItem.st.loading ? "Loading… " : attItem.st.error ? "Couldn't load " : attItem.isVideo ? "▶  " : "📎  ")
                                                               + (attItem.modelData.name || "Attachment")
                                                               + (attItem.modelData.size ? "  ·  " + root.fmtSize(attItem.modelData.size) : "")
@@ -1324,7 +1340,8 @@ ShellRoot {
                                                         onTapped: {
                                                             root.selAtt = attItem.modelData.guid;
                                                             // a big video's thumbnail is fetched when you ask for it
-                                                            if (attItem.st.big) root.needAttachment(attItem.modelData, msgItem.index, "preview", true);
+                                                            if (attItem.st.big || (!attItem.st.path && attItem.isImage && !attItem.auto))
+                                                                root.needAttachment(attItem.modelData, msgItem.index, "preview", true);
                                                         }
                                                         onDoubleTapped: root.previewAttachment(attItem.modelData, msgItem.index)
                                                     }
@@ -2510,6 +2527,107 @@ ShellRoot {
                                     }
                                 }
 
+                                // ---------------- storage & downloads
+                                Text {
+                                    Layout.topMargin: 6
+                                    text: "Storage & downloads"
+                                    color: Theme.fg
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fBody + 1
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.WordWrap
+                                    color: root.bbSetUp ? Theme.dim : Theme.danger
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fCaption
+                                    text: root.bbSetUp
+                                        ? ("What Pear Messages takes from your Mac and keeps here. Using "
+                                           + root.fmtSize(root.storage.dbBytes || 0) + " for " + root.fmtCount(root.storage.messages || 0)
+                                           + " messages and " + root.fmtSize(root.storage.mediaBytes || 0) + " for photo and video previews"
+                                           + ((root.storage.tempBytes || 0) > 0 ? " (+ " + root.fmtSize(root.storage.tempBytes) + " temporary, cleared at logout)" : "") + ".")
+                                        : "These need BlueBubbles. History, photos and videos come from your Mac; over Bluetooth your iPhone only passes on new text messages, so there's nothing here to store or download until BlueBubbles is set up."
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 12
+                                    enabled: root.bbSetUp
+                                    opacity: root.bbSetUp ? 1 : 0.4
+
+                                    Choice {
+                                        label: "History from your Mac"
+                                        description: "Messages taken for your most recent conversations; older ones load when you pull at the top."
+                                        options: [[10, "10 chats"], [20, "20 chats"], [50, "50 chats"], [100, "100 chats"]]
+                                        value: root.sHistory.recentChats
+                                        onPicked: v => root.send({ op: "settings", history: { recentChats: v } })
+                                    }
+                                    Choice {
+                                        label: "Messages for each of those"
+                                        options: [[50, "50"], [100, "100"], [250, "250"], [500, "500"]]
+                                        value: root.sHistory.recentDepth
+                                        onPicked: v => root.send({ op: "settings", history: { recentDepth: v } })
+                                    }
+                                    Choice {
+                                        label: "Messages for every other conversation"
+                                        options: [[0, "None"], [20, "20"], [50, "50"], [100, "100"]]
+                                        value: root.sHistory.otherDepth
+                                        onPicked: v => root.send({ op: "settings", history: { otherDepth: v } })
+                                    }
+                                    RowLayout {
+                                        spacing: 8
+                                        AppButton { text: "Download history again"; onClicked: root.send({ op: "resync_history" }) }
+                                        Text {
+                                            text: "Applies the numbers above now; new messages always arrive."
+                                            color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption
+                                        }
+                                    }
+                                    Choice {
+                                        label: "Keep on this computer, per conversation"
+                                        description: "Older messages are removed from here (unread and unsent ones never are) and can be pulled back from your Mac."
+                                        options: [[0, "Everything"], [100, "100"], [500, "500"], [2000, "2,000"]]
+                                        value: root.sKeep.perChat
+                                        onPicked: v => root.send({ op: "settings", keep: { perChat: v } })
+                                    }
+                                    Choice {
+                                        label: "Keep on this computer, in total"
+                                        options: [[0, "Everything"], [5000, "5,000"], [20000, "20,000"], [100000, "100,000"]]
+                                        value: root.sKeep.total
+                                        onPicked: v => root.send({ op: "settings", keep: { total: v } })
+                                    }
+                                    O.Toggle {
+                                        Layout.fillWidth: true
+                                        label: "Load photo previews automatically"
+                                        description: "Small previews, fetched as messages come into view. Off: click a photo to load it."
+                                        checked: !!root.sMedia.photos
+                                        onClicked: root.send({ op: "settings", media: { photos: !root.sMedia.photos } })
+                                    }
+                                    Choice {
+                                        label: "Video thumbnails"
+                                        description: "Some videos need downloading in full for a thumbnail (it's deleted straight after). The video itself only downloads when you open it."
+                                        options: [["all", "Always"], ["small", "Videos up to 30 MB"], ["never", "Never"]]
+                                        value: root.sMedia.videoThumbs
+                                        onPicked: v => root.send({ op: "settings", media: { videoThumbs: v } })
+                                    }
+                                    Choice {
+                                        label: "Previews to keep per conversation"
+                                        description: "The newest photos and videos keep their previews here; the rest are fetched again when you scroll to them."
+                                        options: [[0, "None"], [10, "10"], [20, "20"], [50, "50"]]
+                                        value: root.sMedia.keepPreviews
+                                        onPicked: v => root.send({ op: "settings", media: { keepPreviews: v } })
+                                    }
+                                    Choice {
+                                        label: "Space for previews"
+                                        options: [[100, "100 MB"], [500, "500 MB"], [1000, "1 GB"], [5000, "5 GB"]]
+                                        value: root.sMedia.cacheMB
+                                        onPicked: v => root.send({ op: "settings", media: { cacheMB: v } })
+                                    }
+                                    AppButton {
+                                        text: "Clear cached photos and videos"
+                                        onClicked: { root.send({ op: "clear_media" }); root.attachments = ({}); }
+                                    }
+                                }
+
                                 // ---------------- notifications
                                 Text {
                                     Layout.topMargin: 6
@@ -2550,6 +2668,40 @@ ShellRoot {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // A labelled row of mutually exclusive options (Omarchy buttons, the picked one selected).
+    component Choice: ColumnLayout {
+        id: choice
+        property string label: ""
+        property string description: ""
+        property var options: []        // [[value, text], ...]
+        property var value
+        signal picked(var v)
+        Layout.fillWidth: true
+        spacing: 6
+        Text { text: choice.label; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
+        Text {
+            visible: choice.description !== ""
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            text: choice.description
+            color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption
+        }
+        Flow {
+            Layout.fillWidth: true
+            spacing: 6
+            Repeater {
+                model: choice.options
+                AppButton {
+                    required property var modelData
+                    text: modelData[1]
+                    fontSize: Theme.fSmall
+                    selected: choice.value === modelData[0]
+                    onClicked: choice.picked(modelData[0])
                 }
             }
         }
