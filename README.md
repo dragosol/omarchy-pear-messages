@@ -79,10 +79,11 @@ once.
   that pop in as you type. That last one can be turned off.
 - **Storage you control.** Settings sets how much history comes from the Mac, how much is kept
   here, whether photo previews and video thumbnails load by themselves, and how much space
-  previews may use. Everything it writes is private to you: the data directory is created 0700
-  and the database, its write-ahead log and its shared-memory file are all 0600 before a single
-  message is written, so no other account on the machine can read your conversations out of a
-  journal file.
+  previews may use. Everything it writes is private to you: the data and cache directories are
+  created 0700, the database, its write-ahead log and its shared-memory file are all 0600 before
+  a single message is written, and every cached photo, video frame and attachment is 0600 once
+  it lands. An install made before this was added is repaired on the next start rather than
+  only new ones being protected.
 - **A connection assistant in Settings.** *Find my Mac* looks for BlueBubbles on your Tailscale
   network, or type any address. *Pair iPhone* shows the pairing code to compare with your phone
   and the one switch to flip on it.

@@ -359,7 +359,13 @@ class Phone:
         self.emit = emit
         self.log = log
         self.cache = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
+        # Files pulled off the phone land here, so it is private, and tightened if an older
+        # version left it at 0755.
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cache_dir, 0o700)
+        except OSError:
+            pass
         self.address = ""
         self.session = ""
         self.state = "off"

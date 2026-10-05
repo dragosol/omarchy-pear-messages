@@ -54,6 +54,20 @@ def _to_jpeg(src: str, dst: str, width: int = 0) -> bool:
     return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
 
 
+def _private(path: str) -> str:
+    """Make a finished cache file readable only by you, and hand the path back.
+
+    Everything here lands through os.replace, which keeps the mode of the file being moved.
+    tempfile.mkstemp gives 0600, but ffmpeg and a plain open() both write 0644 under the usual
+    umask, so a photo or video out of your messages ended up world-readable in the cache. The
+    directory above it is private, which is the real protection; this is the layer under it.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
 def photo_preview(client, guid: str, dst: str) -> str:
     """A small JPEG of the photo. Returns the path written."""
     with _open(client, guid, PREVIEW_WIDTH) as r:
@@ -63,9 +77,10 @@ def photo_preview(client, guid: str, dst: str) -> str:
         f.write(data)
     try:
         if _to_jpeg(raw, dst + ".part.jpg"):
-            os.replace(dst + ".part.jpg", dst)
+            os.replace(dst + ".part.jpg", dst)   # ffmpeg wrote this one 0644
         else:                       # no ffmpeg: keep what the Mac sent
             os.replace(raw, dst)
+        _private(dst)
     finally:
         for p in (raw, dst + ".part.jpg"):
             if os.path.exists(p):
@@ -136,11 +151,12 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
     if not os.path.exists(dst + ".part.jpg") or os.path.getsize(dst + ".part.jpg") == 0:
         raise MediaError("Couldn't read a frame from the video")
     os.replace(dst + ".part.jpg", dst)
-    return dst
+    return _private(dst)
 
 
 def original(client, guid: str, dst: str) -> str:
-    with _open(client, guid) as r, open(dst + ".part", "wb") as f:
+    fd = os.open(dst + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with _open(client, guid) as r, os.fdopen(fd, "wb") as f:
         shutil.copyfileobj(r, f, 1 << 20)
     os.replace(dst + ".part", dst)
-    return dst
+    return _private(dst)

@@ -74,8 +74,39 @@ def _read_json(path: str, default):
         return default
 
 
+def _repair_cache_modes() -> None:
+    """One pass over the cache, making anything an older version left world-readable private."""
+    for root, dirs, files in os.walk(CACHE):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o700)
+            except OSError:
+                pass
+        for f in files:
+            full = os.path.join(root, f)
+            try:
+                if os.stat(full).st_mode & 0o077:
+                    os.chmod(full, 0o600)
+            except OSError:
+                pass
+
+
+def _private_dir(path: str) -> str:
+    """Create a directory only you can enter, and tighten it if it already exists.
+
+    The repair half matters: an install made before this was added has 0755 directories full of
+    photos out of your messages, and only a new install would be protected otherwise.
+    """
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
 def _write_json(path: str, data, mode: int = 0o600) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _private_dir(os.path.dirname(path))
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
@@ -796,6 +827,12 @@ class Daemon:
     # ------------------------------------------------------------------ socket
     def serve(self) -> None:
         os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+        # Your messages' photos live under CACHE. Make it and everything in it private, and
+        # repair what an older version left at 0755 / 0644.
+        for d in (CACHE, os.path.join(CACHE, "previews"), os.path.join(CACHE, "attachments"),
+                  os.path.join(CACHE, "tmp"), CONF):
+            _private_dir(d)
+        _repair_cache_modes()
         os.chmod(RUNTIME, 0o700)
         try:
             os.unlink(SOCK)

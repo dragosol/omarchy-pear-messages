@@ -439,3 +439,42 @@ class PrivacyOnDiskTest(unittest.TestCase):
             if os.path.exists(wal):
                 with open(wal, "rb") as fh:
                     self.assertIn(b"PrivateText", fh.read())
+
+
+class MediaPrivacyTest(unittest.TestCase):
+    """Photos and videos out of your messages are cached on disk.
+
+    They arrive through os.replace, which keeps the mode of the file being moved, and both
+    ffmpeg and a plain open() write 0644 under the usual umask. So the cache filled up with
+    world-readable copies of private photos while the directory above them looked fine.
+    """
+
+    def test_a_finished_cache_file_is_private(self):
+        from pearmsg import media
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                # Stand in for whatever ffmpeg or a download just wrote: 0644.
+                dst = os.path.join(tmp, "at_0_ABC-preview.jpg")
+                with open(dst, "wb") as fh:
+                    fh.write(b"\xff\xd8pretend jpeg")
+                self.assertEqual(stat.S_IMODE(os.stat(dst).st_mode) & 0o077, 0o044)
+                media._private(dst)
+                self.assertEqual(stat.S_IMODE(os.stat(dst).st_mode) & 0o077, 0,
+                                 "a cached photo is still readable by other accounts")
+        finally:
+            os.umask(old)
+
+    def test_cache_directories_are_private_and_repaired(self):
+        from pearmsg import daemon
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                d = os.path.join(tmp, "previews")
+                os.makedirs(d)                      # as an older version left it: 0755
+                self.assertNotEqual(stat.S_IMODE(os.stat(d).st_mode) & 0o077, 0)
+                daemon._private_dir(d)
+                self.assertEqual(stat.S_IMODE(os.stat(d).st_mode) & 0o077, 0,
+                                 "an existing cache directory was not tightened")
+        finally:
+            os.umask(old)
