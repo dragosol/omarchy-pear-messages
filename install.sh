@@ -31,7 +31,10 @@ done
   || die "Omarchy's shell components were not found in $omarchy_shell"
 python3 -c 'import dbus, gi; gi.require_version("GLib", "2.0"); from gi.repository import GLib' 2>/dev/null \
   || die "the D-Bus bindings for Python are missing: sudo pacman -S --needed python-dbus python-gobject"
-command -v notify-send >/dev/null 2>&1 || warn "notify-send is not installed: new messages will not pop up"
+# Notifications go over D-Bus (org.freedesktop.Notifications), not by running notify-send, so
+# message text never reaches a command line. Any notification daemon that owns that name works.
+python3 -c "import dbus,dbus.mainloop.glib" >/dev/null 2>&1 ||
+    warn "python-dbus is not installed: new messages will not pop up"
 
 missing_obex=0
 if [ ! -x /usr/lib/bluetooth/obexd ]; then

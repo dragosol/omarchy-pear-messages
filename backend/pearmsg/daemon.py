@@ -108,6 +108,11 @@ class Daemon:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self.sys = dbus.SystemBus()
         self.ses = dbus.SessionBus()
+        # Notification id -> conversation, so an ActionInvoked signal can open the right one.
+        self._notified: dict[int, str] = {}
+        for sig, cb in (("ActionInvoked", self._notify_action), ("NotificationClosed", self._notify_closed)):
+            self.ses.add_signal_receiver(cb, signal_name=sig,
+                                         dbus_interface="org.freedesktop.Notifications")
         self.loop = GLib.MainLoop()
         self.settings = load_settings()
         self.store = Store(os.path.join(DATA, "messages.db"))
@@ -699,25 +704,41 @@ class Daemon:
         body = m["text"] or ("Attachment" if m["attachments"] else "")
         if not self.settings.get("notificationPreview", True):
             body = "New message"
-        if not shutil.which("notify-send"):
-            return
         icon = os.path.join(DATA, "app", "icon.svg")
         launcher = os.path.join(DATA, "app", "launch.sh")
+        # Sent over D-Bus rather than by running notify-send, because the text of your
+        # messages and the names of the people sending them must not appear in a process's
+        # command line. notify-send holds an --action card open until it is clicked (here for
+        # up to an hour), and for that whole time any other account on the machine can read
+        # /proc/<pid>/cmdline. A D-Bus method call carries its arguments over the bus socket
+        # and never puts them on a command line at all.
+        #
         # A click opens this conversation. Omarchy's notifications (and Omapager) run the
         # omarchy-exec-argv hint straight away, and it still works for a card restored after a
         # shell restart; other notification daemons use the "default" action instead.
-        args = ["notify-send", "-a", "Pear Messages", "-i", icon, "--action=default=Open",
-                "-h", "string:omarchy-exec-argv:" + json.dumps([launcher, m["thread"]]),
-                "-h", "string:x-canonical-private-synchronous:pear-" + m["thread"], title, body]
+        hints = {
+            "omarchy-exec-argv": dbus.String(json.dumps([launcher, m["thread"]])),
+            "x-canonical-private-synchronous": dbus.String("pear-" + m["thread"]),
+        }
+        try:
+            notifier = dbus.Interface(
+                self.ses.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications"),
+                "org.freedesktop.Notifications")
+            nid = int(notifier.Notify("Pear Messages", dbus.UInt32(0), icon, title, body,
+                                      dbus.Array(["default", "Open"], signature="s"),
+                                      dbus.Dictionary(hints, signature="sv"), dbus.Int32(-1)))
+        except dbus.DBusException as e:
+            self.log(f"notify: {e}")
+            return
+        self._notified[nid] = m["thread"]
 
-        def run():
-            try:
-                out = subprocess.run(args, capture_output=True, text=True, timeout=3600).stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                return
-            if out == "default":
-                GLib.idle_add(lambda: (self.open_app(m["thread"]), False)[1])
-        threading.Thread(target=run, daemon=True).start()
+    def _notify_action(self, nid, action) -> None:
+        thread = self._notified.get(int(nid))
+        if thread is not None and str(action) == "default":
+            self.open_app(thread)
+
+    def _notify_closed(self, nid, _reason=None) -> None:
+        self._notified.pop(int(nid), None)
 
     def open_app(self, thread: str = "") -> None:
         if self.conns:

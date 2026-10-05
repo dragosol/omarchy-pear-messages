@@ -38,7 +38,9 @@ once.
   Mac, videos as a thumbnail frame. The originals download only when you open them. Press Space
   (or double-click) to preview in GNOME's previewer, Sushi, or a built-in viewer.
 - **Link previews.** A link shows its site, title and description, as text only, fetched when
-  the message comes into view. Links to your own network are never fetched.
+  the message comes into view. Links to your own network are never fetched: the address is
+  checked once and the connection is pinned to that exact address, so a sender cannot answer
+  with a public address for the check and a private one for the fetch.
 - **Reactions and effects.** Hover a message and press ☺ to react ♥ 👍 👎 😂 ‼ ?. ✦ next to
   Send picks an effect: bubble effects (Slam, Loud, Gentle, Invisible Ink), text effects (Big,
   Small, Shake, Nod, Explode, Ripple, Bloom, Jitter) and screen effects (Confetti, Balloons,
@@ -64,6 +66,8 @@ once.
 **On your desktop**
 - **Notifications even when the window is closed.** A small background service keeps
   receiving. Click a notification to open Pear Messages on that conversation.
+  They are sent over D-Bus, so message text and contact names never appear in a process's
+  command line where another account on the machine could read them.
 - **Read means read.** Only the conversation you're looking at, in the focused window, is
   marked read.
 - **Your iPhone keeps its own audio.** A paired iPhone normally starts playing music and calls

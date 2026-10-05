@@ -7,10 +7,17 @@ cards), falling back to <title> and the meta description. No images.
 Safety: only http(s); only public addresses - a message must not be able to make this
 computer probe your router, localhost or your tailnet, so every hop (redirects included) is
 resolved and checked; at most MAX_BYTES of HTML are read.
+
+The address that is checked is the address that is connected to. Resolving the name once to
+check it and then handing the NAME to urllib would resolve it a second time, and a sender who
+controls that name's DNS can answer differently each time: a public address for the check, a
+private one for the connection. So the socket is pinned to the address that passed, and the
+hostname is kept only for TLS and the Host header, leaving certificate validation unchanged.
 """
 from __future__ import annotations
 
 import html
+import http.client
 import ipaddress
 import re
 import socket
@@ -30,33 +37,82 @@ class Blocked(Exception):
     pass
 
 
-def _public(host: str) -> None:
+CGNAT = ipaddress.ip_network("100.64.0.0/10")        # tailnets live here
+
+
+def _is_public(ip: ipaddress._BaseAddress) -> bool:
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified or ip in CGNAT)
+
+
+def _resolve(host: str) -> tuple[int, str]:
+    """One resolution, fully checked, returning the single address to connect to.
+
+    Every address the name currently resolves to must be public. Refusing the whole name when
+    any answer is private means a name that returns both cannot be used to reach the private
+    one, and the caller cannot accidentally connect to an address that was never checked.
+    """
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
         raise Blocked("can't resolve") from None
+    chosen = None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-                or ip.is_unspecified or ip in ipaddress.ip_network("100.64.0.0/10")):
+        raw = info[4][0].split("%")[0]
+        if not _is_public(ipaddress.ip_address(raw)):
             raise Blocked("not a public address")
+        if chosen is None:
+            chosen = (info[0], raw)
+    if chosen is None:
+        raise Blocked("can't resolve")
+    return chosen
 
 
 def _check(url: str) -> str:
+    """Shape only. The address check happens at connect time, on the address used."""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise Blocked("not a web link")
-    _public(u.hostname)
     return url
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        _family, ip = _resolve(self.host)
+        self.sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        _family, ip = _resolve(self.host)
+        sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+            sock = self.sock
+        # server_hostname stays the name, so the certificate is still checked against it.
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _check(newurl)
+        _check(newurl)                                   # the hop's own connect re-checks its address
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_opener = urllib.request.build_opener(_Redirects)
+_opener = urllib.request.build_opener(_PinnedHTTPHandler, _PinnedHTTPSHandler, _Redirects)
 
 
 class _Meta(HTMLParser):
