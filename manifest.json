@@ -6,7 +6,7 @@
   "author": "dragosol",
   "license": "MIT",
   "homepage": "https://github.com/dragosol/omarchy-pear-messages",
-  "description": "Every bubble, blue or green, in a native Omarchy window. Pear Messages connects to a Mac running BlueBubbles for your full history, group chats, photos, reactions and animated effects, and falls back to your iPhone over Bluetooth, no Mac needed, so texts keep flowing when the Mac is away. Anything that arrives both ways shows once, messages that can't go yet wait and send themselves, and your phone keeps its own audio. Link previews, notifications that open the right chat, and storage you control. Not affiliated with Apple.",
+  "description": "Every bubble, blue or green, in a native Omarchy window. Pear Messages connects to a Mac running BlueBubbles for your full history, group chats, photos, reactions and effects, and falls back to your iPhone over Bluetooth when the Mac is away. Anything arriving both ways shows once, messages that can't go yet send themselves later, and your phone keeps its own audio. Link previews, notifications that open the right chat, and storage you control. Not affiliated with Apple.",
   "kinds": [
     "service"
   ],
