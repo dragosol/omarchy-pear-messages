@@ -44,6 +44,9 @@ if [ ! -x /usr/lib/bluetooth/obexd ]; then
 fi
 
 mkdir -p "$data" "$apps" "$units"
+# Your messages live under $data. Make the directory private before anything is written into
+# it, so a journal or temporary file cannot be read by another account on this machine.
+chmod 700 "$data"
 
 say "Installing the service into $data/backend"
 rm -rf "$data/backend.new"

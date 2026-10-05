@@ -1,4 +1,5 @@
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -396,3 +397,45 @@ class BBTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrivacyOnDiskTest(unittest.TestCase):
+    """The database is not the only file your messages land in.
+
+    SQLite gives the write-ahead log and shared-memory files the permissions the main database
+    had when it created them, so chmodding the database after connecting leaves messages.db-wal
+    world-readable with message text in it while the database itself looks private. These check
+    the files on disk rather than the code that writes them, so they keep holding whatever the
+    implementation does next.
+    """
+
+    def test_database_and_journal_are_private_under_a_permissive_umask(self):
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                folder = os.path.join(tmp, "pear-messages")
+                path = os.path.join(folder, "messages.db")
+                st = store.Store(path)
+                st.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('probe','PrivateText')")
+                st.db.commit()
+                for f, want in ((folder, 0o700), (path, 0o600),
+                                (path + "-wal", 0o600), (path + "-shm", 0o600)):
+                    if not os.path.exists(f):
+                        continue
+                    mode = stat.S_IMODE(os.stat(f).st_mode)
+                    self.assertEqual(mode & 0o077, 0,
+                                     f"{os.path.basename(f)} is {oct(mode)}, readable by others")
+        finally:
+            os.umask(old)
+
+    def test_the_journal_really_does_hold_message_text(self):
+        """Guards the test above from passing because the journal happened to be empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pear-messages", "messages.db")
+            st = store.Store(path)
+            st.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('probe','PrivateText')")
+            st.db.commit()
+            wal = path + "-wal"
+            if os.path.exists(wal):
+                with open(wal, "rb") as fh:
+                    self.assertIn(b"PrivateText", fh.read())

@@ -113,17 +113,44 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip().lower()
 
 
+def _private(path: str, mode: int) -> None:
+    """chmod that does not care if the file is not there yet. A journal file only exists once
+    WAL has been entered, and -shm only while a connection is open."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
 def addr_thread(addr: str) -> str:
     return "addr:" + C.key(addr)
 
 
 class Store:
     def __init__(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Order matters here, and it is the whole point of this block.
+        #
+        # SQLite gives the write-ahead log and shared-memory files the permissions the main
+        # database had when it created them. Connecting first and chmodding afterwards, as this
+        # used to do, meant messages.db-wal was born 0644 under the usual umask and then filled
+        # with message text, so any other account on the machine could read the conversations
+        # out of the journal while the database itself looked private.
+        #
+        # So: a private directory, then the database file created 0600 before SQLite is allowed
+        # to touch it, and only then WAL. The journal inherits 0600 because the database already
+        # had it. The explicit chmods afterwards repair a database and journal left behind by an
+        # older version.
+        folder = os.path.dirname(path)
+        os.makedirs(folder, exist_ok=True)
+        _private(folder, 0o700)
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        _private(path, 0o600)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA journal_mode=WAL")
+        for journal in (path + "-wal", path + "-shm"):
+            _private(journal, 0o600)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
         resync = False
         for col, ddl in (("effect", "TEXT NOT NULL DEFAULT ''"), ("runs", "TEXT NOT NULL DEFAULT '[]'"),
@@ -147,7 +174,8 @@ class Store:
         self._identity: dict[str, str] | None = None
         self.newly_hidden: list[int] = []
         self.removed_reaction_texts = 0
-        os.chmod(path, 0o600)
+        for f in (path, path + "-wal", path + "-shm"):
+            _private(f, 0o600)
 
     # ------------------------------------------------------------------ meta
     def get_meta(self, k: str, default: str = "") -> str:

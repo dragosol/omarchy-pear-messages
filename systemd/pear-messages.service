@@ -6,6 +6,8 @@ Wants=obex.service
 
 [Service]
 Type=simple
+# Anything this service creates is private to you, whatever the login umask happens to be.
+UMask=0077
 Environment=PYTHONPATH=%h/.local/share/pear-messages/backend
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -B -m pearmsg daemon
