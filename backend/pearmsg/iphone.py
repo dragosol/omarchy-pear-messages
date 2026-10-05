@@ -157,16 +157,26 @@ class AudioGuard:
 class PairAgent(dbus.service.Object):
     """A pairing agent that exists only while the connection assistant is pairing.
 
-    It shows the code in the app (the user compares it with the iPhone), refuses the
-    iPhone's audio profiles, and allows everything else.
+    It shows a code in the app for the user to compare with the iPhone, refuses the iPhone's
+    audio profiles, and authorises services only for the device whose code the user actually
+    confirmed.
+
+    While this agent is the default one, BlueZ routes every incoming pairing attempt on the
+    machine to it, not only the one the user started. So "allow it because we are pairing" is
+    not safe: during the discoverable window any nearby device can try. Two rules follow.
+    Pairing without a code to compare ("Just Works") is refused outright, because the whole
+    promise made to the user is that they check a code on both screens, and Just Works offers
+    nothing to check. And a service is authorised only for a device the user confirmed, or one
+    that was already paired before this window opened.
     """
 
     PATH = "/io/github/dragosol/pearmessages/agent"
 
-    def __init__(self, sysbus, on_code, on_event):
+    def __init__(self, sysbus, on_code, on_event, allowed):
         super().__init__(sysbus, self.PATH)
-        self.on_code = on_code      # (device_name, code, ok_cb, err_cb)
+        self.on_code = on_code      # (device_path, device_name, code, ok_cb, err_cb)
         self.on_event = on_event    # (text)
+        self.allowed = allowed      # (device_path) -> bool
         self.bus = sysbus
 
     def _name(self, dev):
@@ -179,21 +189,30 @@ class PairAgent(dbus.service.Object):
     @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="",
                          async_callbacks=("ok", "err"))
     def RequestConfirmation(self, device, passkey, ok, err):
-        self.on_code(self._name(device), "%06d" % passkey, ok,
+        self.on_code(device, self._name(device), "%06d" % passkey, ok,
                      lambda: err(dbus.DBusException("Rejected", name="org.bluez.Error.Rejected")))
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
-        return
+        # "Just Works": BlueZ is asking whether to pair with no code on either side. There is
+        # nothing for the user to compare, so accepting here would pair a nearby device during
+        # the discoverable window with no confirmation at all. Always refuse; an iPhone always
+        # supports the numeric comparison this agent asks for instead.
+        self.on_event("refused a pairing attempt that offered no code to compare")
+        raise dbus.DBusException("This computer only pairs with a code you can compare",
+                                 name="org.bluez.Error.Rejected")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def AuthorizeService(self, device, uuid):
         if str(uuid).lower() in AUDIO_SET:
             raise dbus.DBusException("Audio stays on the phone", name="org.bluez.Error.Rejected")
+        if not self.allowed(str(device)):
+            raise dbus.DBusException("Not a device you confirmed on this computer",
+                                     name="org.bluez.Error.Rejected")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
     def DisplayPasskey(self, device, passkey, entered):
-        self.on_code(self._name(device), "%06d" % passkey, None, None)
+        self.on_code(device, self._name(device), "%06d" % passkey, None, None)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
@@ -224,6 +243,7 @@ class Pairing:
         self.pending = None
         self.timer = 0
         self.known: set[str] = set()
+        self.approved: set[str] = set()   # device paths the user confirmed this session
         sysbus.add_signal_receiver(self._props, "PropertiesChanged",
                                    "org.freedesktop.DBus.Properties", BLUEZ, path_keyword="path")
 
@@ -236,7 +256,8 @@ class Pairing:
 
     def start(self, seconds: int = 180) -> None:
         if self.agent is None:
-            self.agent = PairAgent(self.bus, self._code, self._agent_event)
+            self.approved.clear()
+            self.agent = PairAgent(self.bus, self._code, self._agent_event, self._allowed)
             mgr = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
             mgr.RegisterAgent(PairAgent.PATH, "DisplayYesNo")
             mgr.RequestDefaultAgent(PairAgent.PATH)
@@ -274,17 +295,37 @@ class Pairing:
         p, self.pending = self.pending, None
         if not p:
             return
-        (p[0] if accept else p[1])()
+        ok, err, device = p
+        if accept:
+            # Only now may this device have its services authorised.
+            self.approved.add(str(device))
+            ok()
+        else:
+            err()
         self.emit({"ev": "pair", "stage": "pairing" if accept else "rejected"})
+
+    def _allowed(self, device: str) -> bool:
+        """Services are authorised for a device the user confirmed here, or one that was
+        already paired before this window opened (it was confirmed on some earlier run)."""
+        if device in self.approved:
+            return True
+        try:
+            props = dbus.Interface(self.bus.get_object(BLUEZ, device),
+                                   "org.freedesktop.DBus.Properties")
+            paired = bool(props.Get("org.bluez.Device1", "Paired"))
+            address = str(props.Get("org.bluez.Device1", "Address"))
+        except dbus.DBusException:
+            return False
+        return paired and address in self.known
 
     def _timeout(self) -> bool:
         self.timer = 0
         self.stop("timeout")
         return False
 
-    def _code(self, name, code, ok, err):
+    def _code(self, device, name, code, ok, err):
         if ok is not None:
-            self.pending = (ok, err)
+            self.pending = (ok, err, device)
         self.emit({"ev": "pair", "stage": "confirm", "device": name, "code": code})
 
     def _agent_event(self, what):

@@ -166,7 +166,9 @@ sudo pfctl -a com.apple/250.bluebubbles -f /etc/pf.anchors/bluebubbles-tailscale
 
 1. In Pear Messages → Settings → iPhone over Bluetooth, press **Pair iPhone**.
 2. On the iPhone, open **Settings → Bluetooth** and tap this computer under *Other Devices*.
-   Check that the code matches on both screens.
+   Check that the code matches on both screens. A pairing attempt that offers no code to
+   compare is refused, and only the device whose code you confirmed is allowed to use any
+   service, so nothing else nearby can pair itself while the window is open.
 3. On the iPhone, tap **ⓘ** next to this computer and turn on **Show Notifications** and
    **Sync Contacts**. Without the first, the iPhone refuses to share messages.
 
