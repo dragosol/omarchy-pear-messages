@@ -704,9 +704,17 @@ class SideTimeClearanceTest(unittest.TestCase):
         and the stamp reads "Today 15:36". When the react button claims what is left, the time
         was clipped at the window edge, so it now goes under the bubble instead."""
         body = self._shell()
-        self.assertIn("readonly property bool stacked", body, "the fallback is gone")
-        self.assertIn("readonly property real sideRoom", body,
-                      "the fallback no longer measures the room it has")
+        # Assert what `stacked` is computed FROM, not that the name exists: `stacked: false`
+        # keeps the name and silently disables the fallback, and the first version of this
+        # test passed against exactly that.
+        self.assertRegex(
+            body,
+            r"readonly property bool stacked:[^\n]*sideRoom[^\n]*clearance[^\n]*implicitWidth",
+            "stacked is no longer decided by the room available against the stamp's width")
+        self.assertRegex(
+            body,
+            r"readonly property real sideRoom:[\s\S]{0,200}?target\.parent\.width",
+            "sideRoom no longer measures against the row it sits in")
         self.assertRegex(body, r"anchors\.top: \(target && stacked\) \? target\.bottom",
                          "a stacked stamp is not placed under the bubble")
         # and the row has to grow, or it lands on the message below
