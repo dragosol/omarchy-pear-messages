@@ -712,6 +712,93 @@ class SideTimeClearanceTest(unittest.TestCase):
         self.assertIn("id: reactBtn", self._shell(), "reactBtn lost its id")
 
 
+class RedirectBodyLimitTest(unittest.TestCase):
+    """Only the final response was capped at MAX_BYTES. urllib's redirect handler drains each
+    hop with a bare fp.read() first, which has no limit, so a sender's link answering 302 with
+    a huge body held all of it in the daemon."""
+
+    def test_a_huge_redirect_body_is_not_read(self):
+        import http.server, threading
+        from pearmsg import linkpreview
+
+        chunk = b"A" * (1024 * 1024)
+        total = 8                                  # MB offered on the hop
+        sent = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/final":
+                    body = b"<html><head><title>ok</title></head></html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(302)
+                self.send_header("Location",
+                                 f"http://127.0.0.1:{self.server.server_port}/final")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(total * 1024 * 1024))
+                self.end_headers()
+                try:
+                    for _ in range(total):
+                        self.wfile.write(chunk)
+                        sent.append(len(chunk))
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+
+        # the address rules are tested in LinkPreviewAddressTest; this is about the body size
+        original = linkpreview._is_public
+        linkpreview._is_public = lambda ip: True
+        self.addCleanup(lambda: setattr(linkpreview, "_is_public", original))
+
+        # Only that the hop is still followed. How many bytes the *server* manages to push into
+        # the socket before the client stops reading depends on kernel buffer sizes and timing,
+        # so asserting on it is flaky; the cap itself is checked deterministically below.
+        out = linkpreview.fetch(f"http://127.0.0.1:{server.server_port}/start")
+        self.assertEqual(out.get("title"), "ok", "the redirect was not followed")
+
+    def test_the_drain_is_capped(self):
+        """The mechanism, with no sockets involved: urllib calls fp.read() with no argument on
+        a redirect, and that must not be able to return an unbounded amount."""
+        from pearmsg import linkpreview
+
+        class Fake:
+            def __init__(self):
+                self.asked = []
+                self.body = b"B" * (32 * 1024 * 1024)
+
+            def read(self, amt=None):
+                self.asked.append(amt)
+                return self.body if amt is None else self.body[:amt]
+
+        fp = Fake()
+        linkpreview._bound_body(fp)
+        got = fp.read()                                  # exactly what urllib does
+        self.assertLessEqual(len(got), linkpreview.MAX_REDIRECT_BYTES,
+                             "an unbounded read got through")
+        self.assertEqual(fp.asked[-1], linkpreview.MAX_REDIRECT_BYTES)
+        self.assertLessEqual(len(fp.read(64 * 1024 * 1024)), linkpreview.MAX_REDIRECT_BYTES,
+                             "an explicit oversized read got through")
+
+    def test_every_redirect_status_is_covered(self):
+        from pearmsg import linkpreview
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                self.assertIn(f"http_error_{code}", linkpreview._Redirects.__dict__,
+                              f"{code} still uses urllib's unbounded drain")
+
+
 if __name__ == "__main__":
     unittest.main()
 

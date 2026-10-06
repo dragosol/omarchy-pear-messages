@@ -141,10 +141,50 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
+MAX_REDIRECT_BYTES = 64 * 1024   # a redirect's body is never read for content, only drained
+
+
+def _bound_body(fp):
+    """Cap what a redirect hop's body can cost us.
+
+    urllib's redirect handler drains the hop with a bare `fp.read()` before following it, and
+    that read has no limit: only the *final* response is capped at MAX_BYTES. A sender choosing
+    a link that answers 302 with a multi-gigabyte body therefore holds all of it in the
+    daemon's memory. The body of a redirect is never used for anything, so the read is capped
+    rather than merely bounded per call.
+    """
+    original = fp.read
+
+    def read(amt=None):
+        return original(MAX_REDIRECT_BYTES if amt is None else min(amt, MAX_REDIRECT_BYTES))
+
+    try:
+        fp.read = read
+    except AttributeError:          # a file object that will not take an instance attribute
+        pass
+    return fp
+
+
 class _Redirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _check(newurl)                                   # the hop's own connect re-checks its address
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    # Every status urllib drains a body for before following the hop.
+    def http_error_301(self, req, fp, code, msg, headers):
+        return super().http_error_301(req, _bound_body(fp), code, msg, headers)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return super().http_error_302(req, _bound_body(fp), code, msg, headers)
+
+    def http_error_303(self, req, fp, code, msg, headers):
+        return super().http_error_303(req, _bound_body(fp), code, msg, headers)
+
+    def http_error_307(self, req, fp, code, msg, headers):
+        return super().http_error_307(req, _bound_body(fp), code, msg, headers)
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        return super().http_error_308(req, _bound_body(fp), code, msg, headers)
 
 
 _opener = urllib.request.build_opener(_PinnedHTTPHandler, _PinnedHTTPSHandler, _Redirects)
