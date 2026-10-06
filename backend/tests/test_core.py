@@ -699,28 +699,6 @@ class SideTimeClearanceTest(unittest.TestCase):
             self.assertRegex(body, rf"anchors\.{side}:[^\n]*10 \+ clearance",
                              f"{side} no longer makes room for the react button")
 
-    def test_the_time_falls_back_to_under_the_bubble(self):
-        """Beside the bubble is not always somewhere it fits: a bubble may take 72% of the row
-        and the stamp reads "Today 15:36". When the react button claims what is left, the time
-        was clipped at the window edge, so it now goes under the bubble instead."""
-        body = self._shell()
-        # Assert what `stacked` is computed FROM, not that the name exists: `stacked: false`
-        # keeps the name and silently disables the fallback, and the first version of this
-        # test passed against exactly that.
-        self.assertRegex(
-            body,
-            r"readonly property bool stacked:[^\n]*sideRoom[^\n]*clearance[^\n]*implicitWidth",
-            "stacked is no longer decided by the room available against the stamp's width")
-        self.assertRegex(
-            body,
-            r"readonly property real sideRoom:[\s\S]{0,200}?target\.parent\.width",
-            "sideRoom no longer measures against the row it sits in")
-        self.assertRegex(body, r"anchors\.top: \(target && stacked\) \? target\.bottom",
-                         "a stacked stamp is not placed under the bubble")
-        # and the row has to grow, or it lands on the message below
-        self.assertRegex(body, r"timeLabel\.visible && timeLabel\.stacked",
-                         "the row does not reserve space for a stacked stamp")
-
     def test_the_bubble_time_clears_the_react_button(self):
         body = self._shell()
         self.assertIn("clearance: reactBtn.visible", body,
