@@ -1413,6 +1413,8 @@ ShellRoot {
                                                 target: bubble
                                                 mine: msgItem.mine
                                                 reacted: msgItem.reacts.length > 0
+                                                // 6px gap to the bubble + the button + 8px gap to the time
+                                                clearance: reactBtn.visible ? (reactBtn.width + 4) : 0
                                                 visible: msgItem.showTime
                                                 text: root.stampTime(msgItem.m.ts)
                                             }
@@ -1569,6 +1571,7 @@ ShellRoot {
 
                                             // react button, beside the bubble while the pointer is on it
                                             Rectangle {
+                                                id: reactBtn
                                                 visible: (bubbleHover.hovered || (!!root.picker && root.picker.id === msgItem.m.id))
                                                          && msgItem.m.status !== "sending"
                                                 width: 32; height: 32; radius: 16
@@ -2802,12 +2805,18 @@ ShellRoot {
         // tighter bubble is enough to make them collide. The chip is pinned to the bubble's
         // top, so for a reacted message the time goes to the bottom edge, where nothing is.
         property bool reacted: false
+        // The react button appears on the same side of the bubble on hover and is drawn over
+        // the time. `clearance` is however much room that neighbour needs; the time slides out
+        // past it rather than being covered, so both stay readable while the pointer is there.
+        property int clearance: 0
         anchors.verticalCenter: (target && !reacted) ? target.verticalCenter : undefined
         anchors.bottom: (target && reacted) ? target.bottom : undefined
         anchors.right: mine && target ? target.left : undefined
         anchors.left: !mine && target ? target.right : undefined
-        anchors.leftMargin: 10
-        anchors.rightMargin: 10
+        anchors.leftMargin: 10 + clearance
+        anchors.rightMargin: 10 + clearance
+        Behavior on anchors.leftMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+        Behavior on anchors.rightMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
         color: Theme.dim
         font.family: Theme.uiFont
         font.pixelSize: Theme.fCaption

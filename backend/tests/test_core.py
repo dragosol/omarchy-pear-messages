@@ -680,6 +680,38 @@ class ReactionChipLayoutTest(unittest.TestCase):
             self.fail(f"a negative topMargin ({found.group(1)}) puts an element outside its row")
 
 
+class SideTimeClearanceTest(unittest.TestCase):
+    """The react button appears on hover on the same side of the bubble as the timestamp, at
+    `bubble.x - width - 6` with width 32, while the timestamp sat at a fixed 10px margin. They
+    overlapped by 28px; the button is simply invisible until you hover, which is why it looked
+    like the timestamp was being covered by the reaction popup."""
+
+    def _shell(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")
+        with open(path) as fh:
+            return fh.read()
+
+    def test_side_time_takes_a_clearance(self):
+        body = self._shell()
+        self.assertIn("property int clearance", body, "SideTime no longer accepts a clearance")
+        self.assertIn("anchors.leftMargin: 10 + clearance", body)
+        self.assertIn("anchors.rightMargin: 10 + clearance", body)
+
+    def test_the_bubble_time_clears_the_react_button(self):
+        body = self._shell()
+        self.assertIn("clearance: reactBtn.visible", body,
+                      "the timestamp no longer moves aside for the react button")
+        found = re.search(r"clearance: reactBtn\.visible \? \(reactBtn\.width \+ (\d+)\)", body)
+        self.assertIsNotNone(found, "the clearance rule was rewritten")
+        # button occupies 6 + 32 from the bubble edge; base margin is 10
+        pad = int(found.group(1))
+        self.assertGreaterEqual(10 + 32 + pad, 6 + 32,
+                                "the clearance is too small for the button to fit beside it")
+
+    def test_the_react_button_is_identifiable(self):
+        self.assertIn("id: reactBtn", self._shell(), "reactBtn lost its id")
+
+
 if __name__ == "__main__":
     unittest.main()
 
