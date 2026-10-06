@@ -150,6 +150,7 @@ class Daemon:
         self.conns: list[Conn] = []
         self._link_waiting: dict[str, list] = {}
         self._in_flight: set[int] = set()
+        self._roots_asked: set[str] = set()     # thread-starting messages already fetched once
         self._retry_at: dict[int, float] = {}
         self._mac_tries: dict[int, int] = {}
         # set when the Mac's log shows Messages won't send for BlueBubbles; cleared by a send
@@ -275,6 +276,7 @@ class Daemon:
     def _ingest_bb(self, raw: list[dict]) -> None:
         changed: dict[str, list[int]] = {}
         fresh = []
+        roots: list[str] = []
         newest = 0
         for m in raw:
             newest = max(newest, m.get("dateCreated") or 0)
@@ -292,6 +294,13 @@ class Daemon:
                 continue
             msg = self.store.message(rid)
             changed.setdefault(msg["thread"], []).append(rid)
+            if n.get("reply_to"):
+                # the message that began the thread now has one more reply
+                root = self.store.root_id(n["reply_to"])
+                if root:
+                    changed[msg["thread"]].append(root)
+                else:
+                    roots.append(n["reply_to"])
             # Old history on first sync is not "new"; only recent incoming messages notify.
             if what == "new" and not n["from_me"] and time.time() - n["ts"] < 120:
                 fresh.append(rid)
@@ -306,6 +315,29 @@ class Daemon:
             self.store.set_meta("bb_since_ms", str(max(cur, int(newest))))
         self.store.db.commit()
         self._after_ingest(changed, fresh)
+        self._fetch_roots(roots)
+
+    def _fetch_roots(self, guids: list[str]) -> None:
+        """A reply whose thread began before the history we have: fetch that first message, so
+        the reply can show what it answers."""
+        want = [g for g in self.store.missing_roots(guids) if g not in self._roots_asked][:30]
+        if not want or not self.client:
+            return
+        self._roots_asked.update(want)
+        client = self.client
+
+        def work():
+            got = []
+            for g in want:
+                try:
+                    m = client.message(g)
+                except BB.BBError:
+                    continue
+                if m:
+                    got.append(m)
+            if got:
+                GLib.idle_add(lambda: (self._ingest_bb(got), False)[1])
+        threading.Thread(target=work, daemon=True).start()
 
     def _ingest_phone(self, msgs: list[dict], initial: bool) -> None:
         changed: dict[str, list[int]] = {}
@@ -360,12 +392,29 @@ class Daemon:
     # "failed" is kept for real refusals, and for a Mac that keeps not sending.
     MAX_MAC_TRIES = 4
 
-    def send(self, thread: str, text: str, to: str = "", effect: str = "", files: list | None = None) -> dict:
+    def send(self, thread: str, text: str, to: str = "", effect: str = "", files: list | None = None,
+             reply_to: int = 0) -> dict:
         import mimetypes
         text = (text or "").strip()
         files = [f for f in (files or []) if f and os.path.isfile(f)]
         if not text and not files:
             return {"ok": False, "error": "Nothing to send"}
+        reply = {}
+        if reply_to:
+            # a reply goes into the thread of the message it answers, by that thread's first message
+            root = self.store.reply_root(int(reply_to))
+            ab = self.abilities()
+            if root is None:
+                return {"ok": False, "error": "That message is gone."}
+            if not ab["replies"]:
+                return {"ok": False, "error": ab["replyReason"]}
+            if not root["bb_guid"]:
+                return {"ok": False, "error": "This message only came through your iPhone, so the Mac doesn't "
+                                              "know it yet. Try again in a moment."}
+            if files:
+                return {"ok": False, "error": "Replies in a thread can only be text for now."}
+            thread = root["thread"]
+            reply = {"reply_to": root["bb_guid"], "reply_part": root["reply_part"] if root["reply_to"] else 0}
         if files and not self.abilities()["attachments"]:
             return {"ok": False, "error": self.abilities()["attachReason"]}
         if not thread:
@@ -385,16 +434,18 @@ class Daemon:
                 "guid": "", "name": name, "mime": mimetypes.guess_type(name)[0] or "",
                 "size": os.path.getsize(f), "path": f}]))
         if text:
-            ids.append(self._new_outgoing(thread, text, effect=effect))
+            ids.append(self._new_outgoing(thread, text, effect=effect, reply=reply))
         for rid in ids:
             self._dispatch(rid)
         return {"ok": True, "id": ids[-1], "thread": thread}
 
-    def _new_outgoing(self, thread: str, text: str, effect: str = "", attachments=None) -> int:
+    def _new_outgoing(self, thread: str, text: str, effect: str = "", attachments=None, reply=None) -> int:
         _, rid = self.store.ingest({
             "temp_id": BB.new_temp_guid(), "thread": thread, "from_me": True, "text": text,
-            "attachments": attachments or [], "ts": time.time(), "status": "sending", "effect": effect}, "local")
-        self._after_ingest({thread: [rid]}, [])
+            "attachments": attachments or [], "ts": time.time(), "status": "sending", "effect": effect,
+            **(reply or {})}, "local")
+        root = self.store.root_id((reply or {}).get("reply_to", ""))
+        self._after_ingest({thread: [rid] + ([root] if root else [])}, [])
         return rid
 
     def _outgoing(self, rid: int) -> dict | None:
@@ -411,6 +462,7 @@ class Daemon:
             self.store.db.commit()
         return {"rid": rid, "thread": row["thread"], "text": row["text"], "effect": row["effect"], "temp": temp,
                 "file": files[0]["path"] if files else "", "group": bool(t.get("group")),
+                "reply_to": row["reply_to"], "reply_part": row["reply_part"],
                 "address": parts[0] if parts and not t.get("group") else "", "bb_chat": t.get("bbChat", "")}
 
     def _changed(self, o: dict) -> None:
@@ -418,6 +470,8 @@ class Daemon:
         self._after_ingest({m["thread"] if m else o["thread"]: [o["rid"]]}, [])
 
     def _waiting_for(self, o: dict) -> str:
+        if o["reply_to"]:
+            return "Sends when BlueBubbles connects (replies go through your Mac)"
         if o["file"]:
             return "Sends when BlueBubbles connects (photos and files go through your Mac)"
         if o["group"]:
@@ -439,7 +493,7 @@ class Daemon:
             self._queue(o, self._waiting_for(o))
 
     def _phone_can_take(self, o: dict) -> bool:
-        return (not o["file"] and not o["group"] and bool(o["address"]) and bool(o["text"])
+        return (not o["file"] and not o["group"] and not o["reply_to"] and bool(o["address"]) and bool(o["text"])
                 and self.phone_state.get("state") == "online")
 
     def _queue(self, o: dict, why: str, retry_in: float = 0) -> None:
@@ -472,7 +526,8 @@ class Daemon:
                 if o["file"]:
                     res = client.send_attachment(chat, o["file"], o["temp"], private)
                 elif o["bb_chat"]:
-                    res = client.send(o["bb_chat"], o["text"], o["temp"], private, o["effect"])
+                    res = client.send(o["bb_chat"], o["text"], o["temp"], private, o["effect"],
+                                      o["reply_to"], o["reply_part"])
                 else:
                     res = client.new_chat(o["address"], o["text"], o["temp"], private, o["effect"])
                 GLib.idle_add(done, res, "", False)
@@ -667,7 +722,7 @@ class Daemon:
             + (" BlueBubbles is offline right now." if creds.get("url") and self.settings["bluebubbles"]["enabled"] else "")
             if self.phone_state.get("state") == "online" else "Attachments need BlueBubbles, and it isn't connected.")}
         if self.bb_online and self.bb_info.get("private_api"):
-            return {"reactions": True, "effects": True, "reason": "", **attach}
+            return {"reactions": True, "effects": True, "replies": True, "reason": "", "replyReason": "", **attach}
         if self.bb_online:
             reason = ("Reactions and effects need BlueBubbles' Private API, which is off on your Mac. "
                       "Turn it on in BlueBubbles Server → Settings → Private API (it needs System "
@@ -679,7 +734,8 @@ class Daemon:
                 reason += " BlueBubbles is offline right now."
         else:
             reason = "Not connected."
-        return {"reactions": False, "effects": False, "reason": reason, **attach}
+        return {"reactions": False, "effects": False, "replies": False, "reason": reason,
+                "replyReason": reason.replace("Reactions and effects", "Replies"), **attach}
 
     def react(self, c, rid, mid: int, kind: str) -> None:
         m = self.store.message(mid)
@@ -942,7 +998,10 @@ class Daemon:
             self._older(c, rid, req["thread"], float(req["before"]), int(req.get("count", 100)))
         elif op == "send":
             reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""),
-                                             req.get("effect", ""), req.get("files") or [])})
+                                             req.get("effect", ""), req.get("files") or [],
+                                             int(req.get("replyTo") or 0))})
+        elif op == "reply_thread":
+            self._reply_thread(c, rid, int(req["message"]))
         elif op == "link_preview":
             self._link_preview(c, req.get("url", ""))
         elif op == "storage":
@@ -1032,6 +1091,19 @@ class Daemon:
             self.phone.sync()
         else:
             reply({"ev": "error", "error": f"unknown op {op!r}"})
+
+    def _reply_thread(self, c, rid, mid: int) -> None:
+        """A message's reply thread: the message that began it, then every reply."""
+        r = self.store.db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        if r is None:
+            self._send(c, {"ev": "error", "re": rid, "error": "That message is gone."})
+            return
+        guid = r["reply_to"] or r["bb_guid"] or ""
+        msgs = self.store.reply_thread(guid) if guid else [self.store.message(mid)]
+        self._send(c, {"ev": "reply_thread", "re": rid, "message": mid, "root": guid,
+                       "rootId": self.store.root_id(guid) or 0, "thread": r["thread"], "messages": msgs})
+        if r["reply_to"] and not self.store.root_id(r["reply_to"]):
+            self._fetch_roots([r["reply_to"]])
 
     def _older(self, c, rid, tid: str, before: float, count: int) -> None:
         """Earlier messages for a conversation: what's stored here first; when that runs out,

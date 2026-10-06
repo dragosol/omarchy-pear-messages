@@ -131,6 +131,10 @@ class Client:
             body["before"] = int(before_ms)
         return self._req("POST", "/message/query", body) or []
 
+    def message(self, guid: str) -> dict:
+        return self._req("GET", f"/message/{urllib.parse.quote(guid, safe='')}?with="
+                         + ",".join(WITH_MSG)) or {}
+
     def contacts(self) -> list[dict]:
         out = []
         for c in self._req("GET", "/contact") or []:
@@ -143,9 +147,14 @@ class Client:
             })
         return out
 
-    def send(self, chat_guid: str, text: str, temp_guid: str, private_api: bool, effect: str = "") -> dict:
+    def send(self, chat_guid: str, text: str, temp_guid: str, private_api: bool, effect: str = "",
+             reply_to: str = "", reply_part: int = 0) -> dict:
         body = {"chatGuid": chat_guid, "tempGuid": temp_guid, "message": text,
                 "method": "private-api" if private_api else "apple-script"}
+        if reply_to:
+            # an inline reply into that message's thread (Private API only)
+            body["selectedMessageGuid"] = reply_to
+            body["partIndex"] = reply_part
         if effect.startswith("text:"):
             # an iOS 18 text effect over the whole message (Private API only)
             body["textFormatting"] = [{"start": 0, "length": len(text.encode("utf-16-le")) // 2,
@@ -253,6 +262,14 @@ def _emoji_from_text(text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _part_index(part) -> int:
+    """threadOriginatorPart "0:0:104" -> 0 (which part of a multi-part message was replied to)."""
+    try:
+        return int(str(part).split(":", 1)[0]) if part else 0
+    except ValueError:
+        return 0
+
+
 def new_temp_guid() -> str:
     return "temp-" + uuid.uuid4().hex
 
@@ -334,6 +351,9 @@ def to_message(m: dict) -> dict | None:
         "attachments": atts,
         "effect": m.get("expressiveSendStyleId") or "",
         "runs": text_runs(m.get("attributedBody")),
+        # an inline reply: the message that started its thread, and which part of it
+        "reply_to": m.get("threadOriginatorGuid") or "",
+        "reply_part": _part_index(m.get("threadOriginatorPart")),
         "unread": (not from_me) and not m.get("dateRead"),
         "thread_meta": {
             "name": chat.get("displayName") or "" if group else "",

@@ -48,6 +48,12 @@ once.
   they arrive, and "Happy birthday", "Congrats", "Happy New Year" and friends play their effect
   in several languages. Sending reactions and effects needs BlueBubbles' Private API. When
   that isn't available, the controls are greyed out and say why.
+- **Inline replies.** A reply shows the message it answers above it, joined by a line, and the
+  message that began a thread says how many replies it has. Click either, or ↩ beside a message,
+  to open the thread over the conversation; the message box then replies into it. Reading
+  replies works with any BlueBubbles setup; sending them needs the Private API, like reactions.
+- **Time on hover.** Rest the pointer on a message and its time opens underneath. It only moves
+  the messages below aside when something is in the way.
 - **Reactions that arrive as text** over Bluetooth ("Loved “…”", or the same in French,
   Spanish, German…) become real reactions.
 
@@ -109,21 +115,21 @@ once.
 | Photos and files | ✓ | — |
 | Delivered/read, reactions you receive | ✓ | — |
 | Sending reactions and effects | ✓ with the Private API | — |
+| Inline replies | ✓ shown; sent with the Private API | Shown as plain messages |
 | Contact names | From the Mac | From the iPhone |
 
 ## Install
 
 ```bash
 omarchy plugin add https://github.com/dragosol/omarchy-pear-messages.git --enable
-cd ~/.config/omarchy/plugins/io.github.dragosol.pear-messages
-./install.sh
 ```
 
-Then search **Pear Messages** in the launcher. The first launch opens Settings, where the
-connection assistant sets up either connection, or both.
+That is the whole install. Then search **Pear Messages** in the launcher. The first launch opens
+Settings, where the connection assistant sets up either connection, or both.
 
-`install.sh` runs as your user and needs no elevated privileges. It installs, all under your
-home directory:
+When the plugin loads for the first time it runs the repository's own `install.sh`, as your
+user and with no elevated privileges. It copies files and downloads nothing. It installs, all
+under your home directory:
 
 | What | Where |
 | --- | --- |
@@ -138,8 +144,19 @@ Requirements: `python3`, `python-dbus`, `python-gobject`, `quickshell` and `blue
 iPhone connection. Omarchy already ships all of them, so there is nothing to install. `ffmpeg`,
 also already present, is used for video thumbnails.
 
-After `omarchy plugin update`, run `./install.sh` again to pick up the new version.
-`./uninstall.sh` removes it and keeps your messages and settings; add `--purge` to delete those too.
+After `omarchy plugin update`, the plugin installs the new version by itself the next time it
+loads. Running `./install.sh` by hand does the same thing and is safe to repeat.
+
+To remove it, run the uninstaller from the plugin's folder, then remove the plugin. In that
+order: removing the plugin deletes the folder the uninstaller is in, and a plugin left enabled
+installs the app again the next time it loads.
+
+```bash
+~/.config/omarchy/plugins/io.github.dragosol.pear-messages/uninstall.sh
+omarchy plugin remove io.github.dragosol.pear-messages
+```
+
+`uninstall.sh` keeps your messages and settings; add `--purge` to delete those too.
 
 ### Setting up BlueBubbles
 

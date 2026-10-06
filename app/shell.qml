@@ -3,6 +3,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -44,6 +45,10 @@ ShellRoot {
 
     // reactions / effects / previews
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
+    // An inline-reply thread, open over the conversation: {message (the id it was opened
+    // from), root (guid of the message that began the thread), messages (root first), loading}.
+    // While it's open the composer replies into it.
+    property var replyView: null
     property int newBelow: 0             // messages that arrived while you were scrolled up
     property var pending: []             // files waiting to be sent: [{path, name, mime, size}]
     property var linkPreviews: ({})      // url -> {ok, title, description, site} | {loading}
@@ -165,6 +170,51 @@ ShellRoot {
         return "";
     }
 
+    // Why a reply can't be sent right now, or "" when it can.
+    function replyBlock() {
+        return root.abilities.replies ? "" : (root.abilities.replyReason || root.abilities.reason);
+    }
+    function openReplies(m) {
+        root.picker = null;
+        root.effectPickerOpen = false;
+        root.replyView = { message: m.id, root: m.replyTo || m.guid || "", messages: [m], loading: true };
+        if (root.preview !== "") root.previewReplies(m);
+        else root.send({ op: "reply_thread", message: m.id });
+        composer.forceActiveFocus();
+    }
+    function previewReplies(m) {
+        const g = m.replyTo || m.guid;
+        root.replyView = { message: m.id, root: g, loading: false,
+                           messages: root.msgs.filter(x => x.guid === g || x.replyTo === g)
+                                              .sort((a, b) => (b.guid === g) - (a.guid === g) || a.ts - b.ts) };
+    }
+    function closeReplies() {
+        root.replyView = null;
+        composer.forceActiveFocus();
+    }
+    // a message that belongs in the open thread: its first message, or a reply in it
+    function inReplyView(m) {
+        const rv = root.replyView;
+        return !!rv && rv.root !== "" && (m.replyTo === rv.root || m.guid === rv.root);
+    }
+    function mergeReplies(msgs) {
+        const rv = root.replyView;
+        const next = rv.messages.slice();
+        let changed = false;
+        for (const m of msgs) {
+            const i = next.findIndex(x => x.id === m.id);
+            if (m.hidden || !root.inReplyView(m)) {
+                if (i >= 0 && m.hidden) { next.splice(i, 1); changed = true; }
+                continue;
+            }
+            if (i >= 0) next[i] = m; else next.push(m);
+            changed = true;
+        }
+        if (!changed) return;
+        next.sort((a, b) => (b.guid === rv.root) - (a.guid === rv.root) || a.ts - b.ts);
+        root.replyView = Object.assign({}, rv, { messages: next });
+    }
+
     function isVideo(att) {
         return (att.mime || "").indexOf("video/") === 0 || /\.(mov|mp4|m4v|avi|mkv|webm|3gp)$/i.test(att.name || "");
     }
@@ -234,7 +284,11 @@ ShellRoot {
                     splitMarker: "\n"
                     onRead: data => root.onEvent(data)
                 }
+                // The socket can connect before the Loader has handed it out as sockLoader.item,
+                // so it registers itself; otherwise "hello" went nowhere and the window sat
+                // linked but empty for good.
                 onConnectedChanged: {
+                    root.sock = connected ? this : null;
                     root.linked = connected;
                     if (connected) {
                         root.send({ op: "hello" });
@@ -246,6 +300,7 @@ ShellRoot {
         }
     }
     property bool linked: false
+    property var sock: null
     // ------------------------------------------------------------------ Omarchy theme
     // Omarchy pushes a theme switch to its own shell over IPC (`shell applyTheme`); a standalone
     // window never hears it and would keep the theme it started with. So this watches the
@@ -301,6 +356,31 @@ ShellRoot {
             return "playing " + root.effectNames[id] + "; overlay=" + screenFx.current + " visible=" + screenFx.visible
                    + " size=" + screenFx.width + "x" + screenFx.height;
         }
+        // scroll the open conversation to a message (by its id), e.g. to look at a reply
+        function reveal(message: int): string {
+            const i = root.msgs.findIndex(m => m.id === message);
+            if (i < 0) return "not loaded";
+            list.followEnd = false;
+            list.positionViewAtIndex(i, ListView.Center);
+            return "shown";
+        }
+        // open a message's reply thread, as clicking "Replies" or its quote does
+        function replies(message: int): string {
+            const m = root.msgs.find(x => x.id === message);
+            if (!m) return "not loaded";
+            root.openReplies(m);
+            return "open";
+        }
+        function closeReplies(): string { root.closeReplies(); return "closed"; }
+        // open the hover time on a message, as resting the pointer on it does
+        function hoverTime(message: int): string {
+            const i = root.msgs.findIndex(m => m.id === message);
+            const it = i >= 0 ? list.itemAtIndex(i) : null;
+            if (!it) return "not on screen";
+            it.timeOverlays = it.timeFitsBelow();
+            it.showTime = true;
+            return it.timeOverlays ? "in the gap below" : "pushes down";
+        }
         function state(): string {
             return JSON.stringify({ theme: { bg: String(Theme.bg), fg: String(Theme.fg), accent: String(Theme.accent),
                                              panel: String(Theme.panel), font: Theme.uiFont, radius: Theme.radius },
@@ -339,9 +419,9 @@ ShellRoot {
         if (root.preview !== "") return 0;
         const id = root.reqId++;
         obj.id = id;
-        if (!root.linked || !sockLoader.item) return 0;
-        sockLoader.item.write(JSON.stringify(obj) + "\n");
-        sockLoader.item.flush();
+        if (!root.linked || !root.sock) return 0;
+        root.sock.write(JSON.stringify(obj) + "\n");
+        root.sock.flush();
         return id;
     }
 
@@ -393,9 +473,14 @@ ShellRoot {
                 const have = new Set(root.msgs.map(m => m.id));
                 const add = d.messages.filter(m => !have.has(m.id));
                 if (!add.length) { if (!d.more) root.olderState = "end"; break; }
-                const keep = list.contentHeight - list.contentY;
+                // The message at the top of the view stays exactly where it is on screen. Measuring
+                // the content from the bottom instead went by estimated row heights, and the pull's
+                // bounce kept steering toward the new top, so the view flew through the history.
+                const top = list.indexAt(list.width / 2, list.contentY + 2);
+                const item = top >= 0 ? list.itemAtIndex(top) : null;
+                msgPhys.stopPhysics();
                 root.msgs = add.concat(root.msgs);
-                Qt.callLater(() => { list.forceLayout(); list.contentY = list.contentHeight - keep; });
+                if (item) list.holdAt(root.msgs[top + add.length].id, item.y - list.contentY);
             }
             break;
         case "messages": {
@@ -419,6 +504,7 @@ ShellRoot {
                     changed = true;
                 }
             }
+            if (root.replyView) root.mergeReplies(d.messages);
             if (changed) {
                 next.sort((a, b) => a.ts - b.ts);
                 const atEnd = list.followEnd || list.atYEnd || list.contentHeight <= list.height;
@@ -428,6 +514,10 @@ ShellRoot {
             }
             break;
         }
+        case "reply_thread":
+            if (root.replyView && d.message === root.replyView.message)
+                root.replyView = Object.assign({}, root.replyView, { root: d.root, messages: d.messages, loading: false });
+            break;
         case "sent":
             if (!d.ok) root.flash = d.error || "Couldn't send";
             else if (root.composing && d.thread) { root.composing = false; root.openThread(d.thread); }
@@ -499,6 +589,7 @@ ShellRoot {
         if (id !== root.current) root.pending = [];
         root.composing = false;
         root.picker = null;
+        root.replyView = null;
         root.effectPickerOpen = false;
         root.pendingEffect = "";
         root.hoverAtt = null;
@@ -515,6 +606,7 @@ ShellRoot {
 
     function startCompose() {
         root.settingsOpen = false;
+        root.replyView = null;
         root.composing = true;
         root.composeTo = "";
         root.composeToName = "";
@@ -527,6 +619,24 @@ ShellRoot {
         root.reportView();
     }
 
+    // The composer's hint: a new one each time you send.
+    readonly property var prompts: [
+        "Type something…", "Type something brilliant…", "Type something nice…", "Type something witty…",
+        "Type something, anything…", "Type something legendary…", "Type something worth a ♥…",
+        "Type something they'll screenshot…", "Type something with flair…", "Type something sweet…",
+        "Type something unhinged…", "Type something mysterious…", "Type something dramatic…",
+        "Type something cozy…", "Type something wholesome…", "Type something spicy…",
+        "Type something that slaps…", "Type something in all lowercase…", "Type something with an emoji…",
+        "Type something before you forget…", "Type something, your thumbs miss you…",
+        "Type something unforgettable…", "Type something, we're listening…", "Type something chaotic…"
+    ]
+    property int promptIdx: Math.floor(Math.random() * prompts.length)
+    function nextPrompt() {
+        let i = root.promptIdx;
+        while (i === root.promptIdx) i = Math.floor(Math.random() * root.prompts.length);
+        root.promptIdx = i;
+    }
+
     function sendCurrent() {
         const text = composer.text.trim();
         const files = root.pending.map(p => p.path);
@@ -536,10 +646,17 @@ ShellRoot {
             const to = root.composeTo || toField.text.trim();
             if (!to) { root.flash = "Who is this to?"; toField.forceActiveFocus(); return; }
             root.send({ op: "send", to: to, text: text, effect: root.pendingEffect, files: files });
+        } else if (root.replyView) {
+            if (root.replyBlock()) { root.flash = root.replyBlock(); return; }
+            if (files.length) { root.flash = "Replies in a thread can only be text for now."; return; }
+            if (!text) return;
+            root.send({ op: "send", thread: root.current, text: text, effect: root.pendingEffect,
+                        replyTo: root.replyView.message });
         } else if (root.current) {
             root.send({ op: "send", thread: root.current, text: text, effect: root.pendingEffect, files: files });
         } else return;
         composer.text = "";
+        root.nextPrompt();
         root.pending = [];
         root.pendingEffect = "";
         root.effectPickerOpen = false;
@@ -652,6 +769,7 @@ ShellRoot {
                     if (root.builtinPreview) root.builtinPreview = "";
                     else if (root.picker) root.picker = null;
                     else if (root.effectPickerOpen) root.effectPickerOpen = false;
+                    else if (root.replyView) root.closeReplies();
                     else if (root.settingsOpen) root.settingsOpen = false;
                     else if (root.composing) { root.composing = false; if (root.threads.length) root.openThread(root.threads[0].id); }
                     else if (search.text) search.text = "";
@@ -1079,6 +1197,16 @@ ShellRoot {
                                 cacheBuffer: 2400
                                 spacing: 3
                                 interactive: false
+                                // under an open reply thread: blurred, and no hover times or buttons
+                                enabled: !root.replyView
+                                property real blurAmount: root.replyView ? 1 : 0
+                                Behavior on blurAmount { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+                                layer.enabled: blurAmount > 0
+                                layer.effect: MultiEffect {
+                                    blurEnabled: true
+                                    blur: list.blurAmount
+                                    blurMax: 40
+                                }
                                 ScrollBar.vertical: AppScrollBar {
                                     id: msgBar
                                     // in the conversation's right margin, clear of your bubbles
@@ -1187,6 +1315,37 @@ ShellRoot {
                 }
                 readonly property bool farFromEnd: contentHeight > height && contentY < msgPhys.maxY - 160
                 onFollowEndChanged: if (followEnd) root.newBelow = 0
+                // Keep one message at a fixed spot in the view while rows above and around it are
+                // still being created and measured (they start out at estimated heights).
+                function holdAt(id, offset) {
+                    hold.msgId = id;
+                    hold.offset = offset;
+                    hold.left = 10;
+                    followEnd = false;
+                    hold.apply();
+                    hold.restart();
+                }
+                Timer {
+                    id: hold
+                    property var msgId: null
+                    property real offset: 0
+                    property int left: 0
+                    interval: 16
+                    repeat: true
+                    function apply() {
+                        const i = root.msgs.findIndex(m => m.id === msgId);
+                        if (i < 0) { stop(); return; }
+                        list.positionViewAtIndex(i, ListView.Beginning);
+                        const it = list.itemAtIndex(i);
+                        if (it) list.contentY = it.y - offset;
+                    }
+                    onTriggered: {
+                        // your own scrolling takes over at once
+                        if (msgPhys.busy || msgBar.pressed) { stop(); return; }
+                        apply();
+                        if (--left <= 0) stop();
+                    }
+                }
                 Timer {
                     id: settle
                     property int left: 0
@@ -1203,8 +1362,11 @@ ShellRoot {
                 // called every frame it now and then lands far up the conversation for a frame or
                 // two - the jumping. That's kept for opening a conversation (stickToEnd).
                 function followGrowth() { contentY = Math.max(originY, originY + contentHeight - height); }
-                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running) followGrowth()
-                onOriginYChanged: if (followEnd && !msgPhys.busy && !settle.running) followGrowth()
+                // rows holding an open hover time (counted by the rows themselves)
+                property int holdView: 0
+                onHoldViewChanged: if (holdView === 0 && followEnd && !msgPhys.busy && !settle.running) followGrowth()
+                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running && holdView === 0) followGrowth()
+                onOriginYChanged: if (followEnd && !msgPhys.busy && !settle.running && holdView === 0) followGrowth()
                 onHeightChanged: if (followEnd && !msgPhys.busy) followGrowth()
                 // Pinned to the newest message unless YOU scroll away: only your own scrolling
                 // (wheel, touchpad, the scrollbar) un-pins or re-pins it. A new message, a photo
@@ -1239,21 +1401,86 @@ ShellRoot {
                                                                        && (!prev || prev.fromMe || prev.sender !== m.sender || showStamp)
                                     readonly property bool showStatus: mine && (index === list.lastMine || m.status === "failed" || m.status === "queued")
                                     readonly property var reacts: Object.keys(m.reactions || {})
+                                    readonly property bool isReply: !!m.replyTo
                                     width: list.width
-                                    height: col.implicitHeight + (prev && prev.fromMe !== mine ? 8 : 0)
-                                    // The time, beside the message while the pointer is on it, in the open space
-                                    // next to the bubble: hovering must never move the conversation or cover the
-                                    // next message.
+                                    height: col.implicitHeight + timeRow.height + (prev && prev.fromMe !== mine ? 8 : 0)
+                                    // The time opens under the message while the pointer rests on it, pushing the
+                                    // messages below down, and closes again when the pointer leaves. A short rest
+                                    // first, so sweeping the pointer across the conversation doesn't ripple it.
                                     HoverHandler { id: msgHover }
-                                    readonly property bool showTime: msgHover.hovered && !showStatus
+                                    property bool showTime: false
+                                    // The time only pushes the messages below down when something is in its
+                                    // way. Where the top of the next row is empty on the time's side (usually:
+                                    // the next message is on the other side), it drops into that gap instead
+                                    // and nothing moves. Decided once as it opens, so it can't flip while open.
+                                    property bool timeOverlays: false
+                                    Timer {
+                                        interval: 220
+                                        running: msgHover.hovered && !msgItem.showStatus && !msgItem.showTime
+                                        onTriggered: { msgItem.timeOverlays = msgItem.timeFitsBelow(); msgItem.showTime = true; }
+                                    }
+                                    // What the top of this row holds, as [left, right] in row coordinates: the
+                                    // part a time opening above it, in the previous row, would run into.
+                                    readonly property var topBand: {
+                                        if (showStamp) return [(width - stampText.contentWidth) / 2, (width + stampText.contentWidth) / 2];
+                                        if (showSender) return [senderText.x, senderText.x + senderText.implicitWidth];
+                                        if (isReply) return [0, width];
+                                        if ((m.attachments || []).length)
+                                            return mine ? [width - list.bubbleMax, width] : [0, list.bubbleMax];
+                                        if (reacts.length) return [Math.min(reactChip.x, bubble.x), Math.max(reactChip.x + reactChip.width, bubble.x + bubble.width)];
+                                        return [bubble.x, bubble.x + bubble.width];
+                                    }
+                                    function timeFitsBelow() {
+                                        if (index >= root.msgs.length - 1) return false;
+                                        const next = list.itemAtIndex(index + 1);
+                                        if (!next || !next.topBand) return false;
+                                        const w = timeText.implicitWidth + 10;       // the time and a little air
+                                        const l = mine ? width - w : 2, r = mine ? width : 12 + w;
+                                        return next.topBand[1] < l || next.topBand[0] > r;
+                                    }
+                                    Connections {
+                                        target: msgHover
+                                        function onHoveredChanged() { if (!msgHover.hovered) msgItem.showTime = false; }
+                                    }
+                                    // An open time holds the view still (see list.holdView), so the message under
+                                    // the pointer stays put and only what is below it moves. The newest message is
+                                    // the exception: its time would open below the edge, so the view follows it.
+                                    readonly property bool holdsView: timeRow.height > 0 && index !== root.msgs.length - 1
+                                    onHoldsViewChanged: list.holdView = Math.max(0, list.holdView + (holdsView ? 1 : -1))
+                                    Component.onDestruction: if (holdsView) list.holdView = Math.max(0, list.holdView - 1)
+
+                                    Item {
+                                        id: timeRow
+                                        width: parent.width
+                                        anchors.bottom: parent.bottom
+                                        height: msgItem.showTime && !msgItem.timeOverlays ? timeText.implicitHeight + 4 : 0
+                                        // dropped into the gap below, it is drawn past this row's edge
+                                        clip: !msgItem.timeOverlays
+                                        Behavior on height { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            id: timeText
+                                            y: msgItem.timeOverlays ? 1 : timeRow.height - height
+                                            anchors.right: msgItem.mine ? parent.right : undefined
+                                            x: msgItem.mine ? 0 : 12
+                                            rightPadding: 4
+                                            text: root.stampTime(msgItem.m.ts)
+                                            color: Theme.dim
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                            opacity: msgItem.showTime ? 1 : 0
+                                            Behavior on opacity { NumberAnimation { duration: 180 } }
+                                        }
+                                    }
 
                                     Column {
                                         id: col
                                         width: parent.width
-                                        anchors.bottom: parent.bottom
+                                        anchors.bottom: timeRow.top
                                         spacing: 3
 
                                         Text {
+                                            id: stampText
                                             textFormat: Text.PlainText
                                             visible: msgItem.showStamp
                                             width: parent.width
@@ -1267,12 +1494,26 @@ ShellRoot {
                                         }
                                         Text {
                                             textFormat: Text.PlainText
+                                            id: senderText
                                             visible: msgItem.showSender
                                             x: 12
                                             text: msgItem.m.senderName || msgItem.m.sender || ""
                                             color: Theme.dim
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fCaption
+                                        }
+
+                                        // An inline reply: a faded copy of the message it answers (the one
+                                        // before it in its thread), on that message's side, joined to the
+                                        // reply by a line. Clicking it opens the thread.
+                                        ReplyQuote {
+                                            visible: msgItem.isReply
+                                            width: parent.width
+                                            quote: msgItem.m.quote || null
+                                            maxWidth: list.bubbleMax * 0.75
+                                            targetX: msgItem.m.text !== "" ? (msgItem.mine ? bubble.x + bubble.width - 18 : bubble.x + 18)
+                                                                           : (msgItem.mine ? width - 18 : 18)
+                                            onOpen: root.openReplies(msgItem.m)
                                         }
 
                                         // attachments: click selects, Space or a double-click previews
@@ -1349,14 +1590,6 @@ ShellRoot {
                                                         border.color: Theme.accent
                                                     }
                                                 }
-                                                SideTime {
-                                                    target: img.visible ? img : fileChip
-                                                    mine: msgItem.mine
-                                                    reacted: msgItem.reacts.length > 0
-                                                    visible: msgItem.showTime && msgItem.m.text === ""
-                                                             && attItem.index === (msgItem.m.attachments || []).length - 1
-                                                    text: root.stampTime(msgItem.m.ts)
-                                                }
                                                 Rectangle {
                                                     id: fileChip
                                                     visible: !(attItem.isImage && attItem.st.path)
@@ -1409,15 +1642,6 @@ ShellRoot {
                                             // left exactly 8px of it overlapping the previous bubble.
                                             height: bubble.height + (msgItem.reacts.length ? 26 : 0)
                                             HoverHandler { id: bubbleHover }
-                                            SideTime {
-                                                target: bubble
-                                                mine: msgItem.mine
-                                                reacted: msgItem.reacts.length > 0
-                                                // 6px gap to the bubble + the button + 8px gap to the time
-                                                clearance: reactBtn.visible ? (reactBtn.width + 4) : 0
-                                                visible: msgItem.showTime
-                                                text: root.stampTime(msgItem.m.ts)
-                                            }
 
                                             Rectangle {
                                                 id: bubble
@@ -1590,8 +1814,31 @@ ShellRoot {
                                                 HoverHandler { id: reactHover; cursorShape: Qt.PointingHandCursor }
                                                 TapHandler { onTapped: root.openPicker(msgItem.m, bubble) }
                                             }
+                                            // reply button, just outside the react button
+                                            Rectangle {
+                                                visible: bubbleHover.hovered && msgItem.m.status !== "sending" && msgItem.m.status !== "queued"
+                                                width: 32; height: 32; radius: 16
+                                                anchors.verticalCenter: bubble.verticalCenter
+                                                x: msgItem.mine ? bubble.x - 2 * width - 12 : bubble.x + bubble.width + width + 12
+                                                color: replyHover.hovered ? Theme.hover : Theme.bg
+                                                border.width: 1
+                                                border.color: Theme.line
+                                                Text {
+                                                    textFormat: Text.PlainText
+                                                    anchors.centerIn: parent
+                                                    text: "↩"
+                                                    color: root.replyBlock() ? Theme.faint : Theme.fg
+                                                    font.pixelSize: Math.round(Theme.fBody * 1.15)
+                                                }
+                                                HoverHandler { id: replyHover; cursorShape: Qt.PointingHandCursor }
+                                                TapHandler { onTapped: root.openReplies(msgItem.m) }
+                                                ToolTip.visible: replyHover.hovered
+                                                ToolTip.delay: 500
+                                                ToolTip.text: root.replyBlock() || "Reply"
+                                            }
 
                                             Rectangle {
+                                                id: reactChip
                                                 visible: msgItem.reacts.length > 0
                                                 anchors.top: parent.top
                                                 // 0, not -8: the row now reserves the chip's height, so the 8px
@@ -1621,6 +1868,23 @@ ShellRoot {
                                                     }
                                                 }
                                             }
+                                        }
+
+                                        // "2 Replies" under the message that began a thread
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            visible: !msgItem.isReply && (msgItem.m.replyCount || 0) > 0
+                                            anchors.right: msgItem.mine ? parent.right : undefined
+                                            x: msgItem.mine ? 0 : 4
+                                            leftPadding: 4
+                                            rightPadding: 4
+                                            text: msgItem.m.replyCount === 1 ? "1 Reply" : (msgItem.m.replyCount || 0) + " Replies"
+                                            color: repliesHover.hovered ? Theme.fg : Theme.accent
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fCaption
+                                            font.weight: Font.DemiBold
+                                            HoverHandler { id: repliesHover; cursorShape: Qt.PointingHandCursor }
+                                            TapHandler { onTapped: root.openReplies(msgItem.m) }
                                         }
 
                                         // link preview: text only, fetched when the message comes into view
@@ -1806,7 +2070,7 @@ ShellRoot {
                             Rectangle {
                                 id: toBottomBtn
                                 z: 55
-                                readonly property bool shown: list.farFromEnd && root.current !== "" && !root.composing
+                                readonly property bool shown: list.farFromEnd && root.current !== "" && !root.composing && !root.replyView
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 y: parent.height - height - 14 + (shown ? 0 : 16)
                                 opacity: shown ? 1 : 0
@@ -1855,6 +2119,226 @@ ShellRoot {
                                 visible: !!root.picker || root.effectPickerOpen
                                 onClicked: { root.picker = null; root.effectPickerOpen = false; }
                                 onWheel: wheel => { root.picker = null; root.effectPickerOpen = false; wheel.accepted = false; }
+                            }
+
+                            // ---- an inline-reply thread, over the blurred conversation
+                            // Like Messages: the thread's first message and every reply in order,
+                            // joined by a line, at the bottom by the composer, which now replies
+                            // into this thread. Esc or a click outside the messages closes it.
+                            Item {
+                                id: replyPane
+                                anchors.fill: parent
+                                z: 60
+                                readonly property bool open: !!root.replyView
+                                opacity: open ? 1 : 0
+                                visible: opacity > 0.01
+                                Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+
+                                Rectangle { anchors.fill: parent; color: Theme.bg; opacity: 0.6 }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.closeReplies()
+                                }
+
+                                Flickable {
+                                    id: replyFlick
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 16
+                                    anchors.rightMargin: 16
+                                    anchors.topMargin: 40
+                                    anchors.bottomMargin: 12
+                                    clip: true
+                                    interactive: false
+                                    contentWidth: width
+                                    contentHeight: Math.max(height, replyCol.height)
+                                    // newest reply in view, as the thread fills in
+                                    onContentHeightChanged: contentY = Math.max(0, contentHeight - height)
+                                    ScrollPhysics { id: replyPhys; flick: replyFlick }
+                                    WheelHandler {
+                                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                        onWheel: ev => replyPhys.wheel(ev)
+                                    }
+
+                                    Column {
+                                        id: replyCol
+                                        width: replyFlick.width
+                                        // a short thread sits at the bottom, by the composer
+                                        y: Math.max(0, replyFlick.height - height)
+                                        transformOrigin: Item.Bottom
+                                        scale: replyPane.open ? 1 : 0.97
+                                        Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+
+                                        Repeater {
+                                            model: root.replyView ? root.replyView.messages : []
+                                            delegate: Item {
+                                                id: tItem
+                                                required property var modelData
+                                                required property int index
+                                                readonly property var m: modelData
+                                                readonly property bool mine: m.fromMe
+                                                readonly property var prevM: index > 0 && root.replyView ? root.replyView.messages[index - 1] : null
+                                                readonly property real lineGap: index > 0 ? 18 : 0
+                                                readonly property bool showSender: root.currentInfo && root.currentInfo.group && !mine
+                                                                                   && (!prevM || prevM.fromMe || prevM.sender !== m.sender)
+                                                width: replyCol.width
+                                                height: tCol.implicitHeight + lineGap
+
+                                                ThreadLine {
+                                                    visible: tItem.index > 0
+                                                    fromX: tItem.prevM && tItem.prevM.fromMe ? tItem.width - 18 : 18
+                                                    fromY: 0
+                                                    toX: tItem.mine ? tItem.width - 18 : 18
+                                                    toY: tItem.lineGap + (tItem.showSender ? tSender.height + 3 : 0) + 1
+                                                }
+
+                                                Column {
+                                                    id: tCol
+                                                    y: tItem.lineGap
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        id: tSender
+                                                        visible: tItem.showSender
+                                                        x: 12
+                                                        text: tItem.m.senderName || tItem.m.sender || ""
+                                                        color: Theme.dim
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fCaption
+                                                    }
+                                                    Repeater {
+                                                        model: tItem.m.attachments || []
+                                                        delegate: Item {
+                                                            id: tAtt
+                                                            required property var modelData
+                                                            readonly property var st: root.attachments[modelData.guid] || (modelData.path ? { path: modelData.path } : ({}))
+                                                            readonly property bool isImage: (modelData.mime || "").indexOf("image/") === 0
+                                                            Component.onCompleted: if (isImage && !modelData.path) root.needAttachment(modelData, 0, "preview")
+                                                            width: tCol.width
+                                                            height: tImg.visible ? tImg.height : tChip.height
+                                                            Image {
+                                                                id: tImg
+                                                                visible: tAtt.isImage && !!tAtt.st.path && status === Image.Ready
+                                                                x: tItem.mine ? parent.width - width : 0
+                                                                source: tAtt.isImage && tAtt.st.path ? "file://" + tAtt.st.path : ""
+                                                                width: Math.min(list.bubbleMax * 0.7, 260)
+                                                                height: implicitWidth > 0 ? width * implicitHeight / implicitWidth : 0
+                                                                fillMode: Image.PreserveAspectFit
+                                                                asynchronous: true
+                                                                MouseArea { anchors.fill: parent; onDoubleClicked: root.previewAttachment(tAtt.modelData, 0) }
+                                                            }
+                                                            Rectangle {
+                                                                id: tChip
+                                                                visible: !tImg.visible
+                                                                x: tItem.mine ? parent.width - width : 0
+                                                                width: Math.min(list.bubbleMax, tChipText.implicitWidth + 28)
+                                                                height: 40
+                                                                radius: Theme.radius
+                                                                color: Theme.panel
+                                                                border.width: 1
+                                                                border.color: Theme.line
+                                                                Text {
+                                                                    textFormat: Text.PlainText
+                                                                    id: tChipText
+                                                                    anchors.fill: parent
+                                                                    anchors.leftMargin: 14
+                                                                    anchors.rightMargin: 14
+                                                                    verticalAlignment: Text.AlignVCenter
+                                                                    elide: Text.ElideMiddle
+                                                                    text: (tAtt.isImage ? "🖼  " : root.isVideo(tAtt.modelData) ? "▶  " : "📎  ")
+                                                                          + (tAtt.modelData.name || "Attachment")
+                                                                    color: Theme.fg
+                                                                    font.family: Theme.uiFont
+                                                                    font.pixelSize: Theme.fSmall
+                                                                }
+                                                                MouseArea { anchors.fill: parent; onDoubleClicked: root.previewAttachment(tAtt.modelData, 0) }
+                                                            }
+                                                        }
+                                                    }
+                                                    Rectangle {
+                                                        id: tBubble
+                                                        visible: tItem.m.text !== ""
+                                                        x: tItem.mine ? parent.width - width : 0
+                                                        width: Math.min(tMeasure.implicitWidth, list.bubbleMax - 28) + 28
+                                                        height: tBody.implicitHeight + 16
+                                                        radius: Math.max(Theme.radius, 4)
+                                                        color: tItem.mine ? (tItem.m.status === "failed" ? Theme.danger : Theme.accent) : Theme.panel
+                                                        opacity: tItem.m.status === "sending" || tItem.m.status === "queued" ? 0.6 : 1
+                                                        // a click on a message doesn't close the thread
+                                                        MouseArea { anchors.fill: parent }
+                                                        Text { id: tMeasure; visible: false; text: tItem.m.text; font: tBody.font }
+                                                        Text {
+                                                            id: tBody
+                                                            x: 14
+                                                            y: 8
+                                                            width: tBubble.width - 28
+                                                            wrapMode: Text.Wrap
+                                                            textFormat: Text.RichText
+                                                            text: root.linkify(tItem.m.text, tItem.mine ? Theme.onAccent : Theme.accent)
+                                                            color: tItem.mine ? Theme.onAccent : Theme.fg
+                                                            font.family: Theme.uiFont
+                                                            font.pixelSize: Theme.fBody
+                                                            onLinkActivated: link => Qt.openUrlExternally(link)
+                                                        }
+                                                    }
+                                                    // where a reply of yours stands, under the newest one
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        visible: tItem.mine && (tItem.index === (root.replyView ? root.replyView.messages.length - 1 : -1)
+                                                                                || tItem.m.status === "failed" || tItem.m.status === "queued")
+                                                                 && tItem.m.status !== ""
+                                                        anchors.right: parent.right
+                                                        rightPadding: 2
+                                                        width: Math.min(implicitWidth, parent.width)
+                                                        wrapMode: Text.Wrap
+                                                        horizontalAlignment: Text.AlignRight
+                                                        text: {
+                                                            const m = tItem.m, s = m.status;
+                                                            if (s === "failed") return "Couldn't send" + (m.error ? " · " + m.error : "");
+                                                            if (s === "queued") return "⏳ " + (m.error || "Waiting to send");
+                                                            if (s === "sending") return "Sending…";
+                                                            return ({ sent: "Sent", delivered: "Delivered", read: "Read" })[s] || "";
+                                                        }
+                                                        color: tItem.m.status === "failed" ? Theme.danger : Theme.dim
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fCaption
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // header: how many replies, and a close button
+                                Text {
+                                    textFormat: Text.PlainText
+                                    x: 16
+                                    y: 12
+                                    text: {
+                                        const n = root.replyView ? root.replyView.messages.filter(m => !!m.replyTo).length : 0;
+                                        return n === 0 ? "Reply" : n === 1 ? "1 Reply" : n + " Replies";
+                                    }
+                                    color: Theme.dim
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fCaption
+                                    font.weight: Font.DemiBold
+                                }
+                                Rectangle {
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: 12
+                                    y: 6
+                                    width: 28; height: 28; radius: 14
+                                    color: closeHover.hovered ? Theme.hover : "transparent"
+                                    Text {
+                                        textFormat: Text.PlainText
+                                        anchors.centerIn: parent
+                                        text: "×"
+                                        color: Theme.fg
+                                        font.pixelSize: Math.round(Theme.fBody * 1.3)
+                                    }
+                                    HoverHandler { id: closeHover; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: root.closeReplies() }
+                                }
                             }
 
                             // ---- reaction picker
@@ -2147,13 +2631,26 @@ ShellRoot {
                                             enabled: root.typingAnimation
                                             color: Theme.fg
                                         }
-                                        placeholderText: {
-                                            const group = root.currentInfo && root.currentInfo.group;
-                                            if (root.route === "bluebubbles") return "iMessage";
-                                            if (root.route === "iphone") return group ? "Group chats need BlueBubbles" : "Message via your iPhone";
-                                            return "Not connected";
+                                        // The hint is drawn here rather than as placeholderText, which starts at
+                                        // exactly the cursor's x and had the blinking cursor sitting on its first
+                                        // letter. This one starts a few pixels to the right of it.
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            x: composer.leftPadding + 6
+                                            y: composer.topPadding
+                                            width: composer.width - x - composer.rightPadding
+                                            visible: composer.text === "" && composer.preeditText === ""
+                                            elide: Text.ElideRight
+                                            text: {
+                                                const group = root.currentInfo && root.currentInfo.group;
+                                                if (root.replyView) return root.replyBlock() ? "Replies need BlueBubbles' Private API" : "Reply…";
+                                                if (root.route === "iphone" && group) return "Group chats need BlueBubbles";
+                                                if (root.route === "bluebubbles" || root.route === "iphone") return root.prompts[root.promptIdx];
+                                                return "Not connected";
+                                            }
+                                            color: Theme.dim
+                                            font: composer.font
                                         }
-                                        placeholderTextColor: Theme.dim
                                         color: typing.active ? "transparent" : Theme.fg
                                         selectedTextColor: typing.active ? "transparent" : Theme.fg
                                         font.family: Theme.uiFont
@@ -2177,8 +2674,10 @@ ShellRoot {
                                                 ev.accepted = true;
                                                 return;
                                             }
-                                            if (ev.key === Qt.Key_Escape && (root.builtinPreview || root.picker || root.effectPickerOpen)) {
-                                                root.builtinPreview = ""; root.picker = null; root.effectPickerOpen = false;
+                                            if (ev.key === Qt.Key_Escape && (root.builtinPreview || root.picker || root.effectPickerOpen || root.replyView)) {
+                                                if (root.builtinPreview || root.picker || root.effectPickerOpen) {
+                                                    root.builtinPreview = ""; root.picker = null; root.effectPickerOpen = false;
+                                                } else root.closeReplies();
                                                 ev.accepted = true;
                                                 return;
                                             }
@@ -2793,35 +3292,94 @@ ShellRoot {
         }
     }
 
-    // A labelled row of mutually exclusive options (Omarchy buttons, the picked one selected).
-    // the time beside a message, on the side with room (left of yours, right of theirs)
-    component SideTime: Text {
-        textFormat: Text.PlainText
-        property Item target
-        property bool mine
-        // A reaction chip hangs off the same side of the bubble that this sits on, overlapping
-        // that column by 14px with one reaction and more with several. Centred on a one-line
-        // bubble the two clear each other by a single pixel, so a larger caption font or a
-        // tighter bubble is enough to make them collide. The chip is pinned to the bubble's
-        // top, so for a reacted message the time goes to the bottom edge, where nothing is.
-        property bool reacted: false
-        // The react button appears on the same side of the bubble on hover and is drawn over
-        // the time. `clearance` is however much room that neighbour needs; the time slides out
-        // past it rather than being covered, so both stay readable while the pointer is there.
-        property int clearance: 0
-        anchors.verticalCenter: (target && !reacted) ? target.verticalCenter : undefined
-        anchors.bottom: (target && reacted) ? target.bottom : undefined
-        anchors.right: mine && target ? target.left : undefined
-        anchors.left: !mine && target ? target.right : undefined
-        anchors.leftMargin: 10 + clearance
-        anchors.rightMargin: 10 + clearance
-        Behavior on anchors.leftMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
-        Behavior on anchors.rightMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
-        color: Theme.dim
-        font.family: Theme.uiFont
-        font.pixelSize: Theme.fCaption
+    // Above an inline reply: a faded copy of the message it answers, on that message's side, and
+    // the line from it down into the reply (to targetX, just inside the reply's bubble). Both
+    // ends sit 18 px in from a bubble's outer edge, inside any bubble, so they always meet one.
+    component ReplyQuote: Item {
+        id: rq
+        property var quote: null
+        property real targetX: 0
+        property real maxWidth: 400
+        signal open()
+        readonly property bool qMine: !!quote && quote.fromMe
+        readonly property real gap: 16
+        height: qb.height + gap
+
+        Rectangle {
+            id: qb
+            x: rq.qMine ? rq.width - width : 0
+            width: Math.min(qMeasure.implicitWidth, rq.maxWidth - 24) + 24
+            height: qText.height + 12
+            radius: Math.max(Theme.radius, 4)
+            color: rq.qMine ? Theme.accent : Theme.panel
+            opacity: qHover.hovered ? 0.75 : 0.5
+            Behavior on opacity { NumberAnimation { duration: 120 } }
+            Text { id: qMeasure; visible: false; text: qText.text; font: qText.font; textFormat: Text.PlainText }
+            Text {
+                id: qText
+                x: 12
+                y: 6
+                width: qb.width - 24
+                text: !rq.quote ? "Earlier message" : (rq.quote.text || rq.quote.label || "Message")
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+                color: rq.qMine ? Theme.onAccent : Theme.fg
+                font.family: Theme.uiFont
+                font.pixelSize: Theme.fSmall
+            }
+            HoverHandler { id: qHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: rq.open() }
+        }
+        ThreadLine {
+            fromX: rq.qMine ? qb.x + qb.width - 18 : qb.x + 18
+            fromY: qb.height
+            toX: rq.targetX
+            toY: rq.height + 3      // the column's spacing: just into the reply
+        }
     }
 
+    // The thin line that joins the messages of a reply thread: straight down out of one message
+    // and into the next, or, when they sit on opposite sides, down, across and down again with
+    // rounded corners.
+    component ThreadLine: Shape {
+        id: tl
+        property real fromX
+        property real fromY
+        property real toX
+        property real toY
+        readonly property real dir: toX >= fromX ? 1 : -1
+        readonly property real midY: (fromY + toY) / 2
+        // corner radius: no bigger than half the drop or half the distance across
+        readonly property real r: Math.max(0, Math.min(6, (toY - fromY) / 2 - 0.5, Math.abs(toX - fromX) / 2))
+        anchors.fill: parent
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+            strokeColor: Theme.faint
+            strokeWidth: 1.5
+            fillColor: "transparent"
+            capStyle: ShapePath.RoundCap
+            joinStyle: ShapePath.RoundJoin
+            startX: tl.fromX
+            startY: tl.fromY
+            PathLine { x: tl.fromX; y: tl.midY - tl.r }
+            PathArc {
+                x: tl.fromX + tl.dir * tl.r; y: tl.midY
+                radiusX: tl.r; radiusY: tl.r
+                direction: tl.dir > 0 ? PathArc.Counterclockwise : PathArc.Clockwise
+            }
+            PathLine { x: tl.toX - tl.dir * tl.r; y: tl.midY }
+            PathArc {
+                x: tl.toX; y: tl.midY + tl.r
+                radiusX: tl.r; radiusY: tl.r
+                direction: tl.dir > 0 ? PathArc.Clockwise : PathArc.Counterclockwise
+            }
+            PathLine { x: tl.toX; y: tl.toY }
+        }
+    }
+
+    // A labelled row of mutually exclusive options (Omarchy buttons, the picked one selected).
     component Choice: ColumnLayout {
         id: choice
         property string label: ""
@@ -2929,7 +3487,7 @@ ShellRoot {
             root.status = Object.assign({}, root.status, { route: "iphone", abilities: { reactions: false, effects: false, reason: reason,
                 attachments: false, attachReason: "Attachments need BlueBubbles. Over Bluetooth your iPhone only sends text." } });
         } else {
-            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, reason: "", attachments: true, attachReason: "" } });
+            root.status = Object.assign({}, root.status, { abilities: { reactions: true, effects: true, replies: true, reason: "", attachments: true, attachReason: "" } });
         }
         if (root.preview === "effects") root.effectPickerOpen = true;
         if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
@@ -2957,6 +3515,20 @@ ShellRoot {
                   attachments: [{ guid: "", name: "balloon.png", mime: "image/png", size: 48213, path: Qt.resolvedUrl("fx/balloon-red.png").toString().replace("file://", "") }] },
                 { id: 73, thread: "addr:1", fromMe: true, text: "did you get it?", ts: now - 60, status: "failed", error: "Your Mac isn't sending messages. On the Mac, give BlueBubbles Accessibility and Automation → Messages permission, then retry.", attachments: [], reactions: {} },
                 { id: 74, thread: "addr:1", fromMe: true, text: "on my way", ts: now - 30, status: "sending", error: "Sending through your iPhone", attachments: [], reactions: {} }]);
+        }
+        // replies: inline replies in the conversation; thread: the same with the thread open
+        if (root.preview === "replies" || root.preview === "thread" || root.preview === "threadoff") {
+            const q1 = { id: 1, fromMe: false, text: "Are we still on for dinner tonight?", label: "", senderName: "" };
+            root.msgs = root.msgs.slice(0, 5).map(m => m.id === 1 ? Object.assign({}, m, { guid: "G1", replyCount: 2 }) : m).concat([
+                { id: 20, thread: "addr:1", fromMe: true, text: "Yes — I booked 7:30, under my name", ts: now - 50, status: "", via: "bluebubbles",
+                  attachments: [], reactions: {}, guid: "R20", replyTo: "G1", replyCount: 2, quote: q1 },
+                { id: 21, thread: "addr:1", fromMe: false, sender: "+44", text: "Great, see you there", ts: now - 40, status: "", attachments: [], reactions: {},
+                  guid: "R21", replyTo: "G1", replyCount: 2, quote: { id: 20, fromMe: true, text: "Yes — I booked 7:30, under my name", label: "", senderName: "" } },
+                { id: 22, thread: "addr:1", fromMe: true, text: "👍", ts: now - 30, status: "delivered", via: "bluebubbles", attachments: [], reactions: {}, guid: "G22" }]);
+            if (root.preview === "threadoff")
+                root.status = Object.assign({}, root.status, { abilities: { reactions: false, effects: false, replies: false, reason: "Reactions and effects need BlueBubbles' Private API, which is off on your Mac.",
+                    replyReason: "Replies need BlueBubbles' Private API, which is off on your Mac.", attachments: true, attachReason: "" } });
+            if (root.preview !== "replies") Qt.callLater(() => root.openReplies(root.msgs[0]));
         }
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {

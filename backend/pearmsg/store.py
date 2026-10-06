@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS messages (
     unread      INTEGER NOT NULL DEFAULT 0,
     effect      TEXT NOT NULL DEFAULT '',    -- iMessage bubble/screen effect id
     runs        TEXT NOT NULL DEFAULT '[]',  -- text formatting / iOS 18 text effects (UTF-16 ranges)
-    hidden      INTEGER NOT NULL DEFAULT 0   -- the received copy of a message you sent yourself
+    hidden      INTEGER NOT NULL DEFAULT 0,  -- the received copy of a message you sent yourself
+    reply_to    TEXT NOT NULL DEFAULT '',    -- inline reply: bb_guid of the message that began its thread
+    reply_part  INTEGER NOT NULL DEFAULT 0   -- which part of that message
 );
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread, ts);
 CREATE INDEX IF NOT EXISTS messages_match ON messages(sender, from_me, ts);
@@ -154,10 +156,12 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
         resync = False
         for col, ddl in (("effect", "TEXT NOT NULL DEFAULT ''"), ("runs", "TEXT NOT NULL DEFAULT '[]'"),
-                         ("hidden", "INTEGER NOT NULL DEFAULT 0")):
+                         ("hidden", "INTEGER NOT NULL DEFAULT 0"), ("reply_to", "TEXT NOT NULL DEFAULT ''"),
+                         ("reply_part", "INTEGER NOT NULL DEFAULT 0")):
             if col not in cols:   # databases from older versions
                 self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
-                resync = resync or col in ("effect", "runs")
+                resync = resync or col in ("effect", "runs", "reply_to")
+        self.db.execute("CREATE INDEX IF NOT EXISTS messages_reply ON messages(reply_to) WHERE reply_to!=''")
         if "card" not in {r[1] for r in self.db.execute("PRAGMA table_info(contacts)")}:
             self.db.execute("ALTER TABLE contacts ADD COLUMN card TEXT NOT NULL DEFAULT ''")
         if self.get_meta("reaction_keys_v1") != "done":
@@ -419,7 +423,62 @@ class Store:
                 [{"text": r["text"].replace(_OBJ, "").strip(), "styles": [], "effect": r["effect"][5:]}]
                 if r["effect"].startswith("text:") and r["text"].strip() else []),
             "hidden": bool(r["hidden"]),
+            **self._reply_info(r),
         }
+
+    # --------------------------------------------------------------- replies
+    # Messages threads inline replies on the message that began the thread (the "root"): every
+    # reply carries the root's guid, whichever message of the thread it answered. In the
+    # conversation a reply shows the message before it in its thread above it, and the root
+    # says how many replies it has.
+    def _reply_info(self, r: sqlite3.Row) -> dict:
+        out: dict = {"replyTo": r["reply_to"], "replyCount": 0}
+        if r["bb_guid"] and not r["reply_to"]:
+            out["replyCount"] = self.db.execute(
+                "SELECT COUNT(*) FROM messages WHERE reply_to=? AND hidden=0", (r["bb_guid"],)).fetchone()[0]
+        if r["reply_to"]:
+            q = self.db.execute(
+                "SELECT * FROM messages WHERE (bb_guid=? OR (reply_to=? AND id!=?)) AND hidden=0 AND ts<=? "
+                "ORDER BY ts DESC LIMIT 1", (r["reply_to"], r["reply_to"], r["id"], r["ts"])).fetchone()
+            root = self.db.execute("SELECT id FROM messages WHERE bb_guid=?", (r["reply_to"],)).fetchone()
+            out["replyRoot"] = root["id"] if root else 0
+            out["replyCount"] = self.db.execute(
+                "SELECT COUNT(*) FROM messages WHERE reply_to=? AND hidden=0", (r["reply_to"],)).fetchone()[0]
+            out["quote"] = self._quote(q) if q else None
+        return out
+
+    def _quote(self, q: sqlite3.Row) -> dict:
+        atts = json.loads(q["attachments"])
+        text = q["text"].replace(_OBJ, "").strip()
+        label = ""
+        if not text and atts:
+            mime = atts[0].get("mime") or ""
+            label = "Photo" if mime.startswith("image/") else "Video" if mime.startswith("video/") else (
+                atts[0].get("name") or "Attachment")
+        return {"id": q["id"], "fromMe": bool(q["from_me"]), "text": text[:300], "label": label,
+                "senderName": "" if q["from_me"] else (self.contact_name(q["sender_addr"]) or q["sender_addr"])}
+
+    def reply_root(self, mid: int) -> sqlite3.Row | None:
+        """The message that began the thread this one is in (itself, if it began one)."""
+        r = self.db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        if r is None or not r["reply_to"]:
+            return r
+        return self.db.execute("SELECT * FROM messages WHERE bb_guid=?", (r["reply_to"],)).fetchone()
+
+    def reply_thread(self, root_guid: str) -> list[dict]:
+        """The root, then every reply in order."""
+        rows = self.db.execute(
+            "SELECT * FROM messages WHERE (bb_guid=? OR reply_to=?) AND hidden=0 ORDER BY (bb_guid=?) DESC, ts",
+            (root_guid, root_guid, root_guid)).fetchall()
+        return [self._row(r) for r in rows]
+
+    def missing_roots(self, guids) -> list[str]:
+        return [g for g in dict.fromkeys(guids) if g and self.db.execute(
+            "SELECT 1 FROM messages WHERE bb_guid=?", (g,)).fetchone() is None]
+
+    def root_id(self, guid: str) -> int | None:
+        r = self.db.execute("SELECT id FROM messages WHERE bb_guid=?", (guid,)).fetchone()
+        return r["id"] if r else None
 
     def message(self, mid: int) -> dict | None:
         r = self.db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
@@ -508,12 +567,14 @@ class Store:
         # 3. New.
         cur = self.db.execute(
             "INSERT INTO messages(thread,from_me,sender,sender_addr,text,norm,ts,status,error,via,"
-            "bb_guid,map_handle,temp_id,attachments,unread,effect,runs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "bb_guid,map_handle,temp_id,attachments,unread,effect,runs,reply_to,reply_part) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (m["thread"], int(from_me), sender, "" if from_me else m.get("sender_addr", ""),
              m.get("text", ""), norm, float(m["ts"]), m.get("status", ""), m.get("error", ""), source,
              m.get("bb_guid"), m.get("map_handle"), m.get("temp_id"),
              json.dumps(m.get("attachments") or []), int(bool(m.get("unread")) and not from_me),
-             m.get("effect") or "", json.dumps(m.get("runs") or [])))
+             m.get("effect") or "", json.dumps(m.get("runs") or []),
+             m.get("reply_to") or "", int(m.get("reply_part") or 0)))
         rid = cur.lastrowid
         if m["thread"] == "addr:self":
             self.hide_self_mirrors()
@@ -544,6 +605,9 @@ class Store:
                 upd["effect"] = m["effect"]
             if m.get("runs") and json.dumps(m["runs"]) != r["runs"]:
                 upd["runs"] = json.dumps(m["runs"])
+            if m.get("reply_to"):
+                upd["reply_to"] = m["reply_to"]
+                upd["reply_part"] = int(m.get("reply_part") or 0)
         if m.get("text") and len(m["text"]) > len(r["text"]) and normalize(m["text"]).startswith(r["norm"]):
             upd["text"] = m["text"]
             upd["norm"] = normalize(m["text"])

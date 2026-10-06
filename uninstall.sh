@@ -13,6 +13,7 @@ rm -f "$HOME/.config/systemd/user/pear-messages.service"
 pkill -f "pearmsg daemon" 2>/dev/null || true
 rm -f "$HOME/.local/share/applications/pear-messages.desktop"
 rm -rf "$data/app" "$data/backend"
+rm -f "$data/.plugin-manifest"
 rm -rf "$HOME/.cache/pear-messages"
 echo "Pear Messages removed."
 

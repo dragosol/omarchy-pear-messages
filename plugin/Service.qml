@@ -8,26 +8,31 @@ import Quickshell.Io
 //
 // The app window is NOT loaded into omarchy-shell: it runs as its own Quickshell process
 // (app/shell.qml), because plugins inside the shell share one QML scene and that is no place
-// for your messages. What lives here is small and has one job: keep `pear-messagesd` running
-// for as long as you are logged in, so messages still arrive while the window is closed.
+// for your messages. What lives here has two jobs:
 //
-// This used to be a systemd user unit that install.sh enabled. It is not any more. A plugin is
-// already a supervised, session-length process, so the unit was duplicating what the shell
-// does, and installing it meant the listing could never offer a plain copy-paste install.
-// Restart-on-failure and the private umask moved with it: the restart is below, and the daemon
-// sets its own umask now rather than inheriting one from a unit file.
+// 1. Make `omarchy plugin add` alone give you the whole app. On first load, and whenever this
+//    checkout's manifest differs from the one last installed (an `omarchy plugin update`), it
+//    runs the repository's own install.sh, which only copies the service and the window into
+//    ~/.local/share/pear-messages and writes the launcher: as your own user, no services,
+//    nothing downloaded. Exactly what the README tells people to run by hand.
+// 2. Keep `pear-messagesd` running for as long as you are logged in, so messages still arrive
+//    while the window is closed. This used to be a systemd user unit; a plugin is already a
+//    supervised, session-length process, so the unit was duplicating what the shell does.
+//    Restart-on-failure moved here, and the daemon sets its own private umask.
 QtObject {
   id: root
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string installedRoot: home + "/.local/share/pear-messages"
-  // Where `omarchy plugin add` put this checkout. The backend ships inside it, so the service
-  // can run even before install.sh has laid down the app window and its launcher.
+  // Where `omarchy plugin add` put this checkout.
   readonly property string checkout: decodeURIComponent(
       Qt.resolvedUrl("..").toString().replace(/^file:\/\//, "").replace(/\/$/, ""))
+  // The manifest of the version last installed, so an update re-installs instead of leaving
+  // the old window and service in place.
+  readonly property string stamp: installedRoot + "/.plugin-manifest"
 
-  // Prefer the installed copy when there is one, so the service and the app window are always
-  // the same version; fall back to the checkout so a fresh `plugin add` still receives messages.
+  // Run the installed copy when there is one, so the service and the window are always the
+  // same version; fall back to the checkout so messages still arrive if installing failed.
   property bool useInstalled: false
   readonly property string backendPath: useInstalled ? installedRoot + "/backend" : checkout + "/backend"
 
@@ -38,11 +43,44 @@ QtObject {
   // daemon that cannot start (missing python-dbus, say) does not spin for the whole session.
   readonly property int restartLimit: 20
 
-  property Process probe: Process {
-    command: ["test", "-d", root.installedRoot + "/backend/pearmsg"]
+  // Is the installed copy missing, or from another version than this checkout? Paths go in
+  // as arguments, never spliced into the script.
+  property Process check: Process {
+    command: ["sh", "-c", 'test -x "$1/app/launch.sh" && test -d "$1/backend/pearmsg" && cmp -s "$2" "$3/manifest.json"',
+              "check", root.installedRoot, root.stamp, root.checkout]
     running: true
     onExited: function (code) {
-      root.useInstalled = (code === 0)
+      if (code === 0) {
+        root.useInstalled = true
+        root.daemon.running = true
+      } else {
+        root.install.running = true
+      }
+    }
+  }
+
+  property Process install: Process {
+    running: false
+    command: [root.checkout + "/install.sh"]
+    onExited: function (code) {
+      if (code === 0) {
+        root.stampIt.running = true
+        return
+      }
+      // Run what we have rather than nothing, and say how to see why.
+      root.useInstalled = false
+      root.daemon.running = true
+      Quickshell.execDetached(["notify-send", "-a", "Pear Messages",
+        "Pear Messages could not finish installing",
+        "Run ./install.sh in " + root.checkout + " to see what went wrong."])
+    }
+  }
+
+  property Process stampIt: Process {
+    running: false
+    command: ["cp", root.checkout + "/manifest.json", root.stamp]
+    onExited: function (code) {
+      root.useInstalled = true
       root.daemon.running = true
     }
   }
@@ -65,19 +103,6 @@ QtObject {
     interval: 5000
     repeat: false
     onTriggered: if (!root.stopping) root.daemon.running = true
-  }
-
-  // Tell the user once if the app window has not been installed. The service above is already
-  // running by then, so messages are arriving; what is missing is the launcher.
-  property Process check: Process {
-    command: ["test", "-x", root.installedRoot + "/app/launch.sh"]
-    running: true
-    onExited: function (code) {
-      if (code !== 0)
-        Quickshell.execDetached(["notify-send", "-a", "Pear Messages",
-          "Pear Messages needs one more step",
-          "Run ./install.sh in " + root.checkout + " to add the app window and its launcher."])
-    }
   }
 
   Component.onDestruction: {

@@ -230,6 +230,53 @@ class EffectsTest(unittest.TestCase):
         self.assertIn("effect", cols)
 
 
+class ReplyTest(unittest.TestCase):
+    def setUp(self):
+        self.s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        self.t = time.time() - 100
+
+    def _bb(self, guid, text, dt, from_me=False, root="", part=""):
+        return BB.to_message({"guid": guid, "text": text, "isFromMe": from_me,
+                              "handle": None if from_me else {"address": "+15550100"},
+                              "dateCreated": int((self.t + dt) * 1000), "threadOriginatorGuid": root or None,
+                              "threadOriginatorPart": part or None,
+                              "chats": [{"guid": "iMessage;-;+15550100", "style": 45,
+                                         "participants": [{"address": "+15550100"}]}]})
+
+    def test_parse(self):
+        n = self._bb("R1", "yes", 1, root="G1", part="2:0:31")
+        self.assertEqual((n["reply_to"], n["reply_part"]), ("G1", 2))
+        self.assertEqual(self._bb("G1", "hi", 0)["reply_to"], "")
+
+    def test_quote_is_the_message_before_in_the_thread(self):
+        _, root = self.s.ingest(self._bb("G1", "dinner?", 0), "bluebubbles")
+        self.s.ingest(self._bb("X", "unrelated", 1, from_me=True), "bluebubbles")
+        _, r1 = self.s.ingest(self._bb("R1", "yes", 2, from_me=True, root="G1"), "bluebubbles")
+        _, r2 = self.s.ingest(self._bb("R2", "7pm", 3, root="G1"), "bluebubbles")
+        self.assertEqual(self.s.message(root)["replyCount"], 2)
+        self.assertEqual(self.s.message(r1)["quote"]["id"], root)
+        self.assertEqual(self.s.message(r2)["quote"]["id"], r1)      # not the root: the one before it
+        self.assertEqual(self.s.message(r2)["replyRoot"], root)
+        self.assertEqual([m["id"] for m in self.s.reply_thread("G1")], [root, r1, r2])
+        self.assertEqual(self.s.reply_root(r2)["id"], root)
+        self.assertEqual(self.s.message(r2)["quote"]["senderName"], "")
+
+    def test_missing_root(self):
+        _, r1 = self.s.ingest(self._bb("R1", "yes", 2, root="OLD"), "bluebubbles")
+        self.assertIsNone(self.s.message(r1)["quote"])
+        self.assertEqual(self.s.missing_roots(["OLD", "OLD"]), ["OLD"])
+
+    def test_my_send_keeps_its_thread_when_the_mac_reports_it(self):
+        self.s.ingest(self._bb("G1", "dinner?", 0), "bluebubbles")
+        _, mine = self.s.ingest({"temp_id": "temp-1", "thread": store.addr_thread("+15550100"), "from_me": True,
+                                 "text": "sure", "ts": self.t + 5, "status": "sending", "reply_to": "G1"}, "local")
+        n = self._bb("R9", "sure", 5, from_me=True, root="G1")
+        n["temp_id"] = "temp-1"
+        what, rid = self.s.ingest(n, "bluebubbles")
+        self.assertEqual((what, rid), ("merged", mine))
+        self.assertEqual(self.s.message(mine)["replyTo"], "G1")
+
+
 class IdentityTest(unittest.TestCase):
     def setUp(self):
         self.s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
@@ -425,19 +472,21 @@ class QmlTextFormatTest(unittest.TestCase):
                     missing.append(f"{name}:{i + 1} {line.strip()[:60]}")
         self.assertEqual(missing, [], "text elements on the AutoText default:\n" + "\n".join(missing))
 
-    def test_only_the_message_bubble_uses_rich_text(self):
+    def test_only_message_bubbles_use_rich_text(self):
+        """The message bubble in the conversation and the one in an open reply thread are the
+        only rich-text elements, and both must be fed through linkify()/styledHtml()."""
         rich = []
         for name, lines in self._qml():
             for i, line in enumerate(lines):
                 if re.search(r"textFormat:\s*\w+\.(RichText|StyledText|AutoText)", line):
                     rich.append((name, i + 1, line.strip()))
-        self.assertEqual(len(rich), 1, f"expected exactly one rich-text element, got {rich}")
-        name, lineno, _ = rich[0]
-        self.assertEqual(name, "shell.qml")
-        # it must take its text from linkify()/styledHtml(), both of which run escapeHtml()
-        block = "\n".join(dict(self._qml())[name][lineno - 6:lineno + 6])
-        self.assertTrue("root.linkify(" in block or "root.styledHtml(" in block,
-                        f"the rich-text element at {name}:{lineno} is not fed through linkify()")
+        self.assertEqual(len(rich), 2, f"expected the two message bubbles to be rich text, got {rich}")
+        for name, lineno, _ in rich:
+            self.assertEqual(name, "shell.qml")
+            # it must take its text from linkify()/styledHtml(), both of which run escapeHtml()
+            block = "\n".join(dict(self._qml())[name][lineno - 6:lineno + 6])
+            self.assertTrue("root.linkify(" in block or "root.styledHtml(" in block,
+                            f"the rich-text element at {name}:{lineno} is not fed through linkify()")
 
     def test_escapehtml_neutralises_an_img_tag(self):
         """Mirror of app/shell.qml's escapeHtml, which is what keeps the bubble safe."""
@@ -519,6 +568,36 @@ class StandardInstallationTest(unittest.TestCase):
         self.assertIn('"pearmsg", "daemon"', qml, "Service.qml no longer starts the daemon")
         self.assertIn("workingDirectory", qml)
         self.assertIn("Timer", qml, "nothing restarts the daemon after it exits")
+
+    def test_the_plugin_installs_the_app_itself(self):
+        """`omarchy plugin add` alone has to give the whole app: the plugin runs the repository's
+        own install.sh on first load and again when the checkout's version changes."""
+        with open(os.path.join(self.ROOT, "plugin", "Service.qml")) as fh:
+            qml = fh.read()
+        self.assertIn('command: [root.checkout + "/install.sh"]', qml, "the plugin no longer installs the app")
+        self.assertRegex(qml, r'cmp -s "\$2" "\$3/manifest\.json"', "an update no longer re-installs")
+        # paths reach the shell as arguments, never spliced into the script
+        found = re.search(r"""command: \["sh", "-c", ('[^']*'|"[^"]*")""", qml)
+        self.assertIsNotNone(found, "the install check is gone")
+        self.assertNotIn("root.", found.group(1), "a path is spliced into the shell script")
+        # the service starts only after the install decision, from the installed copy when it worked
+        self.assertNotIn("property Process probe", qml)
+
+    def test_install_sh_only_copies(self):
+        """What the plugin runs by itself must stay a local copy: nothing fetched, nothing built,
+        no privilege, no service manager."""
+        with open(os.path.join(self.ROOT, "install.sh")) as fh:
+            body = "\n".join(l for l in fh.read().split("\n") if not l.lstrip().startswith("#"))
+        for word in ("curl", "wget", "pip ", "git ", "npm", "cargo", "sudo", "pkexec", "systemctl", "pacman"):
+            self.assertNotIn(word, body, f"install.sh now runs {word.strip()}")
+
+    def test_the_readme_install_is_one_command(self):
+        with open(os.path.join(self.ROOT, "README.md")) as fh:
+            readme = fh.read()
+        block = re.search(r"## Install\n\n```bash\n(.*?)```", readme, re.S)
+        self.assertIsNotNone(block, "the README's install block moved")
+        lines = [l for l in block.group(1).split("\n") if l.strip()]
+        self.assertEqual(lines, ["omarchy plugin add https://github.com/dragosol/omarchy-pear-messages.git --enable"])
 
     def test_daemon_sets_its_own_umask(self):
         """UMask=0077 came from the unit file. Losing it silently would undo the journal and
@@ -680,35 +759,41 @@ class ReactionChipLayoutTest(unittest.TestCase):
             self.fail(f"a negative topMargin ({found.group(1)}) puts an element outside its row")
 
 
-class SideTimeClearanceTest(unittest.TestCase):
-    """The react button appears on hover on the same side of the bubble as the timestamp, at
-    `bubble.x - width - 6` with width 32, while the timestamp sat at a fixed 10px margin. They
-    overlapped by 28px; the button is simply invisible until you hover, which is why it looked
-    like the timestamp was being covered by the reaction popup."""
+class HoverTimeLayoutTest(unittest.TestCase):
+    """The hover time used to be drawn beside the bubble, where the react button also appears,
+    and the two kept landing on each other. It is now part of the message's own layout: a row
+    under the message that opens on hover and pushes the messages below it down. Growing a row
+    while the list is pinned to the newest message would make the list follow the growth and
+    lift the hovered message out from under the pointer, so open rows hold the view still."""
 
     def _shell(self):
         path = os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")
         with open(path) as fh:
             return fh.read()
 
-    def test_side_time_takes_a_clearance(self):
-        body = self._shell()
-        self.assertIn("property int clearance", body, "SideTime no longer accepts a clearance")
-        # the margins are now conditional on `stacked`, so match the beside-the-bubble branch
-        for side in ("leftMargin", "rightMargin"):
-            self.assertRegex(body, rf"anchors\.{side}:[^\n]*10 \+ clearance",
-                             f"{side} no longer makes room for the react button")
+    def test_no_time_beside_the_bubble(self):
+        self.assertNotIn("SideTime", self._shell(), "a timestamp overlay beside the bubble is back")
 
-    def test_the_bubble_time_clears_the_react_button(self):
+    def test_the_time_row_is_part_of_the_row_height(self):
         body = self._shell()
-        self.assertIn("clearance: reactBtn.visible", body,
-                      "the timestamp no longer moves aside for the react button")
-        found = re.search(r"clearance: reactBtn\.visible \? \(reactBtn\.width \+ (\d+)\)", body)
-        self.assertIsNotNone(found, "the clearance rule was rewritten")
-        # button occupies 6 + 32 from the bubble edge; base margin is 10
-        pad = int(found.group(1))
-        self.assertGreaterEqual(10 + 32 + pad, 6 + 32,
-                                "the clearance is too small for the button to fit beside it")
+        self.assertRegex(body, r"height: col\.implicitHeight \+ timeRow\.height",
+                         "the hover time no longer counts in the message's height")
+        self.assertIn("anchors.bottom: timeRow.top", body, "the message no longer sits on its time row")
+
+    def test_an_open_time_holds_the_view(self):
+        body = self._shell()
+        for handler in ("onContentHeightChanged", "onOriginYChanged"):
+            found = re.search(handler + r": if \(([^\n]*)\) followGrowth\(\)", body)
+            self.assertIsNotNone(found, f"{handler} no longer follows growth")
+            self.assertIn("holdView === 0", found.group(1),
+                          f"{handler} follows growth while a hover time is open")
+
+    def test_the_time_only_pushes_when_something_is_in_the_way(self):
+        body = self._shell()
+        self.assertIn("function timeFitsBelow()", body, "the time no longer checks the room below")
+        self.assertRegex(body, r"height: msgItem\.showTime && !msgItem\.timeOverlays \?",
+                         "a time dropped into the gap below still grows the row")
+        self.assertIn("readonly property var topBand", body, "rows no longer say what their top holds")
 
     def test_the_react_button_is_identifiable(self):
         self.assertIn("id: reactBtn", self._shell(), "reactBtn lost its id")
