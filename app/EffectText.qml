@@ -187,6 +187,7 @@ Flow {
 
         // Bloom's glow: the letter, blurred and brightened, behind itself.
         Text {
+            textFormat: Text.PlainText
             id: glowText
             visible: g.fx === "bloom" && g.pose[4] > 0.02
             anchors.centerIn: label
@@ -199,6 +200,7 @@ Flow {
             layer.effect: MultiEffect { blurEnabled: true; blur: 1.0; blurMax: 20; brightness: 0.3 }
         }
         Text {
+            textFormat: Text.PlainText
             id: label
             text: g.m.ch === "\n" ? "" : g.m.ch
             color: et.color

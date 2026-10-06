@@ -1,4 +1,5 @@
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -393,6 +394,53 @@ class BBTest(unittest.TestCase):
         self.assertEqual(r["reaction"], "")
         r = BB.to_message({"associatedMessageGuid": "A", "associatedMessageType": "laugh", "isFromMe": True})
         self.assertEqual((r["reaction"], r["sender"]), ("laugh", "me"))
+
+
+class QmlTextFormatTest(unittest.TestCase):
+    """Received message text, contact names and group names reach QML labels. A label left on
+    the default Text.AutoText parses them as rich text, so a sender could include an <img> and
+    make Qt fetch any URL, including a loopback or private-network one that never passes the
+    link previewer's public-IP checks. Every label must therefore declare PlainText, and the
+    one deliberate RichText element must only ever be fed escaped text."""
+
+    APP = os.path.join(os.path.dirname(__file__), "..", "..", "app")
+    ELEMENT = re.compile(r"^\s*(Text|TextEdit|TextArea|TextInput)\s*\{")
+
+    def _qml(self):
+        for name in sorted(os.listdir(self.APP)):
+            if name.endswith(".qml"):
+                with open(os.path.join(self.APP, name)) as fh:
+                    yield name, fh.read().split("\n")
+
+    def test_every_text_element_declares_a_format(self):
+        missing = []
+        for name, lines in self._qml():
+            for i, line in enumerate(lines):
+                if self.ELEMENT.match(line) and "textFormat" not in " ".join(lines[i:i + 14]):
+                    missing.append(f"{name}:{i + 1} {line.strip()[:60]}")
+        self.assertEqual(missing, [], "text elements on the AutoText default:\n" + "\n".join(missing))
+
+    def test_only_the_message_bubble_uses_rich_text(self):
+        rich = []
+        for name, lines in self._qml():
+            for i, line in enumerate(lines):
+                if re.search(r"textFormat:\s*\w+\.(RichText|StyledText|AutoText)", line):
+                    rich.append((name, i + 1, line.strip()))
+        self.assertEqual(len(rich), 1, f"expected exactly one rich-text element, got {rich}")
+        name, lineno, _ = rich[0]
+        self.assertEqual(name, "shell.qml")
+        # it must take its text from linkify()/styledHtml(), both of which run escapeHtml()
+        block = "\n".join(dict(self._qml())[name][lineno - 6:lineno + 6])
+        self.assertTrue("root.linkify(" in block or "root.styledHtml(" in block,
+                        f"the rich-text element at {name}:{lineno} is not fed through linkify()")
+
+    def test_escapehtml_neutralises_an_img_tag(self):
+        """Mirror of app/shell.qml's escapeHtml, which is what keeps the bubble safe."""
+        def escape_html(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        evil = '<img src="http://127.0.0.1:9/x.png">'
+        self.assertNotIn("<img", escape_html(evil))
+        self.assertIn("&lt;img", escape_html(evil))
 
 
 if __name__ == "__main__":

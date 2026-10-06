@@ -84,6 +84,12 @@ once.
   a single message is written, and every cached photo, video frame and attachment is 0600 once
   it lands. An install made before this was added is repaired on the next start rather than
   only new ones being protected.
+- **Message text is never treated as markup.** Every label in the app renders as plain text, so
+  a message, contact name or group name containing something like an `<img>` tag is shown as the
+  characters you were sent rather than being fetched. The one place that does render formatting,
+  the message bubble itself, escapes `<`, `>` and `&` first, which is what makes bold and italic
+  from the sender safe to show. Without this a sender could have made the app request any
+  address, including one on your own machine or network that link previews would have refused.
 - **A connection assistant in Settings.** *Find my Mac* looks for BlueBubbles on your Tailscale
   network, or type any address. *Pair iPhone* shows the pairing code to compare with your phone
   and the one switch to flip on it.

@@ -677,6 +677,7 @@ ShellRoot {
                     asynchronous: true
                 }
                 Text {
+                    textFormat: Text.PlainText
                     anchors.bottom: parent.bottom
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.bottomMargin: 10
@@ -709,6 +710,7 @@ ShellRoot {
                 border.width: 2
                 border.color: root.canAttach ? Theme.accent : Theme.danger
                 Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     width: parent.width * 0.7
                     horizontalAlignment: Text.AlignHCenter
@@ -740,6 +742,7 @@ ShellRoot {
                             Layout.fillWidth: true
                             spacing: 6
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: "Messages"
                                 color: Theme.fg
@@ -809,6 +812,7 @@ ShellRoot {
                                         radius: Math.max(Theme.radius, 19)
                                         color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
                                         Text {
+                                            textFormat: Text.PlainText
                                             anchors.centerIn: parent
                                             text: row.modelData.group ? "⋯" : root.initials(row.modelData.title)
                                             color: Theme.accent
@@ -824,6 +828,7 @@ ShellRoot {
                                         RowLayout {
                                             Layout.fillWidth: true
                                             Text {
+                                                textFormat: Text.PlainText
                                                 Layout.fillWidth: true
                                                 text: row.modelData.title
                                                 elide: Text.ElideRight
@@ -833,6 +838,7 @@ ShellRoot {
                                                 font.weight: row.modelData.unread ? Font.Bold : Font.Medium
                                             }
                                             Text {
+                                                textFormat: Text.PlainText
                                                 text: root.listTime(row.modelData.ts)
                                                 color: Theme.dim
                                                 font.family: Theme.uiFont
@@ -842,6 +848,7 @@ ShellRoot {
                                         RowLayout {
                                             Layout.fillWidth: true
                                             Text {
+                                                textFormat: Text.PlainText
                                                 Layout.fillWidth: true
                                                 text: (row.modelData.fromMe ? "You: " : "") + (row.modelData.preview || "").replace(/\s+/g, " ")
                                                 elide: Text.ElideRight
@@ -863,6 +870,7 @@ ShellRoot {
                             }
 
                             Text {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 width: parent.width - 20
                                 visible: root.shownThreads.length === 0
@@ -905,6 +913,7 @@ ShellRoot {
                                     opacity: root.route === "iphone" ? 0.65 : 1
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     text: root.routeLabel()
                                     elide: Text.ElideRight
@@ -913,6 +922,7 @@ ShellRoot {
                                     font.pixelSize: Theme.fSmall
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "Settings"
                                     color: Theme.dim
                                     font.family: Theme.uiFont
@@ -949,6 +959,7 @@ ShellRoot {
                                     Layout.fillWidth: true
                                     spacing: 1
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: root.currentInfo ? root.currentInfo.title : ""
                                         elide: Text.ElideRight
@@ -958,6 +969,7 @@ ShellRoot {
                                         font.weight: Font.DemiBold
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         visible: text !== ""
                                         text: {
@@ -983,6 +995,7 @@ ShellRoot {
                                 spacing: 10
                                 visible: root.composing
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "To:"
                                     color: Theme.dim
                                     font.family: Theme.uiFont
@@ -995,6 +1008,7 @@ ShellRoot {
                                     radius: Theme.radius
                                     color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
                                     Text {
+                                        textFormat: Text.PlainText
                                         id: chipText
                                         anchors.verticalCenter: parent.verticalCenter
                                         x: 10
@@ -1004,6 +1018,7 @@ ShellRoot {
                                         font.pixelSize: Theme.fSmall
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.right: parent.right
                                         anchors.rightMargin: 8
                                         anchors.verticalCenter: parent.verticalCenter
@@ -1107,6 +1122,7 @@ ShellRoot {
                                         anchors.centerIn: parent
                                         spacing: 8
                                         Text {
+                                            textFormat: Text.PlainText
                                             id: pullGlyph
                                             text: root.olderState === "loading" ? "↻" : "↑"
                                             color: Theme.dim
@@ -1122,6 +1138,7 @@ ShellRoot {
                                             }
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             color: Theme.dim
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fCaption
@@ -1231,6 +1248,7 @@ ShellRoot {
                                         spacing: 3
 
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: msgItem.showStamp
                                             width: parent.width
                                             topPadding: 10
@@ -1242,6 +1260,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fCaption
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: msgItem.showSender
                                             x: 12
                                             text: msgItem.m.senderName || msgItem.m.sender || ""
@@ -1304,7 +1323,7 @@ ShellRoot {
                                                         color: Qt.rgba(0, 0, 0, 0.55)
                                                         border.width: 1.5
                                                         border.color: Qt.rgba(1, 1, 1, 0.8)
-                                                        Text { anchors.centerIn: parent; anchors.horizontalCenterOffset: 2; text: "▶"; color: "white"; font.pixelSize: 18 }
+                                                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; anchors.horizontalCenterOffset: 2; text: "▶"; color: "white"; font.pixelSize: 18 }
                                                     }
                                                     Rectangle {
                                                         visible: attItem.isVideo && attItem.modelData.size > 0
@@ -1312,7 +1331,7 @@ ShellRoot {
                                                         width: sizeText.implicitWidth + 12; height: sizeText.implicitHeight + 4
                                                         radius: height / 2
                                                         color: Qt.rgba(0, 0, 0, 0.55)
-                                                        Text { id: sizeText; anchors.centerIn: parent; text: root.fmtSize(attItem.modelData.size); color: "white"; font.pixelSize: Theme.fCaption }
+                                                        Text { textFormat: Text.PlainText; id: sizeText; anchors.centerIn: parent; text: root.fmtSize(attItem.modelData.size); color: "white"; font.pixelSize: Theme.fCaption }
                                                     }
                                                     Rectangle {
                                                         anchors.fill: parent
@@ -1342,6 +1361,7 @@ ShellRoot {
                                                     border.width: attItem.selected ? 2 : 1
                                                     border.color: attItem.selected ? Theme.accent : Theme.line
                                                     Text {
+                                                        textFormat: Text.PlainText
                                                         id: fileText
                                                         anchors.fill: parent
                                                         anchors.leftMargin: 14
@@ -1447,6 +1467,7 @@ ShellRoot {
                                                 NumberAnimation { id: inkAnim; target: inkDots; property: "opacity"; from: 0; to: 1; duration: 500 }
 
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     id: measure
                                                     visible: false
                                                     text: msgItem.m.text
@@ -1545,6 +1566,7 @@ ShellRoot {
                                                 border.width: 1
                                                 border.color: Theme.line
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     anchors.centerIn: parent
                                                     text: "☺"
                                                     color: root.reactBlock(msgItem.m) ? Theme.faint : Theme.fg
@@ -1572,6 +1594,7 @@ ShellRoot {
                                                     Repeater {
                                                         model: msgItem.reacts
                                                         Text {
+                                                            textFormat: Text.PlainText
                                                             required property var modelData
                                                             text: root.reactionGlyph(msgItem.m.reactions[modelData])
                                                             color: modelData === "me" ? Theme.accent : Theme.fg
@@ -1603,6 +1626,7 @@ ShellRoot {
                                                 width: parent.width - 26
                                                 spacing: 3
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     width: parent.width
                                                     text: linkCard.lp ? (linkCard.lp.site || "") : ""
                                                     visible: text !== ""
@@ -1612,6 +1636,7 @@ ShellRoot {
                                                     font.pixelSize: Theme.fCaption
                                                 }
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     width: parent.width
                                                     text: linkCard.lp ? (linkCard.lp.title || "") : ""
                                                     visible: text !== ""
@@ -1624,6 +1649,7 @@ ShellRoot {
                                                     font.weight: Font.DemiBold
                                                 }
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     width: parent.width
                                                     text: linkCard.lp ? (linkCard.lp.description || "") : ""
                                                     visible: text !== ""
@@ -1641,6 +1667,7 @@ ShellRoot {
 
                                         // "Sent with Slam · Replay" - click to watch it again
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: !!root.effectNames[msgItem.m.effect || ""] && !(msgItem.m.effect || "").startsWith("text:")
                                             anchors.right: msgItem.mine ? parent.right : undefined
                                             leftPadding: 4
@@ -1664,6 +1691,7 @@ ShellRoot {
                                             spacing: 10
                                             readonly property string st: msgItem.m.status
                                             Text {
+                                                textFormat: Text.PlainText
                                                 id: statusText
                                                 rightPadding: 2
                                                 width: Math.min(implicitWidth, col.width - statusActions.width - 12)
@@ -1693,6 +1721,7 @@ ShellRoot {
                                                     model: parent.parent.st === "failed" ? [["Retry", "retry"], ["Delete", "cancel"]]
                                                          : parent.parent.st === "queued" ? [["Send now", "retry"], ["Cancel", "cancel"]] : []
                                                     Text {
+                                                        textFormat: Text.PlainText
                                                         required property var modelData
                                                         text: modelData[0]
                                                         color: actHover.hovered ? Theme.fg : Theme.accent
@@ -1747,8 +1776,8 @@ ShellRoot {
                                             Column {
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 x: 12
-                                                Text { text: modelData.name; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fBody }
-                                                Text { text: modelData.addr; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                                Text { textFormat: Text.PlainText; text: modelData.name; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fBody }
+                                                Text { textFormat: Text.PlainText; text: modelData.addr; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
                                             }
                                         }
                                     }
@@ -1777,6 +1806,7 @@ ShellRoot {
                                     anchors.centerIn: parent
                                     spacing: 8
                                     Text {
+                                        textFormat: Text.PlainText
                                         text: "↓"
                                         color: root.newBelow > 0 ? Theme.accent : Theme.fg
                                         font.family: Theme.uiFont
@@ -1785,6 +1815,7 @@ ShellRoot {
                                         anchors.verticalCenter: parent.verticalCenter
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         text: root.newBelow > 0 ? (root.newBelow === 1 ? "1 new message" : root.newBelow + " new messages")
                                                                 : "Go to bottom"
                                         color: Theme.fg
@@ -1840,6 +1871,7 @@ ShellRoot {
                                                 color: pickerBox.mine === modelData ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.3)
                                                      : kindHover.hovered && !pickerBox.block ? Theme.hover : "transparent"
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     anchors.centerIn: parent
                                                     text: root.reactionGlyph(parent.modelData)
                                                     color: Theme.fg
@@ -1857,6 +1889,7 @@ ShellRoot {
                                         }
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         visible: pickerBox.block !== ""
                                         width: pickerBox.width - 20
                                         wrapMode: Text.WordWrap
@@ -1888,6 +1921,7 @@ ShellRoot {
                                     width: effectBox.width - 28
                                     spacing: 8
                                     Text {
+                                        textFormat: Text.PlainText
                                         text: "Send with effect"
                                         color: Theme.fg
                                         font.family: Theme.uiFont
@@ -1895,6 +1929,7 @@ ShellRoot {
                                         font.weight: Font.DemiBold
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         visible: !root.abilities.effects
                                         width: parent.width
                                         wrapMode: Text.WordWrap
@@ -1903,7 +1938,7 @@ ShellRoot {
                                         font.family: Theme.uiFont
                                         font.pixelSize: Theme.fCaption
                                     }
-                                    Text { text: "Bubble"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Text { textFormat: Text.PlainText; text: "Bubble"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
                                     Flow {
                                         width: parent.width
                                         spacing: 6
@@ -1919,7 +1954,7 @@ ShellRoot {
                                             }
                                         }
                                     }
-                                    Text { text: "Text"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Text { textFormat: Text.PlainText; text: "Text"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
                                     Flow {
                                         width: parent.width
                                         spacing: 6
@@ -1935,7 +1970,7 @@ ShellRoot {
                                             }
                                         }
                                     }
-                                    Text { text: "Screen"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
+                                    Text { textFormat: Text.PlainText; text: "Screen"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption }
                                     Flow {
                                         width: parent.width
                                         spacing: 6
@@ -1960,6 +1995,7 @@ ShellRoot {
                             }
 
                             Text {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 visible: !root.current && !root.composing
                                 text: root.threads.length ? "Pick a conversation" : ""
@@ -1971,6 +2007,7 @@ ShellRoot {
 
                         // flash line
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             Layout.leftMargin: 18
                             visible: root.flash !== ""
@@ -2023,6 +2060,7 @@ ShellRoot {
                                         width: parent.width - 40
                                         spacing: 2
                                         Text {
+                                            textFormat: Text.PlainText
                                             id: chipLabel
                                             width: parent.width
                                             text: (/^video\//.test(chip.modelData.mime) ? "▶  " : "📎  ") + chip.modelData.name
@@ -2032,6 +2070,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             text: root.fmtSize(chip.modelData.size)
                                             color: Theme.dim
                                             font.family: Theme.uiFont
@@ -2044,7 +2083,7 @@ ShellRoot {
                                         anchors.margins: 4
                                         width: 20; height: 20; radius: 10
                                         color: Qt.rgba(0, 0, 0, 0.6)
-                                        Text { anchors.centerIn: parent; text: "×"; color: "white"; font.pixelSize: 14 }
+                                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "×"; color: "white"; font.pixelSize: 14 }
                                         TapHandler { onTapped: root.removePending(chip.modelData.path) }
                                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     }
@@ -2080,6 +2119,7 @@ ShellRoot {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     TextArea {
+                                        textFormat: TextArea.PlainText
                                         id: composer
                                         wrapMode: TextEdit.Wrap
                                         // with typing animation on, the letters are drawn by TypingLetters
@@ -2139,6 +2179,7 @@ ShellRoot {
                                     radius: Theme.radius
                                     color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
                                     Text {
+                                        textFormat: Text.PlainText
                                         id: fxChip
                                         x: 10
                                         anchors.verticalCenter: parent.verticalCenter
@@ -2148,6 +2189,7 @@ ShellRoot {
                                         font.pixelSize: Theme.fSmall
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.right: parent.right
                                         anchors.rightMargin: 8
                                         anchors.verticalCenter: parent.verticalCenter
@@ -2206,6 +2248,7 @@ ShellRoot {
                                 RowLayout {
                                     Layout.fillWidth: true
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: "Settings"
                                         color: Theme.fg
@@ -2217,6 +2260,7 @@ ShellRoot {
                                 }
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     wrapMode: Text.WordWrap
                                     text: "Pear Messages sends through BlueBubbles when it can reach your Mac, and falls back to your iPhone over Bluetooth when it can't. A message that arrives both ways is shown once."
@@ -2244,6 +2288,7 @@ ShellRoot {
                                             Layout.fillWidth: true
                                             spacing: 10
                                             Text {
+                                                textFormat: Text.PlainText
                                                 text: "1"
                                                 color: Theme.accent
                                                 font.family: Theme.uiFont
@@ -2254,6 +2299,7 @@ ShellRoot {
                                                 Layout.fillWidth: true
                                                 spacing: 1
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     text: "BlueBubbles"
                                                     color: Theme.fg
                                                     font.family: Theme.uiFont
@@ -2261,6 +2307,7 @@ ShellRoot {
                                                     font.weight: Font.DemiBold
                                                 }
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     Layout.fillWidth: true
                                                     wrapMode: Text.WordWrap
                                                     text: "Full iMessage: history, group chats, photos and reactions. Needs a Mac signed in to Messages running the free BlueBubbles Server."
@@ -2273,6 +2320,7 @@ ShellRoot {
                                         }
 
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bb.state === "online"
                                             wrapMode: Text.WordWrap
@@ -2285,6 +2333,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bb.state === "online" && !!root.bb.sendProblem
                                             wrapMode: Text.WordWrap
@@ -2295,6 +2344,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bb.state === "error" && !!root.bb.detail
                                             wrapMode: Text.WordWrap
@@ -2309,7 +2359,7 @@ ShellRoot {
                                             columns: 2
                                             columnSpacing: 10
                                             rowSpacing: 8
-                                            Text { text: "Server address"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
+                                            Text { textFormat: Text.PlainText; text: "Server address"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
                                             O.TextField {
                                                 id: bbUrl
                                                 Layout.fillWidth: true
@@ -2317,7 +2367,7 @@ ShellRoot {
                                                 font.pixelSize: Theme.fSmall
                                                 text: root.bb.url || ""
                                             }
-                                            Text { text: "Password"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
+                                            Text { textFormat: Text.PlainText; text: "Password"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
                                             O.TextField {
                                                 id: bbPassword
                                                 Layout.fillWidth: true
@@ -2355,6 +2405,7 @@ ShellRoot {
                                         }
 
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bbTest.ok === false
                                             wrapMode: Text.WordWrap
@@ -2364,6 +2415,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bbTest.ok === true
                                             wrapMode: Text.WordWrap
@@ -2375,6 +2427,7 @@ ShellRoot {
 
                                         // Find my Mac results
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: root.bbFound !== null
                                             wrapMode: Text.WordWrap
@@ -2429,6 +2482,7 @@ ShellRoot {
                                             Layout.fillWidth: true
                                             spacing: 10
                                             Text {
+                                                textFormat: Text.PlainText
                                                 text: "2"
                                                 color: Theme.accent
                                                 font.family: Theme.uiFont
@@ -2439,6 +2493,7 @@ ShellRoot {
                                                 Layout.fillWidth: true
                                                 spacing: 1
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     text: "iPhone over Bluetooth"
                                                     color: Theme.fg
                                                     font.family: Theme.uiFont
@@ -2446,6 +2501,7 @@ ShellRoot {
                                                     font.weight: Font.DemiBold
                                                 }
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     Layout.fillWidth: true
                                                     wrapMode: Text.WordWrap
                                                     text: "No Mac needed. New messages arrive as they come in and you can reply one-to-one; your iPhone decides iMessage or SMS. No history or group chats — BlueBubbles fills those in."
@@ -2458,6 +2514,7 @@ ShellRoot {
                                         }
 
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: !!root.phone.address
                                             wrapMode: Text.WordWrap
@@ -2480,6 +2537,7 @@ ShellRoot {
                                                 width: parent.width - 28
                                                 spacing: 8
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     Layout.fillWidth: true
                                                     wrapMode: Text.WordWrap
                                                     color: Theme.fg
@@ -2500,6 +2558,7 @@ ShellRoot {
                                                     }
                                                 }
                                                 Text {
+                                                    textFormat: Text.PlainText
                                                     visible: root.pair.stage === "confirm"
                                                     text: (root.pair.code || "").replace(/(\d{3})(\d{3})/, "$1 $2")
                                                     color: Theme.accent
@@ -2568,6 +2627,7 @@ ShellRoot {
 
                                 // ---------------- storage & downloads
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.topMargin: 6
                                     text: "Storage & downloads"
                                     color: Theme.fg
@@ -2576,6 +2636,7 @@ ShellRoot {
                                     font.weight: Font.DemiBold
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     wrapMode: Text.WordWrap
                                     color: root.bbSetUp ? Theme.dim : Theme.danger
@@ -2617,6 +2678,7 @@ ShellRoot {
                                         spacing: 8
                                         AppButton { text: "Download history again"; onClicked: root.send({ op: "resync_history" }) }
                                         Text {
+                                            textFormat: Text.PlainText
                                             text: "Applies the numbers above now; new messages always arrive."
                                             color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fCaption
                                         }
@@ -2669,6 +2731,7 @@ ShellRoot {
 
                                 // ---------------- notifications
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.topMargin: 6
                                     text: "Notifications"
                                     color: Theme.fg
@@ -2736,8 +2799,9 @@ ShellRoot {
         signal picked(var v)
         Layout.fillWidth: true
         spacing: 6
-        Text { text: choice.label; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
+        Text { textFormat: Text.PlainText; text: choice.label; color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
         Text {
+            textFormat: Text.PlainText
             visible: choice.description !== ""
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
@@ -2769,6 +2833,7 @@ ShellRoot {
              : (state === "error" || state === "needs_permission") ? Qt.rgba(Theme.danger.r, Theme.danger.g, Theme.danger.b, 0.2)
              : Theme.panel
         Text {
+            textFormat: Text.PlainText
             id: pillText
             anchors.centerIn: parent
             text: root.stateText(parent.state)

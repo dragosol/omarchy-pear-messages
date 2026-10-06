@@ -70,6 +70,7 @@ Item {
     Repeater {
         model: tl.active ? letters : null
         Text {
+            textFormat: Text.PlainText
             id: glyph
             required property int index
             required property string ch
@@ -101,6 +102,7 @@ Item {
     Repeater {
         model: tl.active ? ghosts : null
         Text {
+            textFormat: Text.PlainText
             id: ghost
             required property string ch
             required property real gx

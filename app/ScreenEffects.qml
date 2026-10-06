@@ -457,6 +457,7 @@ Item {
                 x: fx.width / 2 - width / 2; y: fx.height / 2 - height / 2
                 opacity: 0; scale: 0.3
                 Text {
+                    textFormat: Text.PlainText
                     id: chipText
                     anchors.centerIn: parent
                     text: fx.text.length > 34 ? fx.text.slice(0, 34) + "…" : fx.text
