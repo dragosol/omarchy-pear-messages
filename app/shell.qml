@@ -2778,6 +2778,7 @@ ShellRoot {
     // A labelled row of mutually exclusive options (Omarchy buttons, the picked one selected).
     // the time beside a message, on the side with room (left of yours, right of theirs)
     component SideTime: Text {
+        textFormat: Text.PlainText
         property Item target
         property bool mine
         anchors.verticalCenter: target ? target.verticalCenter : undefined

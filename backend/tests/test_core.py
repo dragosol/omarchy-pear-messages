@@ -404,7 +404,10 @@ class QmlTextFormatTest(unittest.TestCase):
     one deliberate RichText element must only ever be fed escaped text."""
 
     APP = os.path.join(os.path.dirname(__file__), "..", "..", "app")
-    ELEMENT = re.compile(r"^\s*(Text|TextEdit|TextArea|TextInput)\s*\{")
+    # A word boundary, not a line anchor: `delegate: Text {` and `component Foo: Text {` are
+    # elements too. A ^ anchor skipped them, this test still passed, and the reviewer then
+    # found one of them. TextInput has no textFormat property, so it is excluded by name.
+    ELEMENT = re.compile(r"(?<![A-Za-z0-9_])(TextEdit|TextArea|TextInput|Text)\s*\{")
 
     def _qml(self):
         for name in sorted(os.listdir(self.APP)):
@@ -416,7 +419,9 @@ class QmlTextFormatTest(unittest.TestCase):
         missing = []
         for name, lines in self._qml():
             for i, line in enumerate(lines):
-                if self.ELEMENT.match(line) and "textFormat" not in " ".join(lines[i:i + 14]):
+                found = self.ELEMENT.search(line)
+                if (found and found.group(1) != "TextInput"
+                        and "textFormat" not in " ".join(lines[i:i + 16])):
                     missing.append(f"{name}:{i + 1} {line.strip()[:60]}")
         self.assertEqual(missing, [], "text elements on the AutoText default:\n" + "\n".join(missing))
 
