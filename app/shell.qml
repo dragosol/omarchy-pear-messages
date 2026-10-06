@@ -1408,8 +1408,11 @@ ShellRoot {
                                             // row and lands on the message above: 18 reserved against 26 needed
                                             // left exactly 8px of it overlapping the previous bubble.
                                             height: bubble.height + (msgItem.reacts.length ? 26 : 0)
+                                                    + (timeLabel.visible && timeLabel.stacked
+                                                       ? timeLabel.height + 4 : 0)
                                             HoverHandler { id: bubbleHover }
                                             SideTime {
+                                                id: timeLabel
                                                 target: bubble
                                                 mine: msgItem.mine
                                                 reacted: msgItem.reacts.length > 0
@@ -1423,6 +1426,9 @@ ShellRoot {
                                                 id: bubble
                                                 anchors.right: msgItem.mine ? parent.right : undefined
                                                 anchors.bottom: parent.bottom
+                                                // leave the stacked stamp its row under the bubble
+                                                anchors.bottomMargin: (timeLabel.visible && timeLabel.stacked)
+                                                                      ? timeLabel.height + 4 : 0
                                                 readonly property var segs: msgItem.m.segments || []
                                                 readonly property bool textFx: segs.some(sg => !!sg.effect)
                                                 // letters drawn one by one come out a little wider than the string
@@ -2809,12 +2815,25 @@ ShellRoot {
         // the time. `clearance` is however much room that neighbour needs; the time slides out
         // past it rather than being covered, so both stay readable while the pointer is there.
         property int clearance: 0
-        anchors.verticalCenter: (target && !reacted) ? target.verticalCenter : undefined
-        anchors.bottom: (target && reacted) ? target.bottom : undefined
-        anchors.right: mine && target ? target.left : undefined
-        anchors.left: !mine && target ? target.right : undefined
-        anchors.leftMargin: 10 + clearance
-        anchors.rightMargin: 10 + clearance
+        // How much room is left on the bubble's own side of the row. A bubble may take 72% of
+        // the width, and the stamp is "Today 15:36" rather than "15:36", so beside the bubble
+        // is not always a place it fits - especially once the react button has claimed 36px of
+        // it on hover. When it does not fit, it goes under the bubble instead of off the edge.
+        readonly property real sideRoom: (target && target.parent)
+            ? (mine ? target.x : target.parent.width - target.x - target.width) : 0
+        readonly property bool stacked: !!target && (sideRoom - 10 - clearance) < implicitWidth
+
+        anchors.verticalCenter: (target && !reacted && !stacked) ? target.verticalCenter : undefined
+        anchors.bottom: (target && reacted && !stacked) ? target.bottom : undefined
+        anchors.top: (target && stacked) ? target.bottom : undefined
+        anchors.topMargin: 4
+
+        anchors.right: target ? (stacked ? (mine ? target.right : undefined)
+                                         : (mine ? target.left : undefined)) : undefined
+        anchors.left: target ? (stacked ? (mine ? undefined : target.left)
+                                        : (mine ? undefined : target.right)) : undefined
+        anchors.leftMargin: stacked ? 2 : 10 + clearance
+        anchors.rightMargin: stacked ? 2 : 10 + clearance
         Behavior on anchors.leftMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
         Behavior on anchors.rightMargin { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
         color: Theme.dim
