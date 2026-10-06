@@ -38,11 +38,46 @@ class Blocked(Exception):
 
 
 CGNAT = ipaddress.ip_network("100.64.0.0/10")        # tailnets live here
+NAT64 = ipaddress.ip_network("64:ff9b::/96")         # carries an IPv4 address in its low 32 bits
+
+
+def _embedded_v4(ip: ipaddress._BaseAddress):
+    """The IPv4 address an IPv6 address carries inside it, if it carries one.
+
+    `ipaddress` compares an address to a network of the other version as simply False rather
+    than raising, so `ip in CGNAT` quietly never fired for IPv6 and `::ffff:100.64.1.2` passed
+    as public. Connecting to it reaches 100.64.1.2, which is somebody's tailnet. Python's own
+    `is_private` does unwrap mapped addresses, which is why ::ffff:127.0.0.1 and
+    ::ffff:192.168.0.1 were already refused and only the hand-written CGNAT test had the hole.
+    Every IPv6 form that embeds IPv4 is unwrapped here, not just the mapped one.
+    """
+    if ip.version != 6:
+        return None
+    for attr in ("ipv4_mapped", "sixtofour"):
+        got = getattr(ip, attr, None)
+        if got is not None:
+            return got
+    teredo = getattr(ip, "teredo", None)
+    if teredo:
+        return teredo[1]                 # the client address, which is what gets reached
+    if ip in NAT64:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def _plain_public(ip: ipaddress._BaseAddress) -> bool:
+    if ip.version == 4 and ip in CGNAT:
+        return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified)
 
 
 def _is_public(ip: ipaddress._BaseAddress) -> bool:
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-                or ip.is_multicast or ip.is_unspecified or ip in CGNAT)
+    """Public in its own right, and public as whatever IPv4 address it may be wrapping."""
+    if not _plain_public(ip):
+        return False
+    inner = _embedded_v4(ip)
+    return inner is None or _plain_public(inner)
 
 
 def _resolve(host: str) -> tuple[int, str]:

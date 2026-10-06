@@ -528,6 +528,48 @@ class StandardInstallationTest(unittest.TestCase):
         self.assertIn("os.umask(0o077)", body)
 
 
+class LinkPreviewAddressTest(unittest.TestCase):
+    """A sender picks the hostname in a link, so a sender picks what the previewer resolves to.
+
+    `ipaddress` compares an address to a network of the other version as False rather than
+    raising, so `ip in CGNAT` never fired for IPv6 and `::ffff:100.64.1.2` passed as public
+    while the socket reached 100.64.1.2 on somebody's tailnet. Every IPv6 form that embeds an
+    IPv4 address is checked as that address now, not only the mapped one."""
+
+    PRIVATE = [
+        "100.64.1.2", "::ffff:100.64.1.2",        # CGNAT, plain and v4-mapped
+        "::ffff:127.0.0.1", "::ffff:192.168.1.5", "::ffff:10.0.0.1", "::ffff:169.254.1.1",
+        "2002:6440:0102::1",                      # 6to4 around 100.64.1.2
+        "64:ff9b::6440:102",                      # NAT64 around 100.64.1.2
+        "127.0.0.1", "192.168.1.1", "10.0.0.1", "169.254.1.1", "::1", "0.0.0.0",
+        "224.0.0.1", "fe80::1", "fc00::1",
+    ]
+    PUBLIC = ["8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8", "2001:4860:4860::8888", "2606:4700::1111"]
+
+    def test_private_and_embedded_private_are_refused(self):
+        from pearmsg.linkpreview import _is_public
+        import ipaddress
+        for text in self.PRIVATE:
+            with self.subTest(address=text):
+                self.assertFalse(_is_public(ipaddress.ip_address(text)),
+                                 f"{text} was treated as a public address")
+
+    def test_public_addresses_still_work(self):
+        from pearmsg.linkpreview import _is_public
+        import ipaddress
+        for text in self.PUBLIC:
+            with self.subTest(address=text):
+                self.assertTrue(_is_public(ipaddress.ip_address(text)),
+                                f"{text} was refused but is public")
+
+    def test_version_mismatch_cannot_silently_pass(self):
+        """The shape of the original bug: a v6 address tested against a v4 network."""
+        import ipaddress
+        from pearmsg.linkpreview import CGNAT
+        self.assertFalse(ipaddress.ip_address("::ffff:100.64.1.2") in CGNAT,
+                         "ipaddress now raises instead of returning False; revisit _is_public")
+
+
 if __name__ == "__main__":
     unittest.main()
 
