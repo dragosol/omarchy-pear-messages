@@ -1346,6 +1346,7 @@ ShellRoot {
                                                 SideTime {
                                                     target: img.visible ? img : fileChip
                                                     mine: msgItem.mine
+                                                    reacted: msgItem.reacts.length > 0
                                                     visible: msgItem.showTime && msgItem.m.text === ""
                                                              && attItem.index === (msgItem.m.attachments || []).length - 1
                                                     text: root.stampTime(msgItem.m.ts)
@@ -1401,6 +1402,7 @@ ShellRoot {
                                             SideTime {
                                                 target: bubble
                                                 mine: msgItem.mine
+                                                reacted: msgItem.reacts.length > 0
                                                 visible: msgItem.showTime
                                                 text: root.stampTime(msgItem.m.ts)
                                             }
@@ -2781,7 +2783,14 @@ ShellRoot {
         textFormat: Text.PlainText
         property Item target
         property bool mine
-        anchors.verticalCenter: target ? target.verticalCenter : undefined
+        // A reaction chip hangs off the same side of the bubble that this sits on, overlapping
+        // that column by 14px with one reaction and more with several. Centred on a one-line
+        // bubble the two clear each other by a single pixel, so a larger caption font or a
+        // tighter bubble is enough to make them collide. The chip is pinned to the bubble's
+        // top, so for a reacted message the time goes to the bottom edge, where nothing is.
+        property bool reacted: false
+        anchors.verticalCenter: (target && !reacted) ? target.verticalCenter : undefined
+        anchors.bottom: (target && reacted) ? target.bottom : undefined
         anchors.right: mine && target ? target.left : undefined
         anchors.left: !mine && target ? target.right : undefined
         anchors.leftMargin: 10

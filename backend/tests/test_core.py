@@ -448,6 +448,61 @@ class QmlTextFormatTest(unittest.TestCase):
         self.assertIn("&lt;img", escape_html(evil))
 
 
+class StandardInstallationTest(unittest.TestCase):
+    """The marketplace only offers a plain copy-paste install for a listing whose baseline has
+    no capabilities beyond `installer`. `privilege`, `package-manager` and `service-management`
+    are all triggered by prose and scripts rather than by behaviour, so they come back easily.
+    These pin the three that were removed in 1.1.0."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def _text(self, *names):
+        out = {}
+        for name in names:
+            path = os.path.join(self.ROOT, name)
+            if os.path.exists(path):
+                with open(path, errors="replace") as fh:
+                    out[name] = fh.read()
+        return out
+
+    def test_no_service_manager_anywhere(self):
+        """A systemd unit, or any systemctl call, reinstates `service-management`."""
+        self.assertFalse(os.path.exists(os.path.join(self.ROOT, "systemd")),
+                         "the systemd/ folder is back")
+        for name, body in self._text("install.sh", "uninstall.sh", "README.md").items():
+            for n, line in enumerate(body.split("\n"), 1):
+                if line.strip().startswith("#"):
+                    continue
+                self.assertNotIn("systemctl", line, f"{name}:{n} calls systemctl: {line.strip()}")
+
+    def test_no_package_manager_or_privilege_prose(self):
+        """`sudo pacman -S ...` in a README is enough for both capabilities; Omarchy already
+        ships every dependency, so there is nothing to tell anyone to install."""
+        for name, body in self._text("install.sh", "uninstall.sh", "README.md").items():
+            low = body.lower()
+            self.assertNotIn("pacman", low, f"{name} mentions pacman")
+            for n, line in enumerate(body.split("\n"), 1):
+                if "sudo" in line or "pkexec" in line:
+                    self.assertTrue(
+                        "no elevated" in line or "never" in line,
+                        f"{name}:{n} has un-negated privilege prose: {line.strip()}")
+
+    def test_the_plugin_runs_the_daemon(self):
+        """With no unit file, the service plugin is what keeps pear-messagesd alive."""
+        with open(os.path.join(self.ROOT, "plugin", "Service.qml")) as fh:
+            qml = fh.read()
+        self.assertIn('"pearmsg", "daemon"', qml, "Service.qml no longer starts the daemon")
+        self.assertIn("workingDirectory", qml)
+        self.assertIn("Timer", qml, "nothing restarts the daemon after it exits")
+
+    def test_daemon_sets_its_own_umask(self):
+        """UMask=0077 came from the unit file. Losing it silently would undo the journal and
+        cache permission fixes' backstop."""
+        with open(os.path.join(self.ROOT, "backend", "pearmsg", "daemon.py")) as fh:
+            body = fh.read()
+        self.assertIn("os.umask(0o077)", body)
+
+
 if __name__ == "__main__":
     unittest.main()
 

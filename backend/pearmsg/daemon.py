@@ -1346,6 +1346,10 @@ def _quiet(fn, *a):
 
 
 def main() -> None:
+    # The systemd unit used to carry UMask=0077 and this service no longer has one: the plugin
+    # starts it with the shell. Every path that writes private data already sets its own mode,
+    # but the umask was the backstop under all of them, so it is set here instead of being lost.
+    os.umask(0o077)
     Daemon().run()
 
 

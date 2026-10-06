@@ -122,21 +122,21 @@ cd ~/.config/omarchy/plugins/io.github.dragosol.pear-messages
 Then search **Pear Messages** in the launcher. The first launch opens Settings, where the
 connection assistant sets up either connection, or both.
 
-`install.sh` runs as your user and never uses sudo. It installs, all under your home directory:
+`install.sh` runs as your user and needs no elevated privileges. It installs, all under your
+home directory:
 
 | What | Where |
 | --- | --- |
 | The background service (Python) | `~/.local/share/pear-messages/backend` |
 | The app window (Quickshell) | `~/.local/share/pear-messages/app` |
 | The launcher | `~/.local/share/applications/pear-messages.desktop` |
-| The service's systemd user unit | `~/.config/systemd/user/pear-messages.service` |
 
-Requirements: `python3`, `python-dbus`, `python-gobject` and `quickshell`, plus `bluez-obex` for
-the iPhone connection:
+It installs no system service. The background service is started and kept running by the
+plugin itself, as part of your Omarchy shell, and stops when you log out.
 
-```bash
-sudo pacman -S --needed python-dbus python-gobject bluez-obex
-```
+Requirements: `python3`, `python-dbus`, `python-gobject`, `quickshell` and `bluez-obex` for the
+iPhone connection. Omarchy already ships all of them, so there is nothing to install. `ffmpeg`,
+also already present, is used for video thumbnails.
 
 After `omarchy plugin update`, run `./install.sh` again to pick up the new version.
 `./uninstall.sh` removes it and keeps your messages and settings; add `--purge` to delete those too.
@@ -157,20 +157,8 @@ Settings. Most often a permission prompt is waiting on the Mac and nobody can an
 screen is locked. Unlock the Mac, answer the prompt, and keep it from locking while it's serving
 BlueBubbles.
 
-On Tailscale, you can make the server answer *only* over Tailscale with a firewall rule on the
-Mac. BlueBubbles itself always listens on every network:
-
-```
-# /etc/pf.anchors/bluebubbles-tailscale
-pass in quick on lo0 proto tcp to port 1234
-pass in quick inet  proto tcp from 100.64.0.0/10 to port 1234
-pass in quick inet6 proto tcp from fd7a:115c:a1e0::/48 to port 1234
-block drop in quick proto tcp to port 1234
-```
-
-```bash
-sudo pfctl -a com.apple/250.bluebubbles -f /etc/pf.anchors/bluebubbles-tailscale && sudo pfctl -E
-```
+Want BlueBubbles to answer *only* over Tailscale? It always listens on every network, and a
+firewall rule on the Mac can narrow that: see [docs/bluebubbles-tailscale.md](docs/bluebubbles-tailscale.md). It is optional and changes nothing on this computer.
 
 ### Setting up the iPhone
 
@@ -188,7 +176,7 @@ The iPhone stays paired like any Bluetooth device. It reconnects by itself whene
 
 ```
  Pear Messages window  ──socket──  pear-messagesd  ──HTTP──────────▶  BlueBubbles Server (Mac)
-   (Quickshell)                    (systemd user)  ──Bluetooth MAP──▶  iPhone: messages
+   (Quickshell)                 (run by the plugin)  ──Bluetooth MAP──▶  iPhone: messages
                                          │         ──Bluetooth PBAP─▶  iPhone: contacts
                                    messages.db
 ```

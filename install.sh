@@ -5,7 +5,7 @@
 #   ~/.local/share/pear-messages/backend   the service (Python, standard library + system D-Bus bindings)
 #   ~/.local/share/pear-messages/app       the app window (Quickshell), copied from ./app
 #   ~/.local/share/applications/pear-messages.desktop   the "Pear Messages" launcher
-#   ~/.config/systemd/user/pear-messages.service        runs the service in your session
+# It installs no system service: the plugin starts pear-messagesd with your Omarchy shell.
 # Your messages live in ~/.local/share/pear-messages/messages.db and your settings in
 # ~/.config/pear-messages; this script never touches either.
 #
@@ -15,7 +15,6 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 data="$HOME/.local/share/pear-messages"
 apps="$HOME/.local/share/applications"
-units="$HOME/.config/systemd/user"
 omarchy_shell="/usr/share/omarchy/shell"
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
@@ -24,13 +23,13 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not root - nothing here needs root"
 
-for cmd in python3 quickshell systemctl; do
+for cmd in python3 quickshell; do
   command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
 done
 [ -d "$omarchy_shell/Ui" ] && [ -d "$omarchy_shell/Commons" ] \
   || die "Omarchy's shell components were not found in $omarchy_shell"
 python3 -c 'import dbus, gi; gi.require_version("GLib", "2.0"); from gi.repository import GLib' 2>/dev/null \
-  || die "the D-Bus bindings for Python are missing: sudo pacman -S --needed python-dbus python-gobject"
+  || die "the D-Bus bindings for Python are missing (python-dbus, python-gobject)"
 # Notifications go over D-Bus (org.freedesktop.Notifications), not by running notify-send, so
 # message text never reaches a command line. Any notification daemon that owns that name works.
 python3 -c "import dbus,dbus.mainloop.glib" >/dev/null 2>&1 ||
@@ -40,10 +39,10 @@ missing_obex=0
 if [ ! -x /usr/lib/bluetooth/obexd ]; then
   missing_obex=1
   warn "bluez-obex is not installed. BlueBubbles works without it; the iPhone-over-Bluetooth"
-  warn "connection needs it:  sudo pacman -S --needed bluez-obex"
+  warn "connection needs it. Omarchy normally ships it."
 fi
 
-mkdir -p "$data" "$apps" "$units"
+mkdir -p "$data" "$apps"
 # Your messages live under $data. Make the directory private before anything is written into
 # it, so a journal or temporary file cannot be read by another account on this machine.
 chmod 700 "$data"
@@ -84,16 +83,11 @@ Keywords=imessage;messages;sms;text;chat;iphone;bluebubbles;pear;
 DESKTOP
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$apps" || true
 
-say "Starting the Pear Messages service"
-install -m 644 "$here/systemd/pear-messages.service" "$units/"
-systemctl --user daemon-reload
-[ "$missing_obex" -eq 1 ] || systemctl --user enable --now obex.service >/dev/null 2>&1 || true
-systemctl --user enable pear-messages.service
-systemctl --user restart pear-messages.service
-
 cat <<DONE
 
 Pear Messages is installed. Open it from the launcher: search "Pear Messages".
+The background service starts with your Omarchy shell; reload it, or log out and back in,
+to pick this version up.
 The first launch opens Settings, where the connection assistant sets up BlueBubbles
 and/or pairs your iPhone.
 DONE

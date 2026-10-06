@@ -7,9 +7,10 @@ set -euo pipefail
 
 data="$HOME/.local/share/pear-messages"
 
-systemctl --user disable --now pear-messages.service 2>/dev/null || true
+# Older versions installed a systemd user unit; this one does not. Remove it if it is there,
+# without needing any service manager to be present.
 rm -f "$HOME/.config/systemd/user/pear-messages.service"
-systemctl --user daemon-reload
+pkill -f "pearmsg daemon" 2>/dev/null || true
 rm -f "$HOME/.local/share/applications/pear-messages.desktop"
 rm -rf "$data/app" "$data/backend"
 rm -rf "$HOME/.cache/pear-messages"
