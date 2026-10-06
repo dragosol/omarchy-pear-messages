@@ -25,7 +25,11 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# The service should already be running; start it if not (it is what the window talks to).
-systemctl --user start pear-messages.service >/dev/null 2>&1 || true
+# The service normally starts with the Omarchy shell, which is what runs it now. If its socket
+# is not there - the plugin is not loaded, or this ran before the shell came up - start the same
+# process here. No service manager is involved either way.
+if [ ! -S "$run/sock" ]; then
+  (cd "$backend" && exec python3 -B -u -m pearmsg daemon >/dev/null 2>&1) &
+fi
 
 PEAR_MESSAGES_OPEN="$thread" exec quickshell -p "$here"

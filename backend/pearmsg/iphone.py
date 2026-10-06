@@ -16,6 +16,8 @@ All D-Bus calls here are asynchronous; the daemon's GLib loop never waits on the
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import tempfile
 import time
 
@@ -84,6 +86,27 @@ def list_phones(bus: dbus.SystemBus) -> list[dict]:
             out.append({"address": str(d.get("Address")), "name": str(d.get("Alias") or d.get("Name") or ""),
                         "connected": bool(d.get("Connected")), "path": str(path)})
     return out
+
+
+def _restart_obexd() -> None:
+    """Bring obexd back after its MAP server wedges, without a service manager.
+
+    obexd is D-Bus activated on org.bluez.obex, so ending the process is enough: the next call
+    into that name starts a fresh one. This used to go through the user service manager,
+    which did the same thing by a longer route and made the plugin look as though it
+    manages system services. Only this user's own obexd is signalled, and none running
+    is not an error.
+    """
+    try:
+        found = subprocess.run(["pgrep", "-x", "-u", str(os.getuid()), "obexd"],
+                               capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return
+    for pid in found.stdout.split():
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
 
 
 class AudioGuard:
@@ -474,7 +497,7 @@ class Phone:
         self.log(f"MAP session broken: {why}; restarting obexd")
         self.session = ""
         self._status("connecting", "Reconnecting to the iPhone")
-        os.system("systemctl --user restart obex.service >/dev/null 2>&1")
+        _restart_obexd()
         self.tries += 1
         self._schedule(4)
 

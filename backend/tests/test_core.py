@@ -465,27 +465,52 @@ class StandardInstallationTest(unittest.TestCase):
                     out[name] = fh.read()
         return out
 
+    SKIP_DIRS = {".git", "__pycache__", "node_modules"}
+
+    def _repo_files(self):
+        """Every tracked text file. The first version of this test looked at three files by
+        name and so could not see the three systemctl calls that survived in app/launch.sh,
+        backend/pearmsg/__main__.py and backend/pearmsg/iphone.py. A guard that names its own
+        haystack only proves what it was already looking at."""
+        for base, dirs, names in os.walk(self.ROOT):
+            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+            for name in names:
+                if name.endswith((".png", ".jpg", ".webp", ".svg", ".mp4", ".db")):
+                    continue
+                path = os.path.join(base, name)
+                rel = os.path.relpath(path, self.ROOT)
+                if rel.startswith("backend/tests"):
+                    continue
+                try:
+                    with open(path, errors="replace") as fh:
+                        yield rel, fh.read()
+                except OSError:
+                    continue
+
     def test_no_service_manager_anywhere(self):
-        """A systemd unit, or any systemctl call, reinstates `service-management`."""
+        """A systemd unit, or any systemctl call anywhere in the repository, reinstates
+        `service-management`. The marketplace cites prose and scripts alike."""
         self.assertFalse(os.path.exists(os.path.join(self.ROOT, "systemd")),
                          "the systemd/ folder is back")
-        for name, body in self._text("install.sh", "uninstall.sh", "README.md").items():
+        hits = []
+        for rel, body in self._repo_files():
             for n, line in enumerate(body.split("\n"), 1):
-                if line.strip().startswith("#"):
-                    continue
-                self.assertNotIn("systemctl", line, f"{name}:{n} calls systemctl: {line.strip()}")
+                if "systemctl" in line:
+                    hits.append(f"{rel}:{n} {line.strip()[:70]}")
+        self.assertEqual(hits, [], "systemctl appears in:\n" + "\n".join(hits))
 
     def test_no_package_manager_or_privilege_prose(self):
         """`sudo pacman -S ...` in a README is enough for both capabilities; Omarchy already
         ships every dependency, so there is nothing to tell anyone to install."""
-        for name, body in self._text("install.sh", "uninstall.sh", "README.md").items():
-            low = body.lower()
-            self.assertNotIn("pacman", low, f"{name} mentions pacman")
+        bad = []
+        for rel, body in self._repo_files():
             for n, line in enumerate(body.split("\n"), 1):
-                if "sudo" in line or "pkexec" in line:
-                    self.assertTrue(
-                        "no elevated" in line or "never" in line,
-                        f"{name}:{n} has un-negated privilege prose: {line.strip()}")
+                if "pacman" in line:
+                    bad.append(f"{rel}:{n} pacman: {line.strip()[:60]}")
+                if ("sudo" in line or "pkexec" in line) and not (
+                        "no elevated" in line or "never" in line):
+                    bad.append(f"{rel}:{n} privilege: {line.strip()[:60]}")
+        self.assertEqual(bad, [], "package-manager/privilege triggers:\n" + "\n".join(bad))
 
     def test_the_plugin_runs_the_daemon(self):
         """With no unit file, the service plugin is what keeps pear-messagesd alive."""
