@@ -570,6 +570,47 @@ class LinkPreviewAddressTest(unittest.TestCase):
                          "ipaddress now raises instead of returning False; revisit _is_public")
 
 
+class LinkifyEscapingTest(unittest.TestCase):
+    """linkify() drops the matched URL into href="...", and its URL pattern allows a quote in
+    the middle, so escaping only < > & let a sender close the attribute and add their own.
+    style="background-image:url(...)" then fetches with no click and without the link
+    previewer's address checks running at all."""
+
+    import re as _re
+    ESCAPE = _re.compile(r"function escapeHtml\(s\) \{(.+?)\n    \}", _re.S)
+
+    def _escape_body(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")
+        with open(path) as fh:
+            found = self.ESCAPE.search(fh.read())
+        self.assertIsNotNone(found, "escapeHtml() is gone or was renamed")
+        return found.group(1)
+
+    def test_quotes_are_escaped(self):
+        body = self._escape_body()
+        for pattern, entity in (('/"/g', "&quot;"), ("/'/g", "&#39;")):
+            self.assertIn(pattern, body, f"escapeHtml no longer escapes {pattern}")
+            self.assertIn(entity, body)
+
+    def test_ampersand_is_escaped_first(self):
+        """&quot; and &#39; introduce an ampersand, so & has to be replaced before them or the
+        entities get double-escaped."""
+        body = self._escape_body()
+        self.assertLess(body.index("/&/g"), body.index('/"/g'),
+                        "& must be escaped before the entity replacements")
+
+    def test_the_injection_payload_cannot_escape_the_attribute(self):
+        """Mirror of linkify in Python, run against the payload the review described."""
+        def escape(s):
+            return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                     .replace('"', "&quot;").replace("'", "&#39;"))
+        payload = 'look http://a/x"style="background-image:url(http://127.0.0.1/x.png)"y end'
+        escaped = escape(payload)
+        self.assertNotIn('"', escaped, "a bare quote survived escaping")
+        href = f'<a href="{escaped}">'
+        self.assertEqual(href.count('"'), 2, "the href attribute is no longer a single value")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -587,8 +587,14 @@ ShellRoot {
         if (days < 7) return Qt.formatDate(d, "dddd") + " " + t;
         return Qt.formatDate(d, "d MMM yyyy") + " " + t;
     }
+    // & first, because the replacements below introduce one. Quotes matter as much as angle
+    // brackets here: linkify drops the matched URL into href="...", and the URL pattern allows
+    // a quote in the middle, so a sender could close the attribute and add their own -
+    // style="background-image:url(...)" fetches without a click and without the link
+    // previewer's address checks ever running.
     function escapeHtml(s) {
-        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
     function linkify(s, color) {
         return escapeHtml(s).replace(/(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g,
