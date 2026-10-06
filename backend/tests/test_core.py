@@ -611,6 +611,75 @@ class LinkifyEscapingTest(unittest.TestCase):
         self.assertEqual(href.count('"'), 2, "the href attribute is no longer a single value")
 
 
+class TapbackLanguageTest(unittest.TestCase):
+    """iOS sends a reaction over Bluetooth as a sentence in the phone's language, and it names
+    the reaction in its own quotes: "a attribué la mention « Aime » à « … »". The bare word is
+    what arrives, without the verb, so a pattern needing "j'aime" missed it and the whole
+    sentence was shown as an ordinary message instead of a reaction."""
+
+    REAL = ("a attribué la mention « Aime » à "
+            "« good emphasis on the being open to other opportunities »")
+
+    def test_the_reported_french_message_is_a_reaction(self):
+        from pearmsg.tapback import parse
+        got = parse(self.REAL)
+        self.assertIsNotNone(got, "the French 'Aime' form is still read as a plain message")
+        self.assertEqual(got.kind, "like")
+        self.assertEqual(got.quoted, "good emphasis on the being open to other opportunities")
+
+    def test_named_reactions_across_languages(self):
+        from pearmsg.tapback import parse
+        for text, kind in [
+            ("a attribué la mention « Aime » à « hi »", "like"),
+            ("a attribué la mention « Adore » à « hi »", "love"),
+            ("a attribué la mention « Haha » à « hi »", "laugh"),
+            ("a attribué la mention « Je n’aime pas » à « hi »", "dislike"),
+            ("Liked “hi”", "like"),
+            ("Le gusta «hi»", "like"),
+        ]:
+            with self.subTest(text=text):
+                got = parse(text)
+                self.assertIsNotNone(got, f"not recognised: {text}")
+                self.assertEqual(got.kind, kind, f"wrong reaction for: {text}")
+
+    def test_dislike_is_still_checked_before_like(self):
+        """'Je n'aime pas' contains 'aime'; the order in KINDS is what keeps it a dislike."""
+        from pearmsg.tapback import parse
+        self.assertEqual(parse("a attribué la mention « Je n’aime pas » à « hi »").kind, "dislike")
+
+    def test_an_ordinary_sentence_is_not_a_reaction(self):
+        from pearmsg.tapback import parse
+        self.assertIsNone(parse("I really aime this restaurant"))
+
+
+class ReactionChipLayoutTest(unittest.TestCase):
+    """The chip is pinned to the bubble's top edge and is 34 tall. The row has to reserve that
+    height above the bubble, or the chip hangs out of its own row and is drawn over the message
+    above it. 18 reserved against 26 needed left 8px of it on the previous bubble."""
+
+    CHIP_HEIGHT = 34
+    OVERLAP = 8          # how much of the chip should sit over its own bubble
+
+    def _shell(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")
+        with open(path) as fh:
+            return fh.read()
+
+    def test_the_row_reserves_the_whole_chip(self):
+        body = self._shell()
+        found = re.search(r"height: bubble\.height \+ \(msgItem\.reacts\.length \? (\d+) : 0\)", body)
+        self.assertIsNotNone(found, "the reacted-row height rule is gone or was rewritten")
+        reserve = int(found.group(1))
+        self.assertGreaterEqual(reserve, self.CHIP_HEIGHT - self.OVERLAP,
+                                f"{reserve}px reserved for a {self.CHIP_HEIGHT}px chip lets it "
+                                f"protrude onto the message above")
+
+    def test_the_chip_is_not_anchored_above_its_row(self):
+        body = self._shell()
+        for found in re.finditer(r"anchors\.topMargin: (-\d+)", body):
+            self.fail(f"a negative topMargin ({found.group(1)}) puts an element outside its row")
+
+
 if __name__ == "__main__":
     unittest.main()
 

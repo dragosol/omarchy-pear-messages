@@ -28,7 +28,11 @@ KINDS = [
     ("", r"\bremoved\b|supprim|retir[ée]|elimin[óo]|entfernt|rimoss|a eliminat|a retras|verwijderd"),
     ("dislike", r"disliked|n[’']aime pas|no le gust|gefällt .*nicht|nicht gefallen|non mi piace|nu (i )?a (mai )?plăcut|👎|dislike"),
     ("love", r"\bloved\b|adore|encant|geliebt|\bliebt\b|ha amato|adorat|iubit|❤|♥|\bheart\b|cœur|coraz[óo]n"),
-    ("like", r"\bliked\b|j[’']aime|gust[óo]|gefällt|mi piace|ha apprezzato|apreciat|a plăcut|👍"),
+    # iOS names the reaction in its own quotes - "a attribué la mention « Aime » à « … »" -
+    # so the bare word appears without the verb around it. j'aime alone missed that, and the
+    # whole sentence then rendered as an ordinary message. Dislike is still checked first, so
+    # "Je n'aime pas" cannot be read as "Aime".
+    ("like", r"\bliked\b|j[’']aime|\baime\b|gust[aóo]|gefällt|mi piace|ha apprezzato|apreciat|a plăcut|👍"),
     ("laugh", r"laughed|ha ?ha|ja ?ja|rió|lachte|gelacht|riso|risata|râs|😂|\blaugh"),
     ("emphasize", r"emphasi[sz]ed|!!|‼|soulign|enfatiz|hervorgehoben|betont|evidenziat|subliniat|exclamation"),
     ("question", r"questioned|\?|pregunt|frag|domand|întreb|question"),

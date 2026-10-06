@@ -1403,7 +1403,11 @@ ShellRoot {
                                             id: bubbleRow
                                             visible: msgItem.m.text !== ""
                                             width: parent.width
-                                            height: bubble.height + (msgItem.reacts.length ? 18 : 0)
+                                            // The chip is 34 tall and sits on the bubble's top edge. It needs
+                                            // its full height reserved above the bubble or it hangs out of this
+                                            // row and lands on the message above: 18 reserved against 26 needed
+                                            // left exactly 8px of it overlapping the previous bubble.
+                                            height: bubble.height + (msgItem.reacts.length ? 26 : 0)
                                             HoverHandler { id: bubbleHover }
                                             SideTime {
                                                 target: bubble
@@ -1587,7 +1591,10 @@ ShellRoot {
                                             Rectangle {
                                                 visible: msgItem.reacts.length > 0
                                                 anchors.top: parent.top
-                                                anchors.topMargin: -8
+                                                // 0, not -8: the row now reserves the chip's height, so the 8px
+                                                // of it that should sit over the bubble comes from the reserve
+                                                // rather than from the message above.
+                                                anchors.topMargin: 0
                                                 x: msgItem.mine ? bubble.x - width + 14 : bubble.x + bubble.width - 14
                                                 height: 34
                                                 width: Math.max(height, reactRow.implicitWidth + 16)
