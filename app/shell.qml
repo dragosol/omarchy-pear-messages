@@ -44,6 +44,44 @@ ShellRoot {
     property int reqId: 1
 
     // reactions / effects / previews
+    // The conversation's list draws from msgModel, which holds only message ids and is changed
+    // row by row: a new message is one inserted row, a status change touches no row at all. Giving
+    // the list a fresh array instead (as every update used to) made Qt throw away and rebuild every
+    // row - the whole conversation flickered on each send, and rebuilding while the previous
+    // rebuild was still releasing rows is where the app crashed (QQuickItemView::setModel).
+    // root.msgs stays the plain array everything else reads; msgMap is id -> message.
+    property var msgMap: ({})
+    ListModel { id: msgModel }
+    // ids of the messages arriving in the current update, so only their rows rise in (see the
+    // delegate's `rise`); cleared once the rows exist
+    property var arriving: ({})
+    property bool animateNew: false
+    onMsgsChanged: syncMsgModel()
+    function syncMsgModel() {
+        const want = root.msgs;
+        const map = {};
+        for (const m of want) map[m.id] = m;
+        root.msgMap = map;
+        // a different conversation: start the rows over in one go
+        let overlap = false;
+        for (let i = 0; i < msgModel.count && !overlap; i++) overlap = msgModel.get(i).mid in map;
+        if (!overlap) {
+            msgModel.clear();
+            for (const m of want) msgModel.append({ mid: m.id });
+            return;
+        }
+        for (let i = msgModel.count - 1; i >= 0; i--)
+            if (!(msgModel.get(i).mid in map)) msgModel.remove(i);
+        for (let i = 0; i < want.length; i++) {
+            const id = want[i].id;
+            if (i < msgModel.count && msgModel.get(i).mid === id) continue;
+            let j = -1;
+            for (let k = i + 1; k < msgModel.count; k++) if (msgModel.get(k).mid === id) { j = k; break; }
+            if (j >= 0) msgModel.move(j, i, 1);
+            else msgModel.insert(i, { mid: id });
+        }
+        while (msgModel.count > want.length) msgModel.remove(msgModel.count - 1);
+    }
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
     // An inline-reply thread, open over the conversation: {message (the id it was opened
     // from), root (guid of the message that began the thread), messages (root first), loading}.
@@ -508,8 +546,23 @@ ShellRoot {
             if (changed) {
                 next.sort((a, b) => a.ts - b.ts);
                 const atEnd = list.followEnd || list.atYEnd || list.contentHeight <= list.height;
-                root.msgs = next;
-                if (atEnd) list.stickToEnd();
+                const had = new Set(root.msgs.map(m => m.id));
+                const arriving = next.some(m => !had.has(m.id));
+                if (atEnd && arriving) {
+                    // The rows are laid out on the next frame, which is when the list starts the
+                    // add transition and works out its new height. Until then: animate, and don't
+                    // jump to the end - slideToEnd glides there.
+                    root.animateNew = true;
+                    const arr = {};
+                    for (const m of next) if (!had.has(m.id)) arr[m.id] = true;
+                    root.arriving = arr;
+                    list.sliding = true;
+                    root.msgs = next;
+                    list.slideToEnd();
+                } else {
+                    root.msgs = next;
+                    if (atEnd) list.followEnd = true;
+                }
                 if (root.focused && root.onScreen) root.send({ op: "view", thread: root.onScreen, active: true });
             }
             break;
@@ -1192,7 +1245,7 @@ ShellRoot {
                                 anchors.leftMargin: 16
                                 anchors.rightMargin: 16
                                 clip: true
-                                model: root.msgs
+                                model: msgModel
                                 // rows above the view stay laid out, so their heights are real, not estimates
                                 cacheBuffer: 2400
                                 spacing: 3
@@ -1296,6 +1349,35 @@ ShellRoot {
                 // Pinning to the end while a long conversation is still being laid out can leave the
                 // list at the right place with nothing drawn. So pin, then pin again as it settles.
                 function stickToEnd() { followEnd = true; msgPhys.stopPhysics(); settle.left = 8; settle.restart(); }
+                // A message just arrived at the bottom: glide up to it while it rises into place,
+                // rather than jumping. Starts once the new row is laid out.
+                property bool sliding: false
+                function slideToEnd() {
+                    followEnd = true;
+                    msgPhys.stopPhysics();
+                    slideStart.restart();
+                }
+                // one frame on, once the new row exists and has its height
+                Timer {
+                    id: slideStart
+                    interval: 16
+                    onTriggered: {
+                        list.forceLayout();
+                        root.animateNew = false;
+                        root.arriving = ({});
+                        slide.from = list.contentY;
+                        slide.to = msgPhys.maxY;
+                        if (slide.to > slide.from + 0.5) slide.restart();
+                        else { list.sliding = false; list.followGrowth(); }
+                    }
+                }
+                NumberAnimation {
+                    id: slide
+                    target: list; property: "contentY"
+                    duration: 300; easing.type: Easing.OutCubic
+                    // anything that grew meanwhile (a photo, a Big text effect) is caught up at the end
+                    onFinished: { list.sliding = false; if (list.followEnd) list.followGrowth(); }
+                }
                 function pinEnd() { list.forceLayout(); list.positionViewAtEnd(); }
                 // Glide back to the newest message. From far up, jump most of the way first so
                 // the glide is a short, readable one rather than a blur through the history.
@@ -1365,8 +1447,8 @@ ShellRoot {
                 // rows holding an open hover time (counted by the rows themselves)
                 property int holdView: 0
                 onHoldViewChanged: if (holdView === 0 && followEnd && !msgPhys.busy && !settle.running) followGrowth()
-                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running && holdView === 0) followGrowth()
-                onOriginYChanged: if (followEnd && !msgPhys.busy && !settle.running && holdView === 0) followGrowth()
+                onContentHeightChanged: if (followEnd && !msgPhys.busy && !settle.running && !list.sliding && holdView === 0) followGrowth()
+                onOriginYChanged: if (followEnd && !msgPhys.busy && !settle.running && !list.sliding && holdView === 0) followGrowth()
                 onHeightChanged: if (followEnd && !msgPhys.busy) followGrowth()
                 // Pinned to the newest message unless YOU scroll away: only your own scrolling
                 // (wheel, touchpad, the scrollbar) un-pins or re-pins it. A new message, a photo
@@ -1376,7 +1458,10 @@ ShellRoot {
                 Connections {
                     target: msgPhys
                     // a coast or bounce has just settled: where did it leave the view?
-                    function onBusyChanged() { if (!msgPhys.busy && !toBottom.running) list.checkPin(); }
+                    function onBusyChanged() {
+                        if (msgPhys.busy) { slide.stop(); list.sliding = false; }   // your own scrolling takes over
+                        else if (!toBottom.running) list.checkPin();
+                    }
                 }
                 Connections {
                     target: msgBar
@@ -1391,9 +1476,19 @@ ShellRoot {
 
                                 delegate: Item {
                                     id: msgItem
-                                    required property var modelData
+                                    required property int mid
                                     required property int index
-                                    readonly property var m: modelData
+                                    readonly property var m: root.msgMap[mid] || ({ id: mid, attachments: [], reactions: {}, text: "" })
+                                    // A message that has just arrived rises into place from below and fades in
+                                    // while the conversation glides up to it (list.slideToEnd). A visual offset
+                                    // only: the row's real position and height never move.
+                                    transform: Translate { id: rise }
+                                    ParallelAnimation {
+                                        id: riseIn
+                                        NumberAnimation { target: rise; property: "y"; from: 46; to: 0; duration: 340; easing.type: Easing.OutCubic }
+                                        NumberAnimation { target: msgItem; property: "opacity"; from: 0; to: 1; duration: 260; easing.type: Easing.OutQuad }
+                                    }
+                                    Component.onCompleted: if (root.arriving[mid]) riseIn.start()
                                     readonly property bool mine: m.fromMe
                                     readonly property var prev: index > 0 ? root.msgs[index - 1] : null
                                     readonly property bool showStamp: !prev || m.ts - prev.ts > 1800
@@ -2653,6 +2748,30 @@ ShellRoot {
                                         }
                                         color: typing.active ? "transparent" : Theme.fg
                                         selectedTextColor: typing.active ? "transparent" : Theme.fg
+                                        // Our own cursor. The field's text is transparent while the typing
+                                        // animation draws the letters, and the built-in cursor is drawn in the
+                                        // text's colour, so it all but disappeared. A soft blink, solid while
+                                        // you type.
+                                        cursorDelegate: Rectangle {
+                                            id: caret
+                                            width: 2
+                                            radius: 1
+                                            color: Theme.fg
+                                            visible: composer.cursorVisible
+                                            SequentialAnimation on opacity {
+                                                id: blink
+                                                running: caret.visible
+                                                loops: Animation.Infinite
+                                                PauseAnimation { duration: 500 }
+                                                NumberAnimation { to: 0; duration: 180; easing.type: Easing.InOutQuad }
+                                                PauseAnimation { duration: 320 }
+                                                NumberAnimation { to: 1; duration: 180; easing.type: Easing.InOutQuad }
+                                            }
+                                            Connections {
+                                                target: composer
+                                                function onCursorPositionChanged() { caret.opacity = 1; blink.restart(); }
+                                            }
+                                        }
                                         font.family: Theme.uiFont
                                         font.pixelSize: Theme.fBody
                                         selectByMouse: true

@@ -901,6 +901,37 @@ class HoverTimeLayoutTest(unittest.TestCase):
         self.assertIn("id: reactBtn", self._shell(), "reactBtn lost its id")
 
 
+class MessageListModelTest(unittest.TestCase):
+    """Two crashes on 2026-10-07 (SIGSEGV in QQuickItemView::setModel from a socket read) and a
+    flicker on every send had one cause: each update gave the message list a new array as its
+    model, so Qt rebuilt every row. The list draws from a ListModel of ids changed row by row."""
+
+    def _shell(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")) as fh:
+            return fh.read()
+
+    def test_the_list_is_not_given_a_fresh_array(self):
+        body = self._shell()
+        self.assertNotIn("model: root.msgs", body, "the message list is bound to the array again")
+        self.assertIn("model: msgModel", body)
+        sync = re.search(r"function syncMsgModel\(\) \{(.*?)\n    \}", body, re.S)
+        self.assertIsNotNone(sync, "syncMsgModel is gone")
+        for op in ("msgModel.insert(", "msgModel.remove(", "msgModel.move("):
+            self.assertIn(op, sync.group(1), f"the sync no longer uses {op}")
+
+    def test_rows_read_their_message_by_id(self):
+        body = self._shell()
+        self.assertIn("required property int mid", body)
+        self.assertIn("root.msgMap[mid]", body)
+
+    def test_new_messages_rise_in_without_moving_the_layout(self):
+        body = self._shell()
+        self.assertIn("transform: Translate { id: rise }", body, "the arrival is no longer a visual offset")
+        self.assertIn("if (root.arriving[mid]) riseIn.start()", body)
+        self.assertIn("!list.sliding && holdView === 0) followGrowth()", body,
+                      "growth jumps to the end during the glide")
+
+
 class RedirectBodyLimitTest(unittest.TestCase):
     """Only the final response was capped at MAX_BYTES. urllib's redirect handler drains each
     hop with a bare fp.read() first, which has no limit, so a sender's link answering 302 with

@@ -41,9 +41,12 @@ Item {
         const removed = before.length - a - b;
         const added = now.length - a - b;
         // the gone ones leave as ghosts, from where they were
+        // (from where each letter was last drawn: by now the text has changed, and asking the
+        // field where a removed letter was is asking for a position that may no longer exist -
+        // clearing the box after a send asked for every one of them)
         for (let k = 0; k < removed && k < 40; k++) {
-            const r = field.positionToRectangle(before[a + k].at);
-            ghosts.append({ ch: before[a + k].ch, gx: r.x, gy: r.y, gh: r.height, key: nextKey++ });
+            const r = before[a + k].rect;
+            if (r) ghosts.append({ ch: before[a + k].ch, gx: r.x, gy: r.y, gh: r.height, key: nextKey++ });
         }
         // the new layout first, so every letter reads its place from the text as it is now
         graphemes = now;
@@ -76,7 +79,9 @@ Item {
             required property string ch
             required property bool fresh
             readonly property var g: index >= 0 && index < tl.graphemes.length ? tl.graphemes[index] : null
-            readonly property rect r: (tl.layoutTick, g ? tl.field.positionToRectangle(g.at) : Qt.rect(x, y, 0, 0))
+            readonly property rect r: (tl.layoutTick, g && g.at <= tl.field.length ? tl.field.positionToRectangle(g.at) : Qt.rect(x, y, 0, 0))
+            // remembered on the grapheme, for the ghost it leaves if it is deleted
+            onRChanged: if (g) g.rect = r
             text: ch === "\n" ? "" : ch
             color: tl.color
             font: tl.field.font
