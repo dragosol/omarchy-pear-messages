@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS messages (
     unread      INTEGER NOT NULL DEFAULT 0,
     effect      TEXT NOT NULL DEFAULT '',    -- iMessage bubble/screen effect id
     runs        TEXT NOT NULL DEFAULT '[]',  -- text formatting / iOS 18 text effects (UTF-16 ranges)
-    hidden      INTEGER NOT NULL DEFAULT 0,  -- the received copy of a message you sent yourself
+    hidden      INTEGER NOT NULL DEFAULT 0,  -- 1: the received copy of a message you sent yourself
+                                             -- 2: only the phone reported it, and the Mac, which had the
+                                             --    conversation at that moment, does not (see hide_phone_only)
     reply_to    TEXT NOT NULL DEFAULT '',    -- inline reply: bb_guid of the message that began its thread
     reply_part  INTEGER NOT NULL DEFAULT 0   -- which part of that message
 );
@@ -306,6 +308,32 @@ class Store:
         # the daemon tells open windows, which may already be showing them
         self.newly_hidden.extend(ids)
         return len(ids)
+
+    # Only the phone reported it, though the Mac was receiving that conversation at the time. With
+    # BlueBubbles connected the Mac's database is the record, and what's missing from it is not a
+    # message: a reaction the phone could only send as a sentence (in any wording, quoting
+    # anything or nothing), the text a message had before it was edited, or a copy that failed to
+    # merge. Phone-only messages from a time the Mac has nothing for the conversation are kept:
+    # the Mac may have been asleep, or not get SMS at all.
+    PHONE_ONLY_GRACE = 90.0      # seconds BlueBubbles must have read past the message
+    PHONE_ONLY_NEAR = 600.0      # the Mac's own messages in the conversation within this much
+
+    def hide_phone_only(self, mac_seen_until: float) -> list[tuple[str, int]]:
+        """Hide (hidden=2, never delete) messages only the phone reported that the Mac, which
+        had the conversation at that moment, does not have. Returns (thread, id) of each."""
+        out = []
+        for r in self.db.execute(
+                "SELECT id, thread, ts FROM messages WHERE bb_guid IS NULL AND map_handle IS NOT NULL "
+                "AND hidden=0 AND from_me=0 AND ts < ?", (mac_seen_until - self.PHONE_ONLY_GRACE,)).fetchall():
+            near = self.db.execute(
+                "SELECT 1 FROM messages WHERE thread=? AND bb_guid IS NOT NULL AND ts BETWEEN ? AND ? LIMIT 1",
+                (r["thread"], r["ts"] - self.PHONE_ONLY_NEAR, r["ts"] + self.PHONE_ONLY_NEAR)).fetchone()
+            if near:
+                self.db.execute("UPDATE messages SET hidden=2, unread=0 WHERE id=?", (r["id"],))
+                out.append((r["thread"], r["id"]))
+        if out:
+            self.db.commit()
+        return out
 
     def contact_name(self, addr: str) -> str:
         r = self.db.execute("SELECT name FROM contacts WHERE key=?", (C.key(addr),)).fetchone()
@@ -636,6 +664,8 @@ class Store:
                 upd[k] = m[k]
         if m.get("unread") is False and r["unread"]:
             upd["unread"] = 0
+        if source == "bluebubbles" and r["hidden"] == 2:
+            upd["hidden"] = 0        # the Mac had it after all: a real message, shown again
         upd = {k: v for k, v in upd.items() if r[k] != v}
         if upd:
             self.db.execute("UPDATE messages SET " + ",".join(f"{k}=?" for k in upd) + " WHERE id=?",

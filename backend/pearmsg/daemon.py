@@ -316,6 +316,23 @@ class Daemon:
         self.store.db.commit()
         self._after_ingest(changed, fresh)
         self._fetch_roots(roots)
+        self._hide_phone_only()
+
+    def _hide_phone_only(self) -> None:
+        """With the Mac connected, hide what only the phone reported and the Mac doesn't have."""
+        if not self.bb_online:
+            return
+        seen = float(self.store.get_meta("bb_since_ms", "0") or 0) / 1000.0
+        gone = self.store.hide_phone_only(seen)
+        if not gone:
+            return
+        by: dict[str, list] = {}
+        for tid, mid in gone:
+            by.setdefault(tid, []).append({"id": mid, "thread": tid, "hidden": True})
+        for tid, rows in by.items():
+            self._broadcast({"ev": "messages", "thread": tid, "messages": rows})
+        self._broadcast_threads()
+        log(f"hid {len(gone)} message(s) only the phone reported, which the Mac does not have")
 
     def _fetch_roots(self, guids: list[str]) -> None:
         """A reply whose thread began before the history we have: fetch that first message, so
@@ -1134,6 +1151,7 @@ class Daemon:
                 changed.setdefault(th, []).append(mid)
             if self.store.merge_orphans():
                 changed.setdefault(tid, [])
+            self._hide_phone_only()
             for th, ids in changed.items():
                 rows = []
                 for i in dict.fromkeys(ids):

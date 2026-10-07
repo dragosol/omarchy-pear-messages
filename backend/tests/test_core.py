@@ -980,6 +980,57 @@ class MessageListModelTest(unittest.TestCase):
                       "growth jumps to the end during the glide")
 
 
+class PhoneOnlyTest(unittest.TestCase):
+    """With the Mac connected, a message only the phone reported - though the Mac had the
+    conversation at that moment - is not a message: a reaction sentence in any wording, the text
+    before an edit, a copy that failed to merge. Seen on 2026-10-07: "Matthew loved a movie",
+    "I typed this one with a Horst accent" (edited to "borat")."""
+
+    def setUp(self):
+        self.s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        self.t = time.time() - 3600
+        self.addr = "+16135550150"
+        self.th = store.addr_thread(self.addr)
+
+    def _mac(self, guid, text, dt):
+        return self.s.ingest({"bb_guid": guid, "thread": self.th, "from_me": False, "sender_addr": self.addr,
+                              "text": text, "ts": self.t + dt}, "bluebubbles")[1]
+
+    def _phone(self, handle, text, dt):
+        return self.s.ingest({"map_handle": handle, "thread": self.th, "from_me": False, "sender_addr": self.addr,
+                              "text": text, "ts": self.t + dt}, "iphone")[1]
+
+    def test_what_the_mac_lacks_is_hidden(self):
+        self._mac("B1", "I typed this one with a borat accent", 0)
+        pre = self._phone("p1", "I typed this one with a Horst accent", -20)
+        react = self._phone("p2", "Matthew loved a movie", 30)
+        gone = self.s.hide_phone_only(self.t + 3000)
+        self.assertEqual(sorted(i for _, i in gone), sorted([pre, react]))
+        self.assertEqual([m["text"] for m in self.s.messages(self.th)], ["I typed this one with a borat accent"])
+
+    def test_kept_when_the_mac_has_nothing_from_then(self):
+        """The Mac asleep, or no SMS on the Mac: the phone's copy is the only one."""
+        self._mac("B1", "earlier", 0)
+        sms = self._phone("p1", "your code is 4812", 5000)
+        self.assertEqual(self.s.hide_phone_only(self.t + 9000), [])
+        self.assertIn(sms, [m["id"] for m in self.s.messages(self.th)])
+
+    def test_kept_until_the_mac_has_been_read_past_it(self):
+        self._mac("B1", "hi", 0)
+        p = self._phone("p1", "just now", 10)
+        self.assertEqual(self.s.hide_phone_only(self.t + 50), [], "hidden before BlueBubbles could have it")
+        self.assertIn(p, [m["id"] for m in self.s.messages(self.th)])
+
+    def test_shown_again_when_the_macs_copy_turns_up(self):
+        self._mac("B1", "hi", 0)
+        p = self._phone("p1", "late on the Mac", 30)
+        self.s.hide_phone_only(self.t + 3000)
+        self.assertNotIn(p, [m["id"] for m in self.s.messages(self.th)])
+        self._mac("B2", "late on the Mac", 31)
+        self.assertIn("late on the Mac", [m["text"] for m in self.s.messages(self.th)])
+        self.assertEqual(len(self.s.messages(self.th)), 2)
+
+
 class PullToCheckTest(unittest.TestCase):
     def test_pulling_past_the_bottom_resyncs(self):
         with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")) as fh:
