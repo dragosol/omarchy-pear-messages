@@ -756,6 +756,78 @@ class TapbackLanguageTest(unittest.TestCase):
         from pearmsg.tapback import parse
         self.assertEqual(parse("a attribué la mention « Je n’aime pas » à « hi »").kind, "dislike")
 
+    # Exactly as the phone delivered them over Bluetooth on 2026-10-01..07: non-breaking spaces
+    # inside « », a name no list had ("Rires"), and quotes cut off with no closing mark.
+    DELIVERED = [
+        ("a attribué la mention \u00ab\u00a0Rires\u00a0\u00bb à \u00ab\u00a0those scrumbags...\u00a0\u00bb", "laugh", "those scrumbags..."),
+        ("a attribué la mention \u00ab\u00a0Rires\u00a0\u00bb à \u00ab\u00a0Lmao le tired 😂\u00a0\u00bb", "laugh", "Lmao le tired 😂"),
+        ("a attribué la mention \u00ab\u00a0Aime\u00a0\u00bb à \u00ab\u00a0All those background colorful renders, "
+         "they are all original and made on my computer", "like",
+         "All those background colorful renders, they are all original and made on my computer"),
+    ]
+
+    def test_what_the_phone_actually_sent(self):
+        from pearmsg.tapback import parse
+        for text, kind, quoted in self.DELIVERED:
+            with self.subTest(text=text):
+                got = parse(text)
+                self.assertIsNotNone(got, f"still shown as a message: {text!r}")
+                self.assertEqual((got.kind, got.quoted), (kind, quoted))
+
+    # As delivered 2026-10-07: the quoted message has quotes of its own.
+    NESTED_MSG = ("It’s been shared to my mom, she ignored it so I shared it in the WhatsApp family "
+                  "Britannia chat and emphasized that we need to get moving with selling the house "
+                  "to which I got a “yes” from her")
+    NESTED = "Liked “" + NESTED_MSG + " ”"
+
+    def test_a_quoted_message_with_quotes_inside(self):
+        from pearmsg.tapback import parse
+        got = parse(self.NESTED)
+        self.assertIsNotNone(got, "a message quoting a message that has quotes is shown as a message")
+        self.assertEqual((got.kind, got.quoted), ("like", self.NESTED_MSG))
+
+    def test_the_conversation_decides_between_readings(self):
+        """Where the quote begins is ambiguous from the text alone; the stored cleanup and the
+        phone path take the reading whose quote is a real message."""
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        t = time.time() - 60
+        addr = "+16135550199"
+        th = store.addr_thread(addr)
+        _, mine = s.ingest({"bb_guid": "N1", "thread": th, "from_me": True, "text": self.NESTED_MSG, "ts": t}, "bluebubbles")
+        s.ingest({"map_handle": "n1", "thread": th, "from_me": False, "sender_addr": addr, "text": self.NESTED, "ts": t + 5}, "iphone")
+        s.cleanup_reaction_texts()
+        self.assertFalse([m for m in s.messages(th) if m["text"].startswith("Liked")])
+        self.assertEqual(list(s.message(mine)["reactions"].values()), ["like"])
+
+    def test_a_reaction_name_nobody_listed_is_still_a_reaction(self):
+        """The bug this replaces: every new language word needed a code change. The structure is
+        what makes it a reaction; an unknown name is kept as its name."""
+        from pearmsg.tapback import parse
+        got = parse("hat « Gefeiert » zu « see you at 7 » hinzugefügt")
+        self.assertIsNone(got, "wording after the quote is not this shape")
+        got = parse("a attribué la mention « Célébré » à « see you at 7 »")
+        self.assertEqual((got.kind, got.quoted), ("Célébré", "see you at 7"))
+        self.assertEqual(parse("a retiré la mention « Rires » de « hi »").kind, "")
+
+    def test_the_stored_sentences_are_cleaned_up(self):
+        """What 1.2.1 left in the database becomes a reaction - or, where BlueBubbles already
+        delivered this person's reaction, just goes."""
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        t = time.time() - 60
+        addr = "+16135550100"
+        th = store.addr_thread(addr)
+        _, mine = s.ingest({"bb_guid": "G1", "thread": th, "from_me": True, "text": "those scrumbags...", "ts": t}, "bluebubbles")
+        _, mine2 = s.ingest({"bb_guid": "G2", "thread": th, "from_me": True, "text": "Lmao le tired 😂", "ts": t + 1}, "bluebubbles")
+        s.react("G1", addr, "laugh")                      # BlueBubbles' real one
+        for k, q in enumerate(("those scrumbags...", "Lmao le tired 😂")):
+            s.ingest({"map_handle": f"h{k}", "thread": th, "from_me": False, "sender_addr": addr,
+                      "text": f"a attribué la mention \u00ab\u00a0Rires\u00a0\u00bb à \u00ab\u00a0{q}\u00a0\u00bb", "ts": t + 5 + k}, "iphone")
+        s.cleanup_reaction_texts()
+        texts = [m["text"] for m in s.messages(th)]
+        self.assertFalse([x for x in texts if "mention" in x], "a reaction sentence is still a message")
+        self.assertEqual(len(s.message(mine)["reactions"]), 1, "BlueBubbles' reaction was doubled")
+        self.assertEqual(list(s.message(mine2)["reactions"].values()), ["laugh"])
+
     def test_an_ordinary_sentence_is_not_a_reaction(self):
         from pearmsg.tapback import parse
         self.assertIsNone(parse("I really aime this restaurant"))

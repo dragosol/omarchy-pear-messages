@@ -348,9 +348,12 @@ class Daemon:
             # “hi”', 'a attribué la mention « Adore » à « hi »'). When BlueBubbles is around it
             # delivers the real reaction, so the sentence is dropped; otherwise it becomes a
             # reaction on the message it quotes.
-            tb = tapback.parse(n["text"])
-            if tb:
+            tb, target = None, None
+            for tb in tapback.candidates(n["text"]):
                 target = self.store.find_quoted(self.store.canonical(n["thread"]), tb.quoted, n["ts"])
+                if target is not None:
+                    break
+            if tb:
                 if target is not None:
                     if not bb_recent:
                         self.store.react_row(target["id"], C.key(n.get("sender_addr", "")), tb.kind)

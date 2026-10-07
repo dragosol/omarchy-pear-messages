@@ -780,19 +780,22 @@ class Store:
     def cleanup_reaction_texts(self) -> list[tuple[str, int]]:
         """Reactions that were stored as messages (in any language) become reactions again.
         Returns (thread, message id) of each message whose reactions changed."""
-        from .tapback import parse
+        from .tapback import candidates
         changed = []
         for r in self.db.execute("SELECT * FROM messages WHERE from_me=0 AND bb_guid IS NULL "
                                  "AND map_handle IS NOT NULL").fetchall():
-            tb = parse(r["text"])
-            if not tb:
-                continue
-            target = self.find_quoted(r["thread"], tb.quoted, r["ts"])
-            if target is None or target["id"] == r["id"]:
+            tb = target = None
+            for tb in candidates(r["text"]):
+                target = self.find_quoted(r["thread"], tb.quoted, r["ts"])
+                if target is not None and target["id"] != r["id"]:
+                    break
+                target = None
+            if target is None:
                 continue
             have = json.loads(target["reactions"])
-            # BlueBubbles may already have delivered the real one, under its own sender key
-            if tb.kind and tb.kind not in have.values():
+            # BlueBubbles may already have delivered the real one: same reaction under its own
+            # sender key, or this person's reaction under theirs (whatever the phone called it)
+            if tb.kind and tb.kind not in have.values() and r["sender"] not in have:
                 self.react_row(target["id"], r["sender"], tb.kind)
                 changed.append((target["thread"], target["id"]))
             self.db.execute("DELETE FROM messages WHERE id=?", (r["id"],))
