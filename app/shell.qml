@@ -2266,7 +2266,7 @@ ShellRoot {
                                                         opacity: tItem.m.status === "sending" || tItem.m.status === "queued" ? 0.6 : 1
                                                         // a click on a message doesn't close the thread
                                                         MouseArea { anchors.fill: parent }
-                                                        Text { id: tMeasure; visible: false; text: tItem.m.text; font: tBody.font }
+                                                        Text { id: tMeasure; visible: false; textFormat: Text.PlainText; text: tItem.m.text; font: tBody.font }
                                                         Text {
                                                             id: tBody
                                                             x: 14

@@ -462,15 +462,45 @@ class QmlTextFormatTest(unittest.TestCase):
                 with open(os.path.join(self.APP, name)) as fh:
                     yield name, fh.read().split("\n")
 
+    @staticmethod
+    def _own_block(src, start):
+        """The text of one element's own block, from just after its `{` to its matching `}`,
+        with every nested child element's block cut out. A fixed window of lines after the
+        element was what this used to read: a one-line element like
+        `Text { id: tMeasure; visible: false; text: ... }` then borrowed the next element's
+        `textFormat` and passed while sitting on AutoText."""
+        depth, j = 1, start
+        while depth and j < len(src):
+            depth += {"{": 1, "}": -1}.get(src[j], 0)
+            j += 1
+        own, d = [], 0
+        for ch in src[start:j - 1]:
+            if ch == "{":
+                d += 1
+            elif ch == "}":
+                d -= 1
+            elif d == 0:
+                own.append(ch)
+        return "".join(own)
+
     def test_every_text_element_declares_a_format(self):
         missing = []
         for name, lines in self._qml():
-            for i, line in enumerate(lines):
-                found = self.ELEMENT.search(line)
-                if (found and found.group(1) != "TextInput"
-                        and "textFormat" not in " ".join(lines[i:i + 16])):
-                    missing.append(f"{name}:{i + 1} {line.strip()[:60]}")
+            src = "\n".join(lines)
+            for found in self.ELEMENT.finditer(src):
+                if found.group(1) == "TextInput":
+                    continue
+                if not re.search(r"\btextFormat\s*:", self._own_block(src, found.end())):
+                    line = src[:found.start()].count("\n") + 1
+                    missing.append(f"{name}:{line} {lines[line - 1].strip()[:60]}")
         self.assertEqual(missing, [], "text elements on the AutoText default:\n" + "\n".join(missing))
+
+    def test_a_one_line_element_cannot_borrow_its_neighbours_format(self):
+        """The shape that got through at 466e660: a one-line element followed by one that does
+        declare a format."""
+        src = "Text { id: a; text: m.text }\nText {\n    textFormat: Text.RichText\n}"
+        first = self.ELEMENT.search(src)
+        self.assertNotIn("textFormat", self._own_block(src, first.end()))
 
     def test_only_message_bubbles_use_rich_text(self):
         """The message bubble in the conversation and the one in an open reply thread are the
