@@ -132,8 +132,12 @@ Item {
         else mode = Math.abs(vel) > 0.02 ? "coast" : "idle";
     }
 
+    // Which end the bounce returns to. The bottom is followed while bouncing: content that grows
+    // meanwhile (a message arriving) moves the end, and the spring settles on where it is now.
+    property bool bounceToEnd: false
     function startBounce() {
-        bounceTarget = flick.contentY < minY ? minY : maxY;
+        bounceToEnd = !(flick.contentY < minY);
+        bounceTarget = bounceToEnd ? maxY : minY;
         mode = "bounce";
     }
 
@@ -147,6 +151,7 @@ Item {
             return;
         }
         if (mode === "bounce") {
+            if (bounceToEnd) bounceTarget = maxY;
             // exact critically damped step: x(t) = (x0 + (v0 + w*x0) t) e^(-wt)
             const w = springOmega;
             const x0 = flick.contentY - bounceTarget, v0 = vel;

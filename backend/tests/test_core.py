@@ -799,6 +799,54 @@ class TapbackLanguageTest(unittest.TestCase):
         self.assertFalse([m for m in s.messages(th) if m["text"].startswith("Liked")])
         self.assertEqual(list(s.message(mine)["reactions"].values()), ["like"])
 
+    def test_a_reaction_to_a_photo_quotes_nothing(self):
+        """'Liked an image' has no quote to match; it is the latest message with a file."""
+        from pearmsg.tapback import candidates
+        for text, kind in [("Liked an image", "like"), ("Laughed at a photo", "laugh"),
+                           ("a attribué la mention « Adore » à une image", "love"),
+                           ("Reacted 😂 to an image", "😂"), ("Le gustó una imagen", "like"),
+                           ("Removed a heart from an image", "")]:
+            with self.subTest(text=text):
+                got = candidates(text)
+                self.assertTrue(got and got[0].attachment, f"not read as a reaction to a file: {text}")
+                self.assertEqual(got[0].kind, kind)
+        for text in ("My dad liked the image", "I sent an image", "look at the photo"):
+            with self.subTest(text=text):
+                self.assertEqual(candidates(text), [], f"an ordinary message taken for a reaction: {text}")
+
+    def test_a_reaction_to_a_photo_lands_on_the_photo(self):
+        s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+        t = time.time() - 60
+        addr = "+16135550142"
+        th = store.addr_thread(addr)
+        _, photo = s.ingest({"bb_guid": "P1", "thread": th, "from_me": True, "text": "", "ts": t,
+                             "attachments": [{"guid": "A1", "mime": "image/jpeg", "name": "IMG.jpg"}]}, "bluebubbles")
+        s.ingest({"bb_guid": "P2", "thread": th, "from_me": True, "text": "nice right", "ts": t + 1}, "bluebubbles")
+        s.ingest({"map_handle": "r1", "thread": th, "from_me": False, "sender_addr": addr, "text": "Loved an image", "ts": t + 5}, "iphone")
+        s.cleanup_reaction_texts()
+        self.assertFalse([m for m in s.messages(th) if m["text"] == "Loved an image"])
+        self.assertEqual(list(s.message(photo)["reactions"].values()), ["love"])
+
+    def test_the_phones_photo_line_merges_with_the_photo(self):
+        """Over Bluetooth a photo arrives as 'Attachment: 1 Photo'; BlueBubbles' copy has the file
+        and no text. They are one message, whichever comes first."""
+        for first in ("iphone", "bluebubbles"):
+            with self.subTest(first=first):
+                s = store.Store(os.path.join(tempfile.mkdtemp(), "m.db"))
+                t = time.time() - 60
+                addr = "+16135550143"
+                th = store.addr_thread(addr)
+                phone = {"map_handle": "m1", "thread": th, "from_me": False, "sender_addr": addr, "text": "Attachment: 1 Photo", "ts": t}
+                mac = {"bb_guid": "B1", "thread": th, "from_me": False, "sender_addr": addr, "text": "", "ts": t + 2,
+                       "attachments": [{"guid": "A1", "mime": "image/jpeg", "name": "IMG.jpg"}]}
+                for src, m in ((("iphone", phone), ("bluebubbles", mac)) if first == "iphone" else (("bluebubbles", mac), ("iphone", phone))):
+                    s.ingest(m, src)
+                s.merge_orphans()
+                rows = s.messages(th)
+                self.assertEqual(len(rows), 1, [r["text"] for r in rows])
+                self.assertEqual(rows[0]["text"], "")
+                self.assertEqual(len(rows[0]["attachments"]), 1)
+
     def test_a_reaction_name_nobody_listed_is_still_a_reaction(self):
         """The bug this replaces: every new language word needed a code change. The structure is
         what makes it a reaction; an unknown name is kept as its name."""
@@ -930,6 +978,25 @@ class MessageListModelTest(unittest.TestCase):
         self.assertIn("if (root.arriving[mid]) riseIn.start()", body)
         self.assertIn("!list.sliding && holdView === 0) followGrowth()", body,
                       "growth jumps to the end during the glide")
+
+
+class PullToCheckTest(unittest.TestCase):
+    def test_pulling_past_the_bottom_resyncs(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")) as fh:
+            body = fh.read()
+        self.assertIn("if (list.pushPeak >= list.pullThreshold) root.resyncNow();", body)
+        self.assertIn('op: "resync"', body)
+        with open(os.path.join(os.path.dirname(__file__), "..", "pearmsg", "daemon.py")) as fh:
+            self.assertIn('op == "resync"', fh.read())
+
+    def test_held_views_are_not_glided(self):
+        """A message arriving while your fingers hold the view rises into place, and the view
+        glides to it only after you let go."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")) as fh:
+            body = fh.read()
+        self.assertIn("if (msgPhys.busy) {\n                        list.catchUp = true;", body)
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "ScrollPhysics.qml")) as fh:
+            self.assertIn("if (bounceToEnd) bounceTarget = maxY;", fh.read())
 
 
 class RedirectBodyLimitTest(unittest.TestCase):

@@ -51,6 +51,8 @@ class Tapback:
     kind: str        # love like dislike laugh emphasize question, an emoji, a name the phone
                      # used that no list here knows, or "" (taken back)
     quoted: str      # the quoted message text (may be cut short, with or without "…")
+    attachment: bool = False   # a reaction to a photo, video or file: nothing quoted, it names
+                               # the kind of thing instead ("Liked an image")
 
 
 # typographic spaces iOS puts inside « » and the like
@@ -130,13 +132,39 @@ def _emoji(s: str) -> str:
     return ""
 
 
+# A reaction to a photo, video or file quotes nothing; the phone names the thing instead, after
+# the reaction: "Liked an image", "a attribué la mention « Adore » à une image".
+_THING = re.compile(
+    r"\s(?:an?|the|une?|la|le|l[’']|una?|el|ein(?:e|en)?|das|den|die|un[’']?|lo|il|uma?|o)\s*"
+    r"(image|photo|picture|video|movie|attachment|sticker|audio message|gif|"
+    r"vid[ée]o|pi[èe]ce jointe|imagen|foto|v[íi]deo|archivo adjunto|adjunto|bild|anhang|"
+    r"immagine|allegato|anexo)s?\s*[.!]?$", re.I)
+
+
+# ...and with nothing quoted to check against a real message, the sentence has to open the way
+# the phone opens one ("Liked", "Reacted 😂 to", "a attribué la mention", "Le gustó"...), so
+# "My dad liked the image" stays a message.
+_ATT_LEAD = re.compile(
+    r"^(loved|liked|disliked|laughed at|emphasi[sz]ed|questioned|reacted \S+ to|removed\b|"
+    r"a attribué la mention|a réagi|a retiré|a aimé|a adoré|"
+    r"le gust[óo]|le encant[óo]|no le gust[óo]|se rió|reaccionó|elimin[óo]|"
+    r"hat\b|gefällt|mag\b|ha (?:messo|reagito|rimosso))", re.I)
+
+
 def candidates(text: str) -> list[Tapback]:
     """Every reading of the text as a reaction, most likely first. Use the first whose quote
     matches a message in the conversation."""
     out = []
-    for quoted, around in _splits(_SPACES.sub(" ", text or "")):
+    t = _SPACES.sub(" ", text or "").strip()
+    for quoted, around in _splits(t):
         tb = _classify(quoted, around)
         if tb:
+            out.append(tb)
+    thing = _THING.search(t)
+    if thing and 0 < thing.start() <= MAX_AROUND and _ATT_LEAD.match(t):
+        tb = _classify("", t[:thing.start()].strip())
+        if tb:
+            tb.attachment = True
             out.append(tb)
     return out
 

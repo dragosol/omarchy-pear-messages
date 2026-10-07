@@ -350,7 +350,7 @@ class Daemon:
             # reaction on the message it quotes.
             tb, target = None, None
             for tb in tapback.candidates(n["text"]):
-                target = self.store.find_quoted(self.store.canonical(n["thread"]), tb.quoted, n["ts"])
+                target = self.store.find_target(self.store.canonical(n["thread"]), tb, n["ts"])
                 if target is not None:
                     break
             if tb:
@@ -1003,6 +1003,8 @@ class Daemon:
             reply({"ev": "sent", **self.send(req.get("thread", ""), req.get("text", ""), req.get("to", ""),
                                              req.get("effect", ""), req.get("files") or [],
                                              int(req.get("replyTo") or 0))})
+        elif op == "resync":
+            self._resync(c, rid, req.get("thread", ""))
         elif op == "reply_thread":
             self._reply_thread(c, rid, int(req["message"]))
         elif op == "link_preview":
@@ -1094,6 +1096,65 @@ class Daemon:
             self.phone.sync()
         else:
             reply({"ev": "error", "error": f"unknown op {op!r}"})
+
+    def _resync(self, c, rid, tid: str) -> None:
+        """Pull past the bottom of a conversation: check it against the sources again now, rather
+        than waiting for the next poll. Re-reads the conversation's latest messages from the Mac
+        (which repairs anything missed, merges duplicates and brings statuses and reactions up to
+        date), asks the phone for its inbox, and re-runs the clean-up of reactions that arrived
+        as text. Answers with what changed."""
+        t = self.store.thread(tid) if tid else None
+        if not t:
+            self._send(c, {"ev": "resynced", "re": rid, "thread": tid, "ok": False, "note": "Nothing to check"})
+            return
+        count = lambda: self.store.db.execute(
+            "SELECT COUNT(*) FROM messages WHERE thread=? AND hidden=0", (tid,)).fetchone()[0]
+        before = count()
+        client = self.client if self.bb_online else None
+        bb_chat = t.get("bbChat", "")
+
+        def work():
+            got, err = [], ""
+            if client and bb_chat:
+                try:
+                    got = client.chat_messages(bb_chat, limit=100)
+                except BB.BBError as e:
+                    err = str(e)
+            GLib.idle_add(done, got, err)
+
+        def done(got, err):
+            if got:
+                self._ingest_bb(list(reversed(got)))
+            if self.phone_state.get("state") == "online":
+                self.phone.sync()
+            if self.poller:
+                self.poller.wake.set()
+            changed: dict = {}
+            for th, mid in self.store.cleanup_reaction_texts():
+                changed.setdefault(th, []).append(mid)
+            if self.store.merge_orphans():
+                changed.setdefault(tid, [])
+            for th, ids in changed.items():
+                rows = []
+                for i in dict.fromkeys(ids):
+                    m = self.store.message(i)
+                    rows.append(m if m else {"id": i, "thread": th, "hidden": True})
+                if rows:
+                    self._broadcast({"ev": "messages", "thread": th, "messages": rows})
+            if changed:
+                self._broadcast_threads()
+            added = count() - before
+            if err and not got:
+                note = "Couldn't reach your Mac: " + err
+            elif not client and self.phone_state.get("state") != "online":
+                note = "Not connected"
+            elif added > 0:
+                note = f"{added} new" if added != 1 else "1 new"
+            else:
+                note = "Up to date"
+            self._send(c, {"ev": "resynced", "re": rid, "thread": tid, "ok": not (err and not got), "note": note})
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def _reply_thread(self, c, rid, mid: int) -> None:
         """A message's reply thread: the message that began it, then every reply."""

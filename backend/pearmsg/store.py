@@ -109,7 +109,18 @@ _TAPBACK_PREFIX = re.compile(
     r"^(Loved|Liked|Disliked|Laughed at|Emphasized|Questioned|Reacted \S+ to)\s+[“\"]", re.I)
 
 
+# Over Bluetooth the iPhone sends a photo or file as this line, with no file. It is the same
+# message as BlueBubbles' copy of the photo, whose text is empty, so it matches as empty.
+_MAP_PLACEHOLDER = re.compile(r"^\s*attachment: \d+ [a-z ]+$", re.I)
+
+
+def is_map_placeholder(text: str) -> bool:
+    return bool(_MAP_PLACEHOLDER.match(text or ""))
+
+
 def normalize(text: str) -> str:
+    if is_map_placeholder(text):
+        return ""
     t = unicodedata.normalize("NFKC", text or "").replace(_OBJ, "")
     t = t.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     return re.sub(r"\s+", " ", t).strip().lower()
@@ -608,7 +619,12 @@ class Store:
             if m.get("reply_to"):
                 upd["reply_to"] = m["reply_to"]
                 upd["reply_part"] = int(m.get("reply_part") or 0)
-        if m.get("text") and len(m["text"]) > len(r["text"]) and normalize(m["text"]).startswith(r["norm"]):
+        if source == "bluebubbles" and is_map_placeholder(r["text"]) and not is_map_placeholder(m.get("text", "")):
+            # the Mac's copy of a photo the phone announced as "Attachment: 1 Photo"
+            upd["text"] = m.get("text", "")
+            upd["norm"] = normalize(m.get("text", ""))
+        elif (m.get("text") and not is_map_placeholder(m["text"]) and len(m["text"]) > len(r["text"])
+              and normalize(m["text"]).startswith(r["norm"])):
             upd["text"] = m["text"]
             upd["norm"] = normalize(m["text"])
         for k in ("status", "error"):
@@ -655,7 +671,7 @@ class Store:
         Returns how many duplicates were removed."""
         n = 0
         for r in self.db.execute("SELECT * FROM messages WHERE map_handle IS NOT NULL AND bb_guid IS NULL").fetchall():
-            twin = self._find_twin(from_me=bool(r["from_me"]), sender=r["sender"], norm=r["norm"],
+            twin = self._find_twin(from_me=bool(r["from_me"]), sender=r["sender"], norm=normalize(r["text"]),
                                    ts=r["ts"], id_col="map_handle")
             if twin is None or twin["id"] == r["id"] or not twin["bb_guid"]:
                 continue
@@ -758,11 +774,20 @@ class Store:
         """The recent message a reaction text quotes, newest first."""
         from .tapback import quote_matches
         for r in self.db.execute(
-                "SELECT * FROM messages WHERE thread=? AND hidden=0 AND ts<=? ORDER BY ts DESC LIMIT 80",
+                "SELECT * FROM messages WHERE thread=? AND hidden=0 AND ts<=? ORDER BY ts DESC LIMIT 400",
                 (thread, before + 5)).fetchall():
             if quote_matches(quoted, r["text"]):
                 return r
         return None
+
+    def find_attachment(self, thread: str, before: float) -> sqlite3.Row | None:
+        """The message a reaction to "an image" means: the latest one with a file in it."""
+        return self.db.execute(
+            "SELECT * FROM messages WHERE thread=? AND hidden=0 AND ts<=? AND attachments!='[]' "
+            "ORDER BY ts DESC LIMIT 1", (thread, before + 5)).fetchone()
+
+    def find_target(self, thread: str, tb, before: float) -> sqlite3.Row | None:
+        return self.find_attachment(thread, before) if tb.attachment else self.find_quoted(thread, tb.quoted, before)
 
     def react_row(self, rid: int, sender: str, kind: str) -> None:
         sender = sender if sender in ("me", "?") else C.key(sender)
@@ -786,7 +811,7 @@ class Store:
                                  "AND map_handle IS NOT NULL").fetchall():
             tb = target = None
             for tb in candidates(r["text"]):
-                target = self.find_quoted(r["thread"], tb.quoted, r["ts"])
+                target = self.find_target(r["thread"], tb, r["ts"])
                 if target is not None and target["id"] != r["id"]:
                     break
                 target = None

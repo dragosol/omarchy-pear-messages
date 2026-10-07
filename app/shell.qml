@@ -55,7 +55,7 @@ ShellRoot {
     // ids of the messages arriving in the current update, so only their rows rise in (see the
     // delegate's `rise`); cleared once the rows exist
     property var arriving: ({})
-    property bool animateNew: false
+    Timer { id: arrivalsDone; interval: 50; onTriggered: root.arriving = ({}) }
     onMsgsChanged: syncMsgModel()
     function syncMsgModel() {
         const want = root.msgs;
@@ -109,6 +109,17 @@ ShellRoot {
         root.linkPreviews = l;
         root.send({ op: "link_preview", url: url });
     }
+    // Pull past the bottom: check this conversation against the Mac and the phone right now.
+    property string syncState: ""        // "" | "syncing" | "done"
+    property string syncNote: ""
+    function resyncNow() {
+        if (root.syncState === "syncing" || !root.current || root.composing) return;
+        root.syncState = "syncing";
+        root.syncNote = "";
+        if (root.preview !== "") { syncShown.restart(); root.syncState = "done"; root.syncNote = "Up to date"; return; }
+        root.send({ op: "resync", thread: root.current });
+    }
+    Timer { id: syncShown; interval: 1800; onTriggered: if (root.syncState === "done") root.syncState = "" }
     property string olderState: ""       // "" | "loading" | "end"
     property string olderNote: ""
     function loadOlder() {
@@ -549,16 +560,22 @@ ShellRoot {
                 const had = new Set(root.msgs.map(m => m.id));
                 const arriving = next.some(m => !had.has(m.id));
                 if (atEnd && arriving) {
-                    // The rows are laid out on the next frame, which is when the list starts the
-                    // add transition and works out its new height. Until then: animate, and don't
-                    // jump to the end - slideToEnd glides there.
-                    root.animateNew = true;
+                    // New messages rise into place (the row's own animation, see `rise`), and the
+                    // view glides up to them rather than jumping. If your fingers - or the bounce
+                    // after them - are holding the view, they keep it: the message rises into the
+                    // space you pulled open, and the glide to the new end waits for them to let go.
                     const arr = {};
                     for (const m of next) if (!had.has(m.id)) arr[m.id] = true;
                     root.arriving = arr;
-                    list.sliding = true;
-                    root.msgs = next;
-                    list.slideToEnd();
+                    arrivalsDone.restart();
+                    if (msgPhys.busy) {
+                        list.catchUp = true;
+                        root.msgs = next;
+                    } else {
+                        list.sliding = true;
+                        root.msgs = next;
+                        list.slideToEnd();
+                    }
                 } else {
                     root.msgs = next;
                     if (atEnd) list.followEnd = true;
@@ -567,6 +584,12 @@ ShellRoot {
             }
             break;
         }
+        case "resynced":
+            if (d.thread !== root.current) break;
+            root.syncState = "done";
+            root.syncNote = d.note || (d.ok ? "Up to date" : "Couldn't check");
+            syncShown.restart();
+            break;
         case "reply_thread":
             if (root.replyView && d.message === root.replyView.message)
                 root.replyView = Object.assign({}, root.replyView, { root: d.root, messages: d.messages, loading: false });
@@ -1279,6 +1302,12 @@ ShellRoot {
                                             wheelPullReset.restart();
                                             if (list.wheelPulls >= 2) { list.wheelPulls = 0; root.loadOlder(); }
                                         }
+                                        // and downward while already at the bottom: a pull to check for messages
+                                        if (notch && ev.angleDelta.y < 0 && list.contentY >= msgPhys.maxY - 1 && !msgPhys.busy) {
+                                            list.wheelPushes++;
+                                            wheelPushReset.restart();
+                                            if (list.wheelPushes >= 2) { list.wheelPushes = 0; root.resyncNow(); }
+                                        }
                                         msgPhys.wheel(ev);
                                     }
                                 }
@@ -1288,6 +1317,12 @@ ShellRoot {
                                 property int wheelPulls: 0
                                 Timer { id: wheelPullReset; interval: 1400; onTriggered: list.wheelPulls = 0 }
                                 onOverscrollChanged: if (msgPhys.mode === "drag" && overscroll > pullPeak) pullPeak = overscroll
+                                // the same pull past the bottom: check this conversation for anything missed
+                                readonly property real overscrollEnd: Math.max(0, contentY - msgPhys.maxY)
+                                property real pushPeak: 0
+                                property int wheelPushes: 0
+                                Timer { id: wheelPushReset; interval: 1400; onTriggered: list.wheelPushes = 0 }
+                                onOverscrollEndChanged: if (msgPhys.mode === "drag" && overscrollEnd > pushPeak) pushPeak = overscrollEnd
                                 Connections {
                                     target: msgPhys
                                     // fingers lifted after pulling far enough past the top
@@ -1295,6 +1330,8 @@ ShellRoot {
                                         if (msgPhys.mode === "drag") return;
                                         if (list.pullPeak >= list.pullThreshold) root.loadOlder();
                                         list.pullPeak = 0;
+                                        if (list.pushPeak >= list.pullThreshold) root.resyncNow();
+                                        list.pushPeak = 0;
                                     }
                                 }
                                 function stopPhysics() { msgPhys.stopPhysics(); }
@@ -1352,6 +1389,8 @@ ShellRoot {
                 // A message just arrived at the bottom: glide up to it while it rises into place,
                 // rather than jumping. Starts once the new row is laid out.
                 property bool sliding: false
+                // a message arrived while you held the view at the end; glide to it once you let go
+                property bool catchUp: false
                 function slideToEnd() {
                     followEnd = true;
                     msgPhys.stopPhysics();
@@ -1363,8 +1402,6 @@ ShellRoot {
                     interval: 16
                     onTriggered: {
                         list.forceLayout();
-                        root.animateNew = false;
-                        root.arriving = ({});
                         slide.from = list.contentY;
                         slide.to = msgPhys.maxY;
                         if (slide.to > slide.from + 0.5) slide.restart();
@@ -1460,6 +1497,7 @@ ShellRoot {
                     // a coast or bounce has just settled: where did it leave the view?
                     function onBusyChanged() {
                         if (msgPhys.busy) { slide.stop(); list.sliding = false; }   // your own scrolling takes over
+                        else if (list.catchUp) { list.catchUp = false; list.sliding = true; list.slideToEnd(); }
                         else if (!toBottom.running) list.checkPin();
                     }
                 }
@@ -2161,6 +2199,60 @@ ShellRoot {
                                 }
                             }
 
+                            // Pull past the bottom to check for messages: the hint sits in the space the
+                            // pull opens under the last message, then says what the check found.
+                            Rectangle {
+                                id: syncPill
+                                z: 54
+                                readonly property real pull: list.overscrollEnd
+                                readonly property bool ready: pull >= list.pullThreshold || list.wheelPushes >= 1
+                                readonly property bool shown: !root.replyView && root.current !== ""
+                                                              && (pull > 6 || root.syncState !== "" || list.wheelPushes >= 1)
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                // inside the opened space while pulling, resting just above the edge after
+                                y: parent.height - height - Math.max(8, Math.min(pull, list.pullThreshold + 20) / 2 - height / 2 + 6)
+                                height: 30
+                                width: syncRow.implicitWidth + 24
+                                radius: height / 2
+                                color: Qt.lighter(Theme.bg, 1.5)
+                                border.width: 1
+                                border.color: Theme.line
+                                opacity: shown ? 1 : 0
+                                visible: opacity > 0.01
+                                Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+                                Row {
+                                    id: syncRow
+                                    anchors.centerIn: parent
+                                    spacing: 8
+                                    Text {
+                                        textFormat: Text.PlainText
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: root.syncState === "syncing" ? "↻" : root.syncState === "done" ? "✓" : "↑"
+                                        color: Theme.dim
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fBody
+                                        rotation: root.syncState === "syncing" ? syncSpin.angle
+                                                : root.syncState === "done" ? 0 : Math.min(180, 180 * syncPill.pull / list.pullThreshold)
+                                        QtObject { id: syncSpin; property real angle: 0 }
+                                        Timer {
+                                            interval: 16; repeat: true; running: root.syncState === "syncing"
+                                            onTriggered: syncSpin.angle = (syncSpin.angle + 9) % 360
+                                        }
+                                    }
+                                    Text {
+                                        textFormat: Text.PlainText
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        color: Theme.dim
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fCaption
+                                        text: root.syncState === "syncing" ? "Checking for messages…"
+                                            : root.syncState === "done" ? root.syncNote
+                                            : syncPill.ready ? (list.wheelPushes >= 1 && syncPill.pull <= 0 ? "Scroll down once more to check for messages" : "Release to check for new messages")
+                                            : "Pull to check for new messages"
+                                    }
+                                }
+                            }
+
                             // "go to bottom": shows once you've scrolled up away from the newest messages
                             Rectangle {
                                 id: toBottomBtn
@@ -2369,7 +2461,10 @@ ShellRoot {
                                                             width: tBubble.width - 28
                                                             wrapMode: Text.Wrap
                                                             textFormat: Text.RichText
-                                                            text: root.linkify(tItem.m.text, tItem.mine ? Theme.onAccent : Theme.accent)
+                                                            // bold, italic, underline and strikethrough as the sender wrote them
+                                                            text: (tItem.m.segments || []).length
+                                                                  ? root.styledHtml(tItem.m.segments, tItem.mine ? Theme.onAccent : Theme.accent)
+                                                                  : root.linkify(tItem.m.text, tItem.mine ? Theme.onAccent : Theme.accent)
                                                             color: tItem.mine ? Theme.onAccent : Theme.fg
                                                             font.family: Theme.uiFont
                                                             font.pixelSize: Theme.fBody
@@ -3648,6 +3743,24 @@ ShellRoot {
                 root.status = Object.assign({}, root.status, { abilities: { reactions: false, effects: false, replies: false, reason: "Reactions and effects need BlueBubbles' Private API, which is off on your Mac.",
                     replyReason: "Replies need BlueBubbles' Private API, which is off on your Mac.", attachments: true, attachReason: "" } });
             if (root.preview !== "replies") Qt.callLater(() => root.openReplies(root.msgs[0]));
+        }
+        // styles: every iOS text style, alone and combined, in a plain bubble, a bubble with a text
+        // effect, and a reply opened in its thread
+        if (root.preview === "styles" || root.preview === "stylesthread") {
+            const segs = [{ text: "bold", styles: ["bold"], effect: "" }, { text: " · ", styles: [], effect: "" },
+                          { text: "italic", styles: ["italic"], effect: "" }, { text: " · ", styles: [], effect: "" },
+                          { text: "underline", styles: ["underline"], effect: "" }, { text: " · ", styles: [], effect: "" },
+                          { text: "struck", styles: ["strikethrough"], effect: "" }, { text: " · ", styles: [], effect: "" },
+                          { text: "all four", styles: ["bold", "italic", "underline", "strikethrough"], effect: "" }];
+            const plain = segs.map(x => x.text).join("");
+            root.msgs = root.msgs.slice(0, 3).map(m => m.id === 1 ? Object.assign({}, m, { guid: "G1", replyCount: 1 }) : m).concat([
+                { id: 30, thread: "addr:1", fromMe: false, sender: "+44", text: plain, ts: now - 50, status: "", attachments: [], reactions: {}, guid: "S30", segments: segs },
+                { id: 31, thread: "addr:1", fromMe: true, text: plain, ts: now - 40, status: "delivered", via: "bluebubbles", attachments: [], reactions: {}, guid: "S31", segments: segs },
+                { id: 32, thread: "addr:1", fromMe: false, sender: "+44", text: "big bold underlined", ts: now - 30, status: "", attachments: [], reactions: {}, guid: "S32",
+                  segments: [{ text: "big bold", styles: ["bold"], effect: "big" }, { text: " underlined", styles: ["underline"], effect: "" }] },
+                { id: 33, thread: "addr:1", fromMe: false, sender: "+44", text: plain, ts: now - 20, status: "", attachments: [], reactions: {}, guid: "S33",
+                  replyTo: "G1", quote: { id: 1, fromMe: false, text: "Are we still on for dinner tonight?", label: "", senderName: "" }, segments: segs }]);
+            if (root.preview === "stylesthread") Qt.callLater(() => root.openReplies(root.msgs[0]));
         }
         if (root.preview === "keyword") Qt.callLater(() => root.playEffect({ id: 99, text: "Happy birthday!!", effect: "" }, true));
         if (root.preview.indexOf("fx_") === 0) {
