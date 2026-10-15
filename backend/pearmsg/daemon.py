@@ -55,6 +55,7 @@ DEFAULTS = {
     "notificationPreview": True,
     "linkPreviews": True,
     "typingAnimation": True,
+    "edgeBlur": True,
     # what's taken from the Mac by default, and what's kept here (0 = no limit)
     "history": {"recentChats": 20, "recentDepth": 100, "otherDepth": 20},
     "keep": {"perChat": 0, "total": 0},
@@ -63,7 +64,16 @@ DEFAULTS = {
 
 
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    # stdout is a pipe to the shell that started us. When that shell is gone, a write raises
+    # BrokenPipeError; inside the SIGTERM handler that used to stop the daemon from ever
+    # quitting, leaving it running for good. Logging is never worth that.
+    try:
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+    except (OSError, ValueError):
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
 
 
 def _read_json(path: str, default):
@@ -894,7 +904,7 @@ class Daemon:
                 "paired": phones,
             },
             "settings": {k: self.settings[k] for k in ("notifications", "notificationPreview", "linkPreviews",
-                                                       "typingAnimation", "history", "keep", "media")},
+                                                       "typingAnimation", "edgeBlur", "history", "keep", "media")},
             "bbSetUp": bool(creds.get("url") and creds.get("password")),
             "abilities": self.abilities(),
             "pairing": self.pairing.active,
@@ -1062,7 +1072,7 @@ class Daemon:
             self._preview(c, rid, req.get("path", ""))
         # ---- settings / connection assistant
         elif op == "settings":
-            for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation"):
+            for k in ("notifications", "notificationPreview", "linkPreviews", "typingAnimation", "edgeBlur"):
                 if k in req:
                     self.settings[k] = bool(req[k])
             for group in ("iphone", "bluebubbles", "history", "keep", "media"):
@@ -1451,6 +1461,8 @@ class Daemon:
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, self._reload)
+        if os.environ.get("PEAR_MESSAGES_SUPERVISED") == "1":
+            self._watch_parent()
         log(f"listening on {SOCK}")
         self.loop.run()
 
@@ -1460,14 +1472,43 @@ class Daemon:
         return True
 
     def _quit(self):
-        log("stopping")
-        if self.pairing.active:
-            self.pairing.stop()
-        if self.poller:
-            self.poller.stop()
-        self.phone.close()
-        self.loop.quit()
+        try:
+            log("stopping")
+            if self.pairing.active:
+                self.pairing.stop()
+            if self.poller:
+                self.poller.stop()
+            self.phone.close()
+        except Exception as e:
+            log(f"stopping: {e}")
+        finally:
+            self.loop.quit()
         return False
+
+    def _watch_parent(self) -> None:
+        """Started by the Omarchy shell: go when it goes.
+
+        A shell restart or crash re-parents us to the user's systemd, and the new shell starts
+        a daemon of its own, so we would only be a second copy polling the Mac. The kernel's
+        parent-death signal covers most of it at once; the check every few seconds covers the
+        rest (the parent having died before the signal was armed, a thread-only exit).
+        """
+        parent = os.getppid()
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+
+        def check():
+            if os.getppid() != parent:
+                log("the shell that started this service is gone; stopping")
+                self._quit()
+                return False
+            return True
+        if not check():
+            return
+        GLib.timeout_add_seconds(3, check)
 
 
 def _sent_meanwhile(client, text: str, since_ms: int) -> dict | None:
@@ -1504,7 +1545,62 @@ def main() -> None:
     # starts it with the shell. Every path that writes private data already sets its own mode,
     # but the umask was the backstop under all of them, so it is set here instead of being lost.
     os.umask(0o077)
+    lock = _take_over()
     Daemon().run()
+    del lock
+
+
+def _is_daemon(pid: int) -> bool:
+    """Is pid one of this user's Pear Messages services?"""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().split(b"\0")
+    except OSError:
+        return False
+    return b"pearmsg" in args and b"daemon" in args and b"-m" in args
+
+
+def _take_over():
+    """Be the only service running: the newest one wins, and any older copy is stopped.
+
+    The newest is the one the shell (or the launcher) just started on purpose; an older copy
+    is a leftover - from a shell restart, say - still polling the Mac and answering on a socket
+    nobody can reach. The lock is held for the life of this process.
+    """
+    import fcntl
+    os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(RUNTIME, "daemon.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    others = [int(d) for d in os.listdir("/proc")
+              if d.isdigit() and int(d) != os.getpid() and _is_daemon(int(d))]
+    for pid in others:
+        log(f"stopping an older copy of the service (pid {pid})")
+        _quiet(os.kill, pid, signal.SIGTERM)
+    deadline = time.monotonic() + 8
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            pass
+        if time.monotonic() > deadline:
+            # one that will not stop (from before the shutdown fix, say): stop it for good
+            for pid in others:
+                if _is_daemon(pid):
+                    _quiet(os.kill, pid, signal.SIGKILL)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            break
+        time.sleep(0.2)
+    # copies from before this lock existed do not hold it: wait for them too
+    while time.monotonic() < deadline and any(_is_daemon(p) for p in others):
+        time.sleep(0.2)
+    for pid in others:
+        if _is_daemon(pid):
+            _quiet(os.kill, pid, signal.SIGKILL)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
 
 
 if __name__ == "__main__":

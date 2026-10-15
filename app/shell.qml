@@ -92,6 +92,7 @@ ShellRoot {
     property var linkPreviews: ({})      // url -> {ok, title, description, site} | {loading}
     readonly property bool linkPreviewsOn: !root.status.settings || root.status.settings.linkPreviews !== false
     readonly property bool typingAnimation: !root.status.settings || root.status.settings.typingAnimation !== false
+    readonly property bool edgeBlur: !root.status.settings || root.status.settings.edgeBlur !== false
     readonly property var sHistory: (root.status.settings && root.status.settings.history) || ({ recentChats: 20, recentDepth: 100, otherDepth: 20 })
     readonly property var sKeep: (root.status.settings && root.status.settings.keep) || ({ perChat: 0, total: 0 })
     readonly property var sMedia: (root.status.settings && root.status.settings.media) || ({ photos: true, videoThumbs: "small", keepPreviews: 20, cacheMB: 500 })
@@ -933,13 +934,37 @@ ShellRoot {
                     Layout.fillHeight: true
                     color: Theme.bg
 
+                    // the title, search and connection chip float: conversations scrolled under
+                    // them show through, frosted
+                    Backdrop {
+                        visible: root.edgeBlur
+                        target: threadList
+                        tint: Theme.bg
+                        width: sidebar.width
+                        height: sideCol.y + threadList.y
+                        offsetX: -(sideCol.x + threadList.x)
+                        offsetY: -height
+                    }
+                    Backdrop {
+                        visible: root.edgeBlur
+                        target: threadList
+                        tint: Theme.bg
+                        y: sideCol.y + threadList.y + threadList.height
+                        width: sidebar.width
+                        height: sidebar.height - y
+                        offsetX: -(sideCol.x + threadList.x)
+                        offsetY: threadList.height
+                    }
+
                     ColumnLayout {
+                        id: sideCol
                         anchors.fill: parent
                         anchors.margins: 12
                         spacing: 10
 
                         RowLayout {
                             Layout.fillWidth: true
+                            z: 1
                             spacing: 6
                             Text {
                                 textFormat: Text.PlainText
@@ -956,6 +981,7 @@ ShellRoot {
                         O.TextField {
                             id: search
                             Layout.fillWidth: true
+                            z: 1
                             placeholderText: "Search"
                             font.pixelSize: Theme.fBody
                             onTextChanged: root.query = text
@@ -966,9 +992,20 @@ ShellRoot {
                             id: threadList
                             Layout.fillWidth: true
                             Layout.fillHeight: true
+                            // with the frosted header and chip, the list runs on under the search
+                            // field and the chip (the column's spacing); the spacer rows keep the
+                            // first and last conversations clear of them at rest
+                            readonly property real inset: root.edgeBlur ? sideCol.spacing : 0
+                            Layout.topMargin: -inset
+                            Layout.bottomMargin: -inset
+                            header: Item { width: 1; height: threadList.inset }
+                            footer: Item { width: 1; height: threadList.inset }
                             clip: true
                             model: root.shownThreads
                             spacing: 2
+                            // rows scrolled under the header and the chip stay drawn for their Backdrops
+                            displayMarginBeginning: root.edgeBlur ? sideCol.y + y : 0
+                            displayMarginEnd: root.edgeBlur ? sidebar.height - sideCol.y - y - height : 0
                             interactive: false
                             ScrollBar.vertical: AppScrollBar {
                                 // in the sidebar's margin, clear of names, times and unread dots
@@ -1088,6 +1125,7 @@ ShellRoot {
                         // connection chip
                         Rectangle {
                             Layout.fillWidth: true
+                            z: 1
                             implicitHeight: 38
                             radius: Theme.radius
                             color: chipMouse.containsMouse ? Theme.hover : "transparent"
@@ -1131,14 +1169,41 @@ ShellRoot {
                             }
                         }
                     }
+
+                    // where the list meets the frosted header and chip, across the sidebar's full width
+                    SeamBand { target: threadList; listX: sideCol.x + threadList.x; listY: sideCol.y + threadList.y }
+                    SeamBand { target: threadList; listX: sideCol.x + threadList.x; listY: sideCol.y + threadList.y; atBottom: true }
                 }
 
                 Rectangle { Layout.fillHeight: true; Layout.preferredWidth: 1; color: Theme.line }
 
                 // ================================================= conversation
                 Item {
+                    id: conversation
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+
+                    // the header and the composer float: messages scrolled under them show
+                    // through, frosted
+                    Backdrop {
+                        visible: root.edgeBlur
+                        target: list
+                        tint: Theme.bg
+                        width: conversation.width
+                        height: msgArea.y + list.y
+                        offsetX: -list.x
+                        offsetY: -height
+                    }
+                    Backdrop {
+                        visible: root.edgeBlur
+                        target: list
+                        tint: Theme.bg
+                        y: msgArea.y + list.y + list.height
+                        width: conversation.width
+                        height: conversation.height - y
+                        offsetX: -list.x
+                        offsetY: list.height
+                    }
 
                     ColumnLayout {
                         anchors.fill: parent
@@ -1147,8 +1212,9 @@ ShellRoot {
                         // header
                         Rectangle {
                             Layout.fillWidth: true
+                            z: 1    // over the messages running on under it
                             implicitHeight: 60
-                            color: Theme.bg
+                            color: root.edgeBlur ? "transparent" : Theme.bg
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: 18
@@ -1253,7 +1319,7 @@ ShellRoot {
                                     onTriggered: root.send({ op: "search", q: toField.text.trim() })
                                 }
                             }
-                            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.line }
+                            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.line; visible: !root.edgeBlur }
                         }
 
                         // messages
@@ -1267,10 +1333,19 @@ ShellRoot {
                                 anchors.fill: parent
                                 anchors.leftMargin: 16
                                 anchors.rightMargin: 16
+                                // with the frosted header and composer, the list runs on under their
+                                // lower and upper parts, so the frost hugs their controls; the header
+                                // and footer rows below keep everything clear of them at rest
+                                readonly property real inset: root.edgeBlur ? 24 : 0
+                                anchors.topMargin: -inset
+                                anchors.bottomMargin: -inset
                                 clip: true
                                 model: msgModel
                                 // rows above the view stay laid out, so their heights are real, not estimates
                                 cacheBuffer: 2400
+                                // and the ones under the header and the composer stay drawn for their Backdrops
+                                displayMarginBeginning: root.edgeBlur ? msgArea.y + y : 0
+                                displayMarginEnd: root.edgeBlur ? conversation.height - msgArea.y - y - height : 0
                                 spacing: 3
                                 interactive: false
                                 // under an open reply thread: blurred, and no hover times or buttons
@@ -1339,11 +1414,12 @@ ShellRoot {
                                 // wheel notches once you're at the top.
                                 header: Item {
                                     width: list.width
-                                    height: 46
+                                    height: 46 + list.inset
                                     readonly property real pull: Math.max(list.pullPeak, list.overscroll)
                                     readonly property bool ready: pull >= list.pullThreshold || list.wheelPulls >= 1
                                     Row {
                                         anchors.centerIn: parent
+                                        anchors.verticalCenterOffset: list.inset / 2
                                         spacing: 8
                                         Text {
                                             textFormat: Text.PlainText
@@ -1374,7 +1450,7 @@ ShellRoot {
                                         }
                                     }
                                 }
-                                footer: Item { width: 1; height: 12 }
+                                footer: Item { width: 1; height: 12 + list.inset }
                                 readonly property real bubbleMax: Math.min(560, width * 0.72)
                                 readonly property int lastMine: {
                                     for (let i = root.msgs.length - 1; i >= 0; i--) if (root.msgs[i].fromMe) return i;
@@ -2153,6 +2229,10 @@ ShellRoot {
                                 }
                             }
 
+                            // where the messages meet the frosted header and composer, margins included
+                            SeamBand { target: list; listX: list.x; listY: list.y }
+                            SeamBand { target: list; listX: list.x; listY: list.y; atBottom: true }
+
                             // contact search results while composing
                             Rectangle {
                                 visible: root.composing && root.composeTo === "" && root.searchResults.length > 0
@@ -2699,6 +2779,7 @@ ShellRoot {
 
                         // flash line
                         Text {
+                            z: 1
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
                             Layout.leftMargin: 18
@@ -2714,10 +2795,11 @@ ShellRoot {
                         // files waiting to be sent
                         Rectangle {
                             Layout.fillWidth: true
+                            z: 1
                             visible: root.pending.length > 0 && (root.current !== "" || root.composing)
                             implicitHeight: 92
-                            color: Theme.bg
-                            Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Theme.line }
+                            color: root.edgeBlur ? "transparent" : Theme.bg
+                            Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Theme.line; visible: !root.edgeBlur }
                             ListView {
                                 anchors.fill: parent
                                 anchors.margins: 12
@@ -2786,10 +2868,11 @@ ShellRoot {
                         // composer
                         Rectangle {
                             Layout.fillWidth: true
+                            z: 1
                             implicitHeight: Math.min(160, composer.implicitHeight + 24)
-                            color: Theme.bg
+                            color: root.edgeBlur ? "transparent" : Theme.bg
                             visible: root.current !== "" || root.composing
-                            Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Theme.line }
+                            Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Theme.line; visible: !root.edgeBlur }
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.margins: 12
@@ -3486,6 +3569,13 @@ ShellRoot {
                                 }
                                 O.Toggle {
                                     Layout.fillWidth: true
+                                    label: "Frosted header and composer"
+                                    description: "Conversations and messages scroll on under the header, the search and the composer, blurred, instead of being cut off."
+                                    checked: root.edgeBlur
+                                    onClicked: root.send({ op: "settings", edgeBlur: !root.edgeBlur })
+                                }
+                                O.Toggle {
+                                    Layout.fillWidth: true
                                     label: "Link previews"
                                     description: "Show a link's title and description (text only). This computer fetches the page when the message comes into view."
                                     checked: root.linkPreviewsOn
@@ -3503,6 +3593,52 @@ ShellRoot {
                     }
                 }
             }
+        }
+    }
+
+    // Where a list meets a frosted header or footer: rows blur progressively as they near it -
+    // a light blur first, then the header's heavy frost - so nothing goes from sharp to blurred
+    // along a line. It grows in with how far the list is scrolled past that edge, so a row at
+    // rest is never blurred. Spans its parent's full width, margins included.
+    component SeamBand: Item {
+        id: sb
+        required property Flickable target
+        property bool atBottom: false
+        // where the list sits in this band's parent
+        property real listX: 0
+        property real listY: 0
+        readonly property real minY: target.originY
+        readonly property real maxY: Math.max(minY, minY + target.contentHeight - target.height)
+        readonly property real beyond: Math.max(0, atBottom ? maxY - target.contentY : target.contentY - minY)
+        y: atBottom ? listY + target.height - height : listY
+        width: parent ? parent.width : 0
+        height: 52
+        opacity: root.edgeBlur ? Math.min(1, beyond / 40) : 0
+        visible: opacity > 0.01
+
+        Backdrop {
+            width: sb.width
+            height: sb.height
+            target: sb.target
+            offsetX: -sb.listX
+            offsetY: sb.y - sb.listY
+            tint: Theme.bg
+            veil: 0
+            blurMax: 14
+            plateau: 0.0
+            feather: sb.atBottom ? "top" : "bottom"
+        }
+        Backdrop {
+            y: sb.atBottom ? sb.height - height : 0
+            width: sb.width
+            height: sb.height * 0.6
+            target: sb.target
+            offsetX: -sb.listX
+            offsetY: sb.y + y - sb.listY
+            tint: Theme.bg
+            veil: 0.55
+            plateau: 0.15
+            feather: sb.atBottom ? "top" : "bottom"
         }
     }
 

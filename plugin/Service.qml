@@ -90,6 +90,8 @@ QtObject {
     // `python3 -m` puts the working directory on sys.path, so running from the backend folder
     // replaces PYTHONPATH, and -u replaces PYTHONUNBUFFERED. No environment to pass at all.
     command: ["python3", "-B", "-u", "-m", "pearmsg", "daemon"]
+    // so it stops when this shell goes away instead of lingering beside the next one's
+    environment: ({ PEAR_MESSAGES_SUPERVISED: "1" })
     workingDirectory: root.backendPath
     onExited: function (code, status) {
       if (root.stopping || root.restarts >= root.restartLimit)

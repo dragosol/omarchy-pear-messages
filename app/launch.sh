@@ -29,7 +29,8 @@ fi
 # is not there - the plugin is not loaded, or this ran before the shell came up - start the same
 # process here. No service manager is involved either way.
 if [ ! -S "$run/sock" ]; then
-  (cd "$backend" && exec python3 -B -u -m pearmsg daemon >/dev/null 2>&1) &
+  # not holding the window's lock (fd 9), or the window could never open again while it runs
+  (cd "$backend" && exec python3 -B -u -m pearmsg daemon >/dev/null 2>&1 9>&-) &
 fi
 
 PEAR_MESSAGES_OPEN="$thread" exec quickshell -p "$here"

@@ -52,6 +52,9 @@ once.
   message that began a thread says how many replies it has. Click either, or ↩ beside a message,
   to open the thread over the conversation; the message box then replies into it. Reading
   replies works with any BlueBubbles setup; sending them needs the Private API, like reactions.
+- **Frosted header and composer.** Conversations and messages scroll on under the header,
+  the search field and the composer, blurred, instead of being cut off at an edge. Settings →
+  "Frosted header and composer" turns it off.
 - **Time on hover.** Rest the pointer on a message and its time opens underneath. It only moves
   the messages below aside when something is in the way.
 - **Reactions that arrive as text** over Bluetooth ("Loved “…”", or the same in French,
@@ -138,7 +141,9 @@ under your home directory:
 | The launcher | `~/.local/share/applications/pear-messages.desktop` |
 
 It installs no system service. The background service is started and kept running by the
-plugin itself, as part of your Omarchy shell, and stops when you log out.
+plugin itself, as part of your Omarchy shell, and stops when you log out. Only one copy ever
+runs: when the shell restarts, its service stops with it, and a newly started service stops
+any older copy before it begins.
 
 Requirements: `python3`, `python-dbus`, `python-gobject`, `quickshell` and `bluez-obex` for the
 iPhone connection. Omarchy already ships all of them, so there is nothing to install. `ffmpeg`,
