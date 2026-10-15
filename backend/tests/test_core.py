@@ -1137,6 +1137,33 @@ class RedirectBodyLimitTest(unittest.TestCase):
                               f"{code} still uses urllib's unbounded drain")
 
 
+class TakeOverTest(unittest.TestCase):
+    """Only the service's own Python process counts as an older copy to stop."""
+
+    def _spawn(self, argv):
+        import subprocess
+        p = subprocess.Popen(argv)
+        self.addCleanup(p.kill)
+        time.sleep(0.3)
+        return p.pid
+
+    def test_python_service_is_a_copy(self):
+        from pearmsg import daemon
+        pid = self._spawn([sys.executable, "-c", "import time; time.sleep(5)", "-m", "pearmsg", "daemon"])
+        self.assertTrue(daemon._is_daemon(pid))
+
+    def test_wrapper_mentioning_it_is_not(self):
+        from pearmsg import daemon
+        # timeout/strace/sh -c: the command line mentions the service, the process is not it
+        pid = self._spawn(["sh", "-c", "sleep 5; true", "-m", "pearmsg", "daemon"])   # stays sh
+        self.assertFalse(daemon._is_daemon(pid))
+
+    def test_own_ancestor_is_not(self):
+        from pearmsg import daemon
+        self.assertNotIn(os.getpid(), [p for p in daemon._ancestors()])
+        self.assertIn(os.getppid(), daemon._ancestors())
+
+
 if __name__ == "__main__":
     unittest.main()
 

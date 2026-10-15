@@ -1551,15 +1551,37 @@ def main() -> None:
 
 
 def _is_daemon(pid: int) -> bool:
-    """Is pid one of this user's Pear Messages services?"""
+    """Is pid one of this user's Pear Messages services?
+
+    The Python process itself (`python3 ... -m pearmsg daemon`), never a wrapper whose command
+    line merely mentions it - `timeout`, `strace`, a `sh -c` - and never one of our ancestors.
+    """
     try:
         if os.stat(f"/proc/{pid}").st_uid != os.getuid():
             return False
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            args = f.read().split(b"\0")
+            args = f.read().rstrip(b"\0").split(b"\0")
     except OSError:
         return False
-    return b"pearmsg" in args and b"daemon" in args and b"-m" in args
+    if not args or not os.path.basename(args[0]).startswith(b"python"):
+        return False
+    try:
+        i = args.index(b"-m")
+    except ValueError:
+        return False
+    return args[i + 1:i + 3] == [b"pearmsg", b"daemon"] and pid not in _ancestors()
+
+
+def _ancestors() -> set[int]:
+    seen, pid = set(), os.getppid()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return seen
 
 
 def _take_over():
