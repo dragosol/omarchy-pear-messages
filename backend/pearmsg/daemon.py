@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -38,6 +39,8 @@ from . import tapback
 from . import media
 from . import linkpreview
 from .store import Store, addr_thread
+
+CLIP_IMAGE_MAX = 50 * 1024 * 1024   # a pasted image bigger than this isn't attached
 
 HOME = os.path.expanduser("~")
 CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "pear-messages")
@@ -730,9 +733,36 @@ class Daemon:
                     d = os.path.join(RUNTIME, "outgoing")
                     os.makedirs(d, mode=0o700, exist_ok=True)
                     path = os.path.join(d, time.strftime("Pasted image %Y-%m-%d at %H.%M.%S.") + kind.split("/")[1].replace("jpeg", "jpg"))
-                    with open(path, "wb") as f:
-                        f.write(subprocess.run(["wl-paste", "--type", kind], capture_output=True, timeout=10).stdout)
-                    info = self._file_info(path)
+                    # Read at most CLIP_IMAGE_MAX bytes within 10 s: whoever owns the clipboard
+                    # decides what comes down the pipe, and for how long.
+                    proc = subprocess.Popen(["wl-paste", "--type", kind], stdout=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL)
+                    got, deadline, eof = 0, time.monotonic() + 10, False
+                    try:
+                        with open(path, "wb") as f:
+                            while time.monotonic() < deadline:
+                                ready, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                                if not ready:
+                                    break
+                                chunk = os.read(proc.stdout.fileno(), 1 << 16)
+                                if not chunk:
+                                    eof = True
+                                    break
+                                got += len(chunk)
+                                if got > CLIP_IMAGE_MAX:
+                                    break
+                                f.write(chunk)
+                        complete = eof and proc.wait(timeout=1) == 0
+                    except subprocess.TimeoutExpired:
+                        complete = False
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.stdout.close()
+                    if not complete or got == 0:
+                        os.unlink(path)
+                    else:
+                        info = self._file_info(path)
             except (OSError, subprocess.SubprocessError):
                 info = None
             GLib.idle_add(lambda: (self._send(c, {"ev": "clipboard_image", "re": rid, "file": info}), False)[1])

@@ -1247,3 +1247,70 @@ class MediaPrivacyTest(unittest.TestCase):
                                  "an existing cache directory was not tightened")
         finally:
             os.umask(old)
+
+
+class ClipboardImageTest(unittest.TestCase):
+    """A pasted image is read with a size cap and a deadline: the clipboard's owner decides
+    what comes down the pipe and for how long."""
+
+    def setUp(self):
+        from pearmsg import daemon as D
+        self.D = D
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "wl-paste"), "w") as f:
+            f.write('#!/bin/sh\n[ "$1" = --list-types ] && { echo image/png; exit 0; }\n'
+                    'case "$FAKE_CLIP" in ok) head -c 2000 /dev/zero ;; huge) exec cat /dev/zero ;;'
+                    ' hang) exec sleep 30 ;; esac\n')
+        os.chmod(os.path.join(self.bin, "wl-paste"), 0o755)
+        self.env = {k: os.environ.get(k) for k in ("PATH", "FAKE_CLIP")}
+        os.environ["PATH"] = self.bin + os.pathsep + os.environ["PATH"]
+        self.runtime, D.RUNTIME = D.RUNTIME, self.tmp.name
+
+    def tearDown(self):
+        self.D.RUNTIME = self.runtime
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def paste(self, mode, cap=None):
+        from gi.repository import GLib
+        os.environ["FAKE_CLIP"] = mode
+        out = []
+        fake = type("F", (), {})()
+        fake._file_info = lambda p: self.D.Daemon._file_info(fake, p)
+        fake._send = lambda c, m: out.append(m)
+        old = self.D.CLIP_IMAGE_MAX
+        if cap:
+            self.D.CLIP_IMAGE_MAX = cap
+        try:
+            start = time.monotonic()
+            self.D.Daemon._clipboard_image(fake, None, 1)
+            ctx = GLib.MainContext.default()
+            while not out and time.monotonic() - start < 20:
+                ctx.iteration(False)
+                time.sleep(0.01)
+        finally:
+            self.D.CLIP_IMAGE_MAX = old
+        left = os.listdir(os.path.join(self.tmp.name, "outgoing"))
+        return out[0]["file"], left, time.monotonic() - start
+
+    def test_an_image_is_saved(self):
+        info, left, _ = self.paste("ok")
+        self.assertEqual(info["size"], 2000)
+        self.assertEqual(len(left), 1)
+
+    def test_too_big_is_dropped(self):
+        info, left, _ = self.paste("huge", cap=1 << 20)
+        self.assertIsNone(info)
+        self.assertEqual(left, [])
+
+    def test_a_stalled_provider_hits_the_deadline(self):
+        info, left, took = self.paste("hang")
+        self.assertIsNone(info)
+        self.assertEqual(left, [])
+        self.assertLess(took, 12)

@@ -8,6 +8,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui as O
+import "TextEdit.js" as Edit
 
 // Pear Messages. This window is only a view of pear-messagesd: it connects to the daemon's
 // socket, shows what it is told, and asks it to send. Closing the window changes nothing -
@@ -985,7 +986,21 @@ ShellRoot {
                             placeholderText: "Search"
                             font.pixelSize: Theme.fBody
                             onTextChanged: root.query = text
-                            Keys.onDownPressed: if (root.shownThreads.length) root.openThread(root.shownThreads[0].id)
+                            // read-only to Qt, typed into by Edit.key: see TextEdit.js
+                            readOnly: true
+                            cursorVisible: activeFocus
+                            ContextMenu.menu: null
+                            Keys.onPressed: function (ev) {
+                                if (ev.key === Qt.Key_Down) {
+                                    if (root.shownThreads.length) root.openThread(root.shownThreads[0].id);
+                                    ev.accepted = true;
+                                    return;
+                                }
+                                ev.accepted = Edit.key(search, ev, { paste: () => searchPaste.start() }, { paste: StandardKey.Paste, selectAll: StandardKey.SelectAll, cut: StandardKey.Cut });
+                            }
+                            TapHandler { onTapped: search.forceActiveFocus() }
+                            MouseArea { anchors.fill: parent; acceptedButtons: Qt.MiddleButton }
+                            BoundedPaste { id: searchPaste; field: search }
                         }
 
                         ListView {
@@ -1252,6 +1267,24 @@ ShellRoot {
                                         font.pixelSize: Theme.fCaption
                                     }
                                 }
+                                // The iPhone only lets a computer see what it receives (its MAP "sent"
+                                // folder is always empty), so over Bluetooth what you type on the phone
+                                // is missing until BlueBubbles brings it in.
+                                Text {
+                                    textFormat: Text.PlainText
+                                    visible: root.route === "iphone"
+                                    Layout.maximumWidth: 330
+                                    horizontalAlignment: Text.AlignRight
+                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 2
+                                    elide: Text.ElideRight
+                                    text: root.status.bbSetUp
+                                        ? "What you send from your iPhone shows up once BlueBubbles connects."
+                                        : "Bluetooth shows only messages you receive, not ones you send."
+                                    color: Theme.dim
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fCaption
+                                }
                             }
                             // "To:" row while composing
                             RowLayout {
@@ -1305,13 +1338,25 @@ ShellRoot {
                                     placeholderText: "Name, phone number or email"
                                     font.pixelSize: Theme.fBody
                                     onTextChanged: searchTimer.restart()
-                                    Keys.onReturnPressed: {
-                                        if (root.searchResults.length) {
-                                            root.composeTo = root.searchResults[0].addr;
-                                            root.composeToName = root.searchResults[0].name;
-                                        } else if (text.trim()) root.composeTo = text.trim();
-                                        if (root.composeTo) composer.forceActiveFocus();
+                                    readOnly: true
+                                    cursorVisible: activeFocus
+                                    ContextMenu.menu: null
+                                    Keys.onPressed: function (ev) {
+                                        ev.accepted = Edit.key(toField, ev, {
+                                            paste: () => toPaste.start(),
+                                            enter: function () {
+                                                if (root.searchResults.length) {
+                                                    root.composeTo = root.searchResults[0].addr;
+                                                    root.composeToName = root.searchResults[0].name;
+                                                } else if (toField.text.trim()) root.composeTo = toField.text.trim();
+                                                if (root.composeTo) composer.forceActiveFocus();
+                                                return true;
+                                            }
+                                        }, { paste: StandardKey.Paste, selectAll: StandardKey.SelectAll, cut: StandardKey.Cut });
                                     }
+                                    TapHandler { onTapped: toField.forceActiveFocus() }
+                                    MouseArea { anchors.fill: parent; acceptedButtons: Qt.MiddleButton }
+                                    BoundedPaste { id: toPaste; field: toField }
                                 }
                                 Timer {
                                     id: searchTimer
@@ -2978,11 +3023,23 @@ ShellRoot {
                                                 ev.accepted = true;
                                                 return;
                                             }
-                                            if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && !(ev.modifiers & Qt.ShiftModifier)) {
-                                                root.sendCurrent();
-                                                ev.accepted = true;
-                                            }
+                                            ev.accepted = Edit.key(composer, ev, {
+                                                multiline: true,
+                                                paste: () => composerPaste.start(),
+                                                enter: function (e) {
+                                                    if (e.modifiers & Qt.ShiftModifier) return false;
+                                                    root.sendCurrent();
+                                                    return true;
+                                                }
+                                            }, { paste: StandardKey.Paste, selectAll: StandardKey.SelectAll, cut: StandardKey.Cut });
                                         }
+                                        // read-only to Qt, typed into by Edit.key: see TextEdit.js
+                                        readOnly: true
+                                        cursorVisible: activeFocus
+                                        ContextMenu.menu: null
+                                        TapHandler { onTapped: composer.forceActiveFocus() }
+                                        MouseArea { anchors.fill: parent; acceptedButtons: Qt.MiddleButton }
+                                        BoundedPaste { id: composerPaste; field: composer; multiline: true; limit: 65536 }
                                     }
                                 }
                                 Rectangle {
@@ -3180,6 +3237,13 @@ ShellRoot {
                                                 placeholderText: "http://100.x.y.z:1234 or https://…"
                                                 font.pixelSize: Theme.fSmall
                                                 text: root.bb.url || ""
+                                                readOnly: true
+                                                cursorVisible: activeFocus
+                                                ContextMenu.menu: null
+                                                Keys.onPressed: ev => ev.accepted = Edit.key(bbUrl, ev, { paste: () => bbUrlPaste.start() }, { paste: StandardKey.Paste, selectAll: StandardKey.SelectAll, cut: StandardKey.Cut })
+                                                TapHandler { onTapped: bbUrl.forceActiveFocus() }
+                                                MouseArea { anchors.fill: parent; acceptedButtons: Qt.MiddleButton }
+                                                BoundedPaste { id: bbUrlPaste; field: bbUrl }
                                             }
                                             Text { textFormat: Text.PlainText; text: "Password"; color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall }
                                             O.TextField {
@@ -3188,7 +3252,16 @@ ShellRoot {
                                                 password: true
                                                 placeholderText: root.bb.configured ? "Saved — type to change" : "The server password from BlueBubbles"
                                                 font.pixelSize: Theme.fSmall
-                                                Keys.onReturnPressed: testBtn.clicked()
+                                                readOnly: true
+                                                cursorVisible: activeFocus
+                                                ContextMenu.menu: null
+                                                Keys.onPressed: ev => ev.accepted = Edit.key(bbPassword, ev, {
+                                                    paste: () => bbPasswordPaste.start(),
+                                                    enter: () => { testBtn.clicked(); return true; }
+                                                }, { paste: StandardKey.Paste, selectAll: StandardKey.SelectAll, cut: StandardKey.Cut })
+                                                TapHandler { onTapped: bbPassword.forceActiveFocus() }
+                                                MouseArea { anchors.fill: parent; acceptedButtons: Qt.MiddleButton }
+                                                BoundedPaste { id: bbPasswordPaste; field: bbPassword }
                                             }
                                         }
 

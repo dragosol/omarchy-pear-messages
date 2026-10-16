@@ -222,6 +222,7 @@ PYTHONPATH=~/.local/share/pear-messages/backend python3 -m pearmsg threads   # c
 
 ```bash
 python3 -B -m unittest discover -s backend/tests          # parser + merge tests
+QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests   # text fields (read-only to Qt, see app/TextEdit.js)
 # render the window with made-up data, off-screen:
 PEAR_MESSAGES_PREVIEW=threads PEAR_MESSAGES_SNAPSHOT=/tmp/shot.png \
   QT_QPA_PLATFORM=offscreen quickshell -p <a copy of app/ with Ui and Commons linked>

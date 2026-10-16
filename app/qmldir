@@ -6,3 +6,4 @@ ScreenEffects 1.0 ScreenEffects.qml
 EffectText 1.0 EffectText.qml
 TypingLetters 1.0 TypingLetters.qml
 Backdrop 1.0 Backdrop.qml
+BoundedPaste 1.0 BoundedPaste.qml
