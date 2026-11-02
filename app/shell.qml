@@ -7,6 +7,7 @@ import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui as O
 import "TextEdit.js" as Edit
 
@@ -392,8 +393,8 @@ ShellRoot {
         const colors = themeColors.text();
         if (!colors) return;
         root.appliedTheme = colors;
-        Color.loadColors(colors);
-        Color.loadShell(themeShell.text() || "");
+        Commons.Color.loadColors(colors);
+        Commons.Color.loadShell(themeShell.text() || "");
         Style.scheduleRefresh();
     }
 
