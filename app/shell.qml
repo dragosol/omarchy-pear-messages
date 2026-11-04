@@ -85,6 +85,9 @@ ShellRoot {
         while (msgModel.count > want.length) msgModel.remove(msgModel.count - 1);
     }
     property var picker: null            // {id, x, y, mine} - the reaction picker, when open
+    property var ctxMenu: null           // {x, y, items: [{label, danger, run}]} - a right-click menu, when open
+    property var confirmBox: null        // {title, body, action, run} - asking before something can't be undone
+    property string afterDelete: ""      // the conversation to open once the one on screen is deleted
     // An inline-reply thread, open over the conversation: {message (the id it was opened
     // from), root (guid of the message that began the thread), messages (root first), loading}.
     // While it's open the composer replies into it.
@@ -656,6 +659,14 @@ ShellRoot {
         case "open":
             if (d.thread) root.openThread(d.thread);
             break;
+        case "deleted":
+            if (!d.ok) { root.flash = d.error || "Couldn't delete it"; break; }
+            if (d.thread && d.thread === root.current) {
+                if (root.afterDelete && root.threads.some(t => t.id === root.afterDelete)) root.openThread(root.afterDelete);
+                else root.startCompose();
+            }
+            root.afterDelete = "";
+            break;
         case "error":
             root.flash = d.error;
             break;
@@ -802,6 +813,53 @@ ShellRoot {
         if (n >= 1e3) return Math.round(n / 1e3) + " KB";
         return n + " B";
     }
+    // ---- deleting (on this computer only; the Mac and the iPhone keep their copies)
+    function openMenu(item, px, py, items) {
+        const p = item.mapToItem(scope, px, py);
+        root.picker = null;
+        root.effectPickerOpen = false;
+        root.ctxMenu = { x: p.x, y: p.y, items: items };
+    }
+    function closeOverlays() {
+        if (root.confirmBox) { root.confirmBox = null; return true; }
+        if (root.ctxMenu) { root.ctxMenu = null; return true; }
+        return false;
+    }
+    function threadMenu(item, px, py, t) {
+        root.openMenu(item, px, py, [{ label: "Delete Conversation…", danger: true, run: () => root.askDeleteThread(t) }]);
+    }
+    function messageMenu(item, px, py, m) {
+        if (m.status === "sending") return;
+        root.openMenu(item, px, py, [{ label: "Delete Message…", danger: true, run: () => root.askDeleteMessage(m) }]);
+    }
+    function askDeleteThread(t) {
+        root.confirmBox = {
+            title: "Delete this conversation?",
+            body: "Your conversation with " + (t.title || "them") + " is removed from Pear Messages on this computer. "
+                + "Your Mac and iPhone keep their copies. A new message starts it again.",
+            action: "Delete Conversation",
+            run: () => root.deleteThread(t.id)
+        };
+    }
+    function askDeleteMessage(m) {
+        root.confirmBox = {
+            title: "Delete this message?",
+            body: "It's removed from Pear Messages on this computer. Your Mac and iPhone keep their copies, "
+                + "and the other person still has it.",
+            action: "Delete Message",
+            run: () => root.send({ op: "delete_messages", ids: [m.id] })
+        };
+    }
+    function deleteThread(id) {
+        if (id === root.current) {
+            const list = root.shownThreads;
+            const i = list.findIndex(t => t.id === id);
+            const next = list[i + 1] || list[i - 1];
+            root.afterDelete = next ? next.id : "";
+        }
+        root.send({ op: "delete_thread", thread: id });
+    }
+
     function openPicker(m, item) {
         if (root.picker && root.picker.id === m.id) { root.picker = null; return; }
         const p = item.mapToItem(msgArea, 0, 0);
@@ -844,6 +902,10 @@ ShellRoot {
                 const ctrl = ev.modifiers & Qt.ControlModifier;
                 if (ev.key === Qt.Key_Space && root.builtinPreview) { root.builtinPreview = ""; ev.accepted = true; return; }
                 if (ev.key === Qt.Key_Space && root.spacePreview()) { ev.accepted = true; return; }
+                if (ev.key === Qt.Key_Escape && root.closeOverlays()) { ev.accepted = true; return; }
+                if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && root.confirmBox) {
+                    const c = root.confirmBox; root.confirmBox = null; c.run(); ev.accepted = true; return;
+                }
                 if (ev.key === Qt.Key_Escape) {
                     if (root.builtinPreview) root.builtinPreview = "";
                     else if (root.picker) root.picker = null;
@@ -890,6 +952,114 @@ ShellRoot {
                     font.pixelSize: Theme.fCaption
                 }
                 TapHandler { onTapped: root.builtinPreview = "" }
+            }
+
+            // ---- right-click menu
+            MouseArea {
+                anchors.fill: parent
+                z: 110
+                visible: !!root.ctxMenu
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onPressed: root.ctxMenu = null
+                onWheel: wheel => { root.ctxMenu = null; wheel.accepted = false; }
+            }
+            Rectangle {
+                id: ctxBox
+                z: 111
+                visible: !!root.ctxMenu
+                width: Math.max(180, ctxCol.implicitWidth + 12)
+                height: ctxCol.implicitHeight + 12
+                x: root.ctxMenu ? Math.max(6, Math.min(scope.width - width - 6, root.ctxMenu.x)) : 0
+                y: root.ctxMenu ? Math.max(6, Math.min(scope.height - height - 6, root.ctxMenu.y)) : 0
+                radius: Math.max(Theme.radius, 6)
+                color: Theme.bg
+                border.width: 1
+                border.color: Theme.line
+                Column {
+                    id: ctxCol
+                    x: 6; y: 6
+                    Repeater {
+                        model: root.ctxMenu ? root.ctxMenu.items : []
+                        Rectangle {
+                            id: ctxItem
+                            required property var modelData
+                            width: ctxBox.width - 12
+                            height: ctxLabel.implicitHeight + 14
+                            radius: Math.max(Theme.radius - 2, 4)
+                            color: ctxHover.hovered ? Theme.hover : "transparent"
+                            Text {
+                                id: ctxLabel
+                                textFormat: Text.PlainText
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 10
+                                text: ctxItem.modelData.label
+                                color: ctxItem.modelData.danger ? Theme.danger : Theme.fg
+                                font.family: Theme.uiFont
+                                font.pixelSize: Theme.fSmall
+                            }
+                            HoverHandler { id: ctxHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler {
+                                onTapped: { const run = ctxItem.modelData.run; root.ctxMenu = null; run(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- asking before deleting
+            Rectangle {
+                anchors.fill: parent
+                z: 120
+                visible: !!root.confirmBox
+                color: Qt.rgba(0, 0, 0, 0.45)
+                MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; onClicked: root.confirmBox = null; onWheel: wheel => wheel.accepted = true }
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: Math.min(420, parent.width - 48)
+                    height: confirmCol.implicitHeight + 40
+                    radius: Math.max(Theme.radius, 10)
+                    color: Theme.bg
+                    border.width: 1
+                    border.color: Theme.line
+                    MouseArea { anchors.fill: parent }   // clicks inside don't dismiss it
+                    ColumnLayout {
+                        id: confirmCol
+                        x: 20; y: 20
+                        width: parent.width - 40
+                        spacing: 10
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.confirmBox ? root.confirmBox.title : ""
+                            wrapMode: Text.WordWrap
+                            color: Theme.fg
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            font.weight: Font.DemiBold
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.confirmBox ? root.confirmBox.body : ""
+                            wrapMode: Text.WordWrap
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.topMargin: 6
+                            spacing: 8
+                            Item { Layout.fillWidth: true }
+                            AppButton { text: "Cancel"; onClicked: root.confirmBox = null }
+                            AppButton {
+                                text: root.confirmBox ? root.confirmBox.action : ""
+                                foreground: Theme.danger
+                                onClicked: { const c = root.confirmBox; root.confirmBox = null; if (c) c.run(); }
+                            }
+                        }
+                    }
+                }
             }
 
             // drop files anywhere on the window to attach them
@@ -1050,7 +1220,11 @@ ShellRoot {
                                     id: rowMouse
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    onClicked: root.openThread(row.modelData.id)
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    onClicked: mouse => {
+                                        if (mouse.button === Qt.RightButton) root.threadMenu(rowMouse, mouse.x, mouse.y, row.modelData);
+                                        else root.openThread(row.modelData.id);
+                                    }
                                 }
 
                                 RowLayout {
@@ -1649,6 +1823,10 @@ ShellRoot {
                                         NumberAnimation { target: msgItem; property: "opacity"; from: 0; to: 1; duration: 260; easing.type: Easing.OutQuad }
                                     }
                                     Component.onCompleted: if (root.arriving[mid]) riseIn.start()
+                                    TapHandler {
+                                        acceptedButtons: Qt.RightButton
+                                        onTapped: (pt, button) => root.messageMenu(msgItem, pt.position.x, pt.position.y, msgItem.m)
+                                    }
                                     readonly property bool mine: m.fromMe
                                     readonly property var prev: index > 0 ? root.msgs[index - 1] : null
                                     readonly property bool showStamp: !prev || m.ts - prev.ts > 1800
@@ -3010,6 +3188,10 @@ ShellRoot {
                                         topPadding: 9
                                         bottomPadding: 9
                                         Keys.onPressed: function (ev) {
+                                            if (ev.key === Qt.Key_Escape && root.closeOverlays()) { ev.accepted = true; return; }
+                                            if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && root.confirmBox) {
+                                                const c = root.confirmBox; root.confirmBox = null; c.run(); ev.accepted = true; return;
+                                            }
                                             if (ev.key === Qt.Key_V && (ev.modifiers & Qt.ControlModifier) && root.canAttach)
                                                 root.send({ op: "clipboard_image" });
                                             if (ev.key === Qt.Key_Space && composer.text === "" && (root.builtinPreview || root.spacePreview())) {
@@ -3916,6 +4098,8 @@ ShellRoot {
         if (root.preview === "effects") root.effectPickerOpen = true;
         if (root.preview === "react") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
         if (root.preview === "reactok") Qt.callLater(() => { root.picker = { id: 5, m: root.msgs[4], x: 20, y: 470, w: 240, mine: false }; });
+        if (root.preview === "deletemenu") Qt.callLater(() => { root.openMenu(scope, 520, 300, [{ label: "Delete Message…", danger: true, run: () => {} }]); });
+        if (root.preview === "deletethread") Qt.callLater(() => { if (root.threads[0]) root.askDeleteThread(root.threads[0]); });
         // fx_<Name>: play that screen effect, e.g. PEAR_MESSAGES_PREVIEW=fx_Confetti
         if (root.preview === "textfx") {
             const fxs = ["big", "small", "shake", "nod", "explode", "ripple", "bloom", "jitter"];

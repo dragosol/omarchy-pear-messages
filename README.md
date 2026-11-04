@@ -52,6 +52,11 @@ once.
   message that began a thread says how many replies it has. Click either, or ↩ beside a message,
   to open the thread over the conversation; the message box then replies into it. Reading
   replies works with any BlueBubbles setup; sending them needs the Private API, like reactions.
+- **Deleting.** Right-click a conversation or a message and pick Delete. It goes from Pear
+  Messages on this computer only: your Mac and iPhone keep their copies (BlueBubbles can delete
+  only with its Private API, and Bluetooth can't at all). A deleted message never comes back
+  from either connection, its text and cached files are removed, and the older history of a
+  deleted conversation stays gone. A new message starts the conversation again.
 - **Frosted header and composer.** Conversations and messages scroll on under the header,
   the search field and the composer, blurred, instead of being cut off at an edge. Settings →
   "Frosted header and composer" turns it off.

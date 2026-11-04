@@ -685,6 +685,53 @@ class Daemon:
                          "messages": [{"id": rid, "thread": row["thread"], "hidden": True}]})
         self._broadcast_threads()
 
+    # ------------------------------------------------------------ deleting
+    def delete_messages(self, ids: list[int]) -> dict:
+        """Delete messages from this computer (the Mac and the phone keep theirs)."""
+        busy = [i for i in ids if i in self._in_flight]
+        if busy:
+            return {"ok": False, "error": "That message is still sending."}
+        return self._deleted(self.store.delete_messages(ids))
+
+    def delete_thread(self, tid: str) -> dict:
+        if not tid:
+            return {"ok": False, "error": "No conversation."}
+        if any(self.store.db.execute("SELECT 1 FROM messages WHERE id=? AND thread=?", (i, tid)).fetchone()
+               for i in self._in_flight):
+            return {"ok": False, "error": "A message in this conversation is still sending."}
+        return {**self._deleted(self.store.delete_thread(tid)), "thread": tid}
+
+    def _deleted(self, rows: list[dict]) -> dict:
+        by: dict[str, list] = {}
+        for r in rows:
+            by.setdefault(r["thread"], []).append({"id": r["id"], "thread": r["thread"], "hidden": True})
+            for a in r["attachments"]:
+                self._forget_files(a.get("guid") or "")
+        for tid, msgs in by.items():
+            self._broadcast({"ev": "messages", "thread": tid, "messages": msgs})
+        if rows:
+            self._broadcast_threads()
+            log(f"deleted {len(rows)} message(s) here")
+        return {"ok": True, "count": len(rows)}
+
+    def _forget_files(self, guid: str) -> None:
+        """The cached previews and downloaded copies of one attachment (never a file of yours
+        that a send pointed at)."""
+        if len(guid) < 8:
+            return
+        for d in (os.path.join(CACHE, "previews"), os.path.join(CACHE, "attachments"),
+                  os.path.join(RUNTIME, "previews"), os.path.join(RUNTIME, "attachments")):
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for n in names:
+                if n.startswith(guid[:16] + "-"):
+                    try:
+                        os.unlink(os.path.join(d, n))
+                    except OSError:
+                        pass
+
     # ------------------------------------------------------------ picking files
     def _pick_files(self, c, rid) -> None:
         """The desktop's own file chooser, through xdg-desktop-portal."""
@@ -1086,6 +1133,10 @@ class Daemon:
             self._clipboard_image(c, rid)
         elif op == "file_info":
             reply({"ev": "file_info", "files": [self._file_info(f) for f in req.get("files", []) if os.path.isfile(f)]})
+        elif op == "delete_messages":
+            reply({"ev": "deleted", **self.delete_messages([int(i) for i in req.get("ids", [])])})
+        elif op == "delete_thread":
+            reply({"ev": "deleted", **self.delete_thread(req.get("thread", ""))})
         elif op == "react":
             self.react(c, rid, int(req["message"]), req.get("reaction", ""))
         elif op == "retry":
@@ -1246,6 +1297,10 @@ class Daemon:
                 guids += [f"iMessage;-;{a}", f"SMS;-;{a}", f"RCS;-;{a}"]
         guids = list(dict.fromkeys(g for g in guids if g))
         oldest = local[0]["ts"] if local else before
+        if oldest <= self.store.deleted_until(tid):
+            # everything before this you deleted
+            self._send(c, {"ev": "older", "re": rid, "thread": tid, "messages": local, "more": False})
+            return
         client = self.client
 
         def work():
@@ -1261,8 +1316,9 @@ class Daemon:
             if got:
                 self._ingest_bb(list(reversed(got)))
             msgs = self.store.messages(tid, count, before)
+            until = self.store.deleted_until(tid)
             self._send(c, {"ev": "older", "re": rid, "thread": tid, "messages": msgs,
-                           "more": bool(got) or len(msgs) >= count,
+                           "more": any((g.get("dateCreated") or 0) / 1000.0 > until for g in got) or len(msgs) >= count,
                            "note": "" if msgs else "No earlier messages."})
             return False
 

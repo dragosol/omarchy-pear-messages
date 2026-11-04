@@ -19,6 +19,7 @@ are one thread. A group chat only BlueBubbles knows about is keyed by its chat g
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -52,6 +53,8 @@ CREATE TABLE IF NOT EXISTS messages (
     hidden      INTEGER NOT NULL DEFAULT 0,  -- 1: the received copy of a message you sent yourself
                                              -- 2: only the phone reported it, and the Mac, which had the
                                              --    conversation at that moment, does not (see hide_phone_only)
+                                             -- 3: you deleted it. The row stays as an empty stand-in (ids, time,
+                                             --    sender, a hash of the text) so neither connection brings it back
     reply_to    TEXT NOT NULL DEFAULT '',    -- inline reply: bb_guid of the message that began its thread
     reply_part  INTEGER NOT NULL DEFAULT 0   -- which part of that message
 );
@@ -64,7 +67,8 @@ CREATE TABLE IF NOT EXISTS threads (
     participants TEXT NOT NULL DEFAULT '[]',   -- addresses
     is_group     INTEGER NOT NULL DEFAULT 0,
     bb_chat      TEXT NOT NULL DEFAULT '',     -- BlueBubbles chat guid, when known
-    service      TEXT NOT NULL DEFAULT ''      -- iMessage | SMS
+    service      TEXT NOT NULL DEFAULT '',     -- iMessage | SMS
+    deleted_until REAL NOT NULL DEFAULT 0      -- you deleted the conversation: nothing up to this time comes back
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
@@ -175,6 +179,8 @@ class Store:
                 self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
                 resync = resync or col in ("effect", "runs", "reply_to")
         self.db.execute("CREATE INDEX IF NOT EXISTS messages_reply ON messages(reply_to) WHERE reply_to!=''")
+        if "deleted_until" not in {r[1] for r in self.db.execute("PRAGMA table_info(threads)")}:
+            self.db.execute("ALTER TABLE threads ADD COLUMN deleted_until REAL NOT NULL DEFAULT 0")
         if "card" not in {r[1] for r in self.db.execute("PRAGMA table_info(contacts)")}:
             self.db.execute("ALTER TABLE contacts ADD COLUMN card TEXT NOT NULL DEFAULT ''")
         if self.get_meta("reaction_keys_v1") != "done":
@@ -280,6 +286,8 @@ class Store:
             self.ensure_thread(new, participants=json.loads(old["participants"]),
                                bb_chat=old["bb_chat"], service=old["service"])
             self.db.execute("UPDATE messages SET thread=? WHERE thread=?", (new, tid))
+            self.db.execute("UPDATE threads SET deleted_until=MAX(deleted_until, ?) WHERE id=?",
+                            (old["deleted_until"], new))
             self.db.execute("DELETE FROM threads WHERE id=?", (tid,))
             moved += 1
         if moved:
@@ -603,7 +611,23 @@ class Store:
             self._update(twin, m, source, merge_id=(id_col, own_id))
             return "merged", twin["id"]
 
-        # 3. New.
+        # 2b. A message you deleted, arriving again from the other connection.
+        gone = self._deleted_twin(from_me=from_me, sender=sender, norm=norm, ts=float(m["ts"]), id_col=id_col)
+        if gone is not None:
+            self._update(gone, m, source, merge_id=(id_col, own_id))
+            return "same", gone["id"]
+
+        # 3. New. Older history of a conversation you deleted is stored as already deleted.
+        until = self.db.execute("SELECT deleted_until FROM threads WHERE id=?", (m["thread"],)).fetchone()
+        if until and float(m["ts"]) <= until[0]:
+            cur = self.db.execute(
+                "INSERT INTO messages(thread,from_me,sender,sender_addr,norm,ts,status,via,bb_guid,map_handle,"
+                "temp_id,hidden) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (m["thread"], int(from_me), sender, "" if from_me else m.get("sender_addr", ""), _deleted_norm(norm),
+                 float(m["ts"]), m.get("status", ""), source, m.get("bb_guid"), m.get("map_handle"),
+                 m.get("temp_id"), DELETED))
+            self.db.commit()
+            return "same", cur.lastrowid
         cur = self.db.execute(
             "INSERT INTO messages(thread,from_me,sender,sender_addr,text,norm,ts,status,error,via,"
             "bb_guid,map_handle,temp_id,attachments,unread,effect,runs,reply_to,reply_part) "
@@ -628,6 +652,14 @@ class Store:
             upd[merge_id[0]] = merge_id[1]
             if r["via"] not in (source, "both"):
                 upd["via"] = "both" if r["via"] in ("bluebubbles", "iphone") else source
+        if r["hidden"] == DELETED:
+            # deleted: learn the other connection's id, so it is recognised next time; nothing else
+            upd = {k: v for k, v in upd.items() if r[k] != v}
+            if upd:
+                self.db.execute("UPDATE messages SET " + ",".join(f"{k}=?" for k in upd) + " WHERE id=?",
+                                (*upd.values(), r["id"]))
+                self.db.commit()
+            return False
         if source == "bluebubbles":
             # BlueBubbles knows the exact time and the real chat (a group, say).
             upd["ts"] = float(m["ts"])
@@ -700,7 +732,7 @@ class Store:
         """Merge iPhone-only rows into BlueBubbles-only rows that are the same message.
         Returns how many duplicates were removed."""
         n = 0
-        for r in self.db.execute("SELECT * FROM messages WHERE map_handle IS NOT NULL AND bb_guid IS NULL").fetchall():
+        for r in self.db.execute("SELECT * FROM messages WHERE map_handle IS NOT NULL AND bb_guid IS NULL AND hidden!=3").fetchall():
             twin = self._find_twin(from_me=bool(r["from_me"]), sender=r["sender"], norm=normalize(r["text"]),
                                    ts=r["ts"], id_col="map_handle")
             if twin is None or twin["id"] == r["id"] or not twin["bb_guid"]:
@@ -712,6 +744,53 @@ class Store:
             n += 1
         self.db.commit()
         return n
+
+    # --------------------------------------------------------------- deleting
+    # Deleting is on this computer only: the Mac and the phone keep their copies (BlueBubbles can
+    # delete only with its Private API, and Bluetooth can't at all). So a deleted message stays
+    # as an empty stand-in that both connections' copies match, and is never shown again.
+
+    def _deleted_twin(self, *, from_me: bool, sender: str, norm: str, ts: float, id_col: str) -> sqlite3.Row | None:
+        dn = _deleted_norm(norm)
+        if not dn:
+            return None
+        win = MATCH_WINDOW
+        return self.db.execute(
+            f"SELECT * FROM messages WHERE hidden=3 AND from_me=? AND {id_col} IS NULL AND norm=? "
+            "AND ts BETWEEN ? AND ? " + ("" if from_me else "AND sender=? ") + "ORDER BY ABS(ts-?) LIMIT 1",
+            (int(from_me), dn, ts - win, ts + win) + (() if from_me else (sender,)) + (ts,)).fetchone()
+
+    def delete_messages(self, ids) -> list[dict]:
+        """Delete messages here. Returns {id, thread, attachments} for each one deleted (the
+        attachments, so their cached files can go too). A send that never left is removed outright."""
+        out = []
+        for mid in ids:
+            r = self.db.execute("SELECT * FROM messages WHERE id=?", (int(mid),)).fetchone()
+            if r is None or r["hidden"] == DELETED:
+                continue
+            out.append({"id": r["id"], "thread": r["thread"], "attachments": json.loads(r["attachments"])})
+            if not (r["bb_guid"] or r["map_handle"]) and r["status"] in ("queued", "failed"):
+                self.db.execute("DELETE FROM messages WHERE id=?", (r["id"],))
+                continue
+            self.db.execute(
+                "UPDATE messages SET hidden=3, unread=0, text='', norm=?, attachments='[]', reactions='{}', "
+                "runs='[]', effect='', error='' WHERE id=?", (_deleted_norm(r["norm"]), r["id"]))
+        self.db.commit()
+        return out
+
+    def delete_thread(self, tid: str) -> list[dict]:
+        """Delete a whole conversation here: every message in it, and any older history the Mac
+        might send later. New messages after this bring it back, starting from them."""
+        last = self.db.execute("SELECT MAX(ts) FROM messages WHERE thread=?", (tid,)).fetchone()[0]
+        if last is None:
+            return []
+        self.db.execute("UPDATE threads SET deleted_until=MAX(deleted_until, ?) WHERE id=?", (last, tid))
+        ids = [r[0] for r in self.db.execute("SELECT id FROM messages WHERE thread=? AND hidden!=3", (tid,))]
+        return self.delete_messages(ids)
+
+    def deleted_until(self, tid: str) -> float:
+        r = self.db.execute("SELECT deleted_until FROM threads WHERE id=?", (tid,)).fetchone()
+        return float(r[0]) if r else 0.0
 
     def link_preview(self, url: str) -> dict | None:
         r = self.db.execute("SELECT * FROM link_previews WHERE url=?", (url,)).fetchone()
@@ -731,19 +810,19 @@ class Store:
     def prune(self, per_chat: int, total: int) -> int:
         """Drop the oldest messages beyond the limits (0 = none). Kept regardless: unread
         messages and yours that haven't gone yet. Returns how many were removed."""
-        keep_rule = "unread=0 AND status NOT IN ('queued','sending','failed')"
+        keep_rule = "unread=0 AND status NOT IN ('queued','sending','failed') AND hidden!=3"
         n = 0
         if per_chat > 0:
-            for (tid,) in self.db.execute("SELECT thread FROM messages GROUP BY thread HAVING COUNT(*) > ?",
+            for (tid,) in self.db.execute("SELECT thread FROM messages WHERE hidden!=3 GROUP BY thread HAVING COUNT(*) > ?",
                                           (per_chat,)).fetchall():
                 n += self.db.execute(
                     f"DELETE FROM messages WHERE thread=? AND {keep_rule} AND id NOT IN "
-                    "(SELECT id FROM messages WHERE thread=? ORDER BY ts DESC LIMIT ?)",
+                    "(SELECT id FROM messages WHERE thread=? AND hidden!=3 ORDER BY ts DESC LIMIT ?)",
                     (tid, tid, per_chat)).rowcount
         if total > 0:
             n += self.db.execute(
                 f"DELETE FROM messages WHERE {keep_rule} AND id NOT IN "
-                "(SELECT id FROM messages ORDER BY ts DESC LIMIT ?)", (total,)).rowcount
+                "(SELECT id FROM messages WHERE hidden!=3 ORDER BY ts DESC LIMIT ?)", (total,)).rowcount
         self.db.commit()
         return n
 
@@ -862,6 +941,14 @@ class Store:
     def latest_ts(self, via_col: str) -> float:
         r = self.db.execute(f"SELECT MAX(ts) FROM messages WHERE {via_col} IS NOT NULL").fetchone()
         return r[0] or 0.0
+
+
+DELETED = 3
+
+
+def _deleted_norm(norm: str) -> str:
+    """What a deleted message keeps of its text: enough to recognise another copy of it, not the words."""
+    return "#del:" + hashlib.sha256(norm.encode()).hexdigest()[:24] if norm and not norm.startswith("#del:") else norm
 
 
 def now() -> float:
