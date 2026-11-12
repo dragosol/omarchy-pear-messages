@@ -6,7 +6,8 @@ cards), falling back to <title> and the meta description. No images.
 
 Safety: only http(s); only public addresses - a message must not be able to make this
 computer probe your router, localhost or your tailnet, so every hop (redirects included) is
-resolved and checked; at most MAX_BYTES of HTML are read.
+resolved and checked; at most MAX_BYTES of HTML are read, and the whole fetch - every hop's
+connect, headers and body - gets DEADLINE seconds, after which its sockets are shut down.
 
 The address that is checked is the address that is connected to. Resolving the name once to
 check it and then handing the NAME to urllib would resolve it a second time, and a sender who
@@ -21,13 +22,16 @@ import http.client
 import ipaddress
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
 MAX_BYTES = 600 * 1024
-TIMEOUT = 8
+TIMEOUT = 8          # any one wait on the network
+DEADLINE = 15        # the whole preview, redirects included
 # Many sites only hand their preview tags to link-preview crawlers.
 UA = ("Mozilla/5.0 (compatible; PearMessages/1.0 link preview; "
       "+https://github.com/dragosol/omarchy-pear-messages) facebookexternalhit/1.1")
@@ -111,10 +115,48 @@ def _check(url: str) -> str:
     return url
 
 
+class _Budget(threading.local):
+    """The fetch running on this thread: when it must be over, and the sockets it opened.
+
+    A socket timeout is per wait, so a server that sends one byte every few seconds never trips
+    it and can hold a preview for as long as it likes. At the deadline a timer shuts every socket
+    of the fetch down, which ends a blocked read at once, whatever layer (TLS, buffering) it's in.
+    """
+    deadline = None
+    socks = None
+
+
+_budget = _Budget()
+
+
+def _remaining() -> float:
+    if _budget.deadline is None:
+        return TIMEOUT
+    left = _budget.deadline - time.monotonic()
+    if left <= 0:
+        raise Blocked("too slow")
+    return min(TIMEOUT, left)
+
+
+def _connect(ip: str, port: int, source_address) -> socket.socket:
+    sock = socket.create_connection((ip, port), _remaining(), source_address)
+    if _budget.socks is not None:
+        _budget.socks.append(sock)
+    return sock
+
+
+def _shut(socks: list) -> None:
+    for sock in list(socks):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 class _PinnedHTTPConnection(http.client.HTTPConnection):
     def connect(self):
         _family, ip = _resolve(self.host)
-        self.sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+        self.sock = _connect(ip, self.port, self.source_address)
         if self._tunnel_host:
             self._tunnel()
 
@@ -122,7 +164,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def connect(self):
         _family, ip = _resolve(self.host)
-        sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+        sock = _connect(ip, self.port, self.source_address)
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
@@ -225,13 +267,28 @@ def fetch(url: str) -> dict:
     _check(url)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,application/xhtml+xml",
                                                "Accept-Language": "en;q=0.9, *;q=0.5"})
-    with _opener.open(req, timeout=TIMEOUT) as r:
-        ctype = r.headers.get("Content-Type", "")
-        if "html" not in ctype and "xml" not in ctype:
-            raise Blocked("not a web page")
-        raw = r.read(MAX_BYTES)
-        charset = r.headers.get_content_charset()
-        final = r.geturl()
+    socks: list = []
+    _budget.deadline, _budget.socks = time.monotonic() + DEADLINE, socks
+    timer = threading.Timer(DEADLINE, _shut, (socks,))
+    timer.daemon = True
+    timer.start()
+    try:
+        with _opener.open(req, timeout=TIMEOUT) as r:
+            ctype = r.headers.get("Content-Type", "")
+            if "html" not in ctype and "xml" not in ctype:
+                raise Blocked("not a web page")
+            raw = r.read(MAX_BYTES)
+            charset = r.headers.get_content_charset()
+            final = r.geturl()
+        _remaining()                     # a read the timer cut short is not a page
+    except (OSError, http.client.HTTPException):   # IncompleteRead, when the timer cut the body
+        if _budget.deadline is not None and time.monotonic() >= _budget.deadline:
+            raise Blocked("too slow") from None
+        raise
+    finally:
+        timer.cancel()
+        _shut(socks)
+        _budget.deadline, _budget.socks = None, None
     if not charset:
         m = re.search(rb'<meta[^>]+charset=["\']?([\w-]+)', raw[:4096], re.I)
         charset = m.group(1).decode() if m else "utf-8"

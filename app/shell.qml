@@ -617,7 +617,8 @@ ShellRoot {
             break;
         case "link_preview": {
             const l = Object.assign({}, root.linkPreviews);
-            l[d.url] = d;
+            if (d.busy) delete l[d.url];      // too many fetches at once: ask again when it shows
+            else l[d.url] = d;
             root.linkPreviews = l;
             break;
         }
@@ -2082,6 +2083,7 @@ ShellRoot {
                                                 anchors.bottom: parent.bottom
                                                 readonly property var segs: msgItem.m.segments || []
                                                 readonly property bool textFx: segs.some(sg => !!sg.effect)
+                                                    && segs.reduce((n, sg) => n + sg.text.length, 0) <= effText.maxLetters
                                                 // letters drawn one by one come out a little wider than the string
                                                 width: Math.min(textFx ? effText.naturalWidth + 2 : measure.implicitWidth, list.bubbleMax - 28) + 28
                                                 height: (textFx ? effText.height : body.implicitHeight) + 16

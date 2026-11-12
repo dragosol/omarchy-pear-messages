@@ -111,6 +111,11 @@ CROSS_HANDLE_WINDOW = 20.0
 SELF_MIRROR_WINDOW = 120.0
 
 _OBJ = "￼"  # what Messages puts in the text where an attachment sits
+# Text effects draw every character of the message as its own moving item, so only a message this
+# short keeps them; a longer one shows its text plain (bold, italic... stay). Messages' own effect
+# picker is for a line or two. And a message keeps at most MAX_RUNS formatting runs.
+EFFECT_MAX_CHARS = 500
+MAX_RUNS = 256
 _TAPBACK_PREFIX = re.compile(
     r"^(Loved|Liked|Disliked|Laughed at|Emphasized|Questioned|Reacted \S+ to)\s+[“\"]", re.I)
 
@@ -963,6 +968,9 @@ def _segments(text: str, runs: list[dict]) -> list[dict]:
         return []
     u = (text or "").encode("utf-16-le")
     n = len(u) // 2
+    runs = runs[:MAX_RUNS]
+    if n > EFFECT_MAX_CHARS:
+        runs = [{**r, "effect": ""} for r in runs]
     cuts = sorted({0, n} | {max(0, min(n, r["start"])) for r in runs}
                   | {max(0, min(n, r["start"] + r["length"])) for r in runs})
     out = []

@@ -15,6 +15,10 @@ import Quickshell
 Flow {
     id: et
     property var segments: []
+    // Each letter is an item with its own bindings, so a long message must never get here; the
+    // daemon and the bubble both keep effects to EFFECT_MAX_CHARS. This is the last stop: past it
+    // the letters are not built at all.
+    readonly property int maxLetters: 500
     property color color: "white"
     property font font
     property bool running: visible
@@ -83,11 +87,13 @@ Flow {
         const out = [];
         const runs = [];
         let cur = [];
-        let prevFx = null, runIdx = 0;
+        let prevFx = null, runIdx = 0, count = 0;
         for (const seg of et.segments) {
+            if (count >= et.maxLetters) break;
             const fx = seg.effect || "";
             if (fx !== prevFx) { runIdx = 0; runs.push({ fx: fx, n: 0 }); prevFx = fx; }
-            for (const ch of et.graphemes(seg.text)) {
+            for (const ch of et.graphemes(seg.text.slice(0, et.maxLetters * 8))) {
+                if (++count > et.maxLetters) break;
                 const run = runs[runs.length - 1];
                 const t = { ch: ch, styles: seg.styles || [], effect: fx, i: runIdx++, run: runs.length - 1,
                             seed: Math.random() * 1000, dir: Math.random() * Math.PI * 2,

@@ -16,8 +16,10 @@ answers with events carrying "ev" (and "re" = the request's "id" when it is an a
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -41,6 +43,20 @@ from . import linkpreview
 from .store import Store, addr_thread
 
 CLIP_IMAGE_MAX = 50 * 1024 * 1024   # a pasted image bigger than this isn't attached
+LINK_PREVIEW_SLOTS = 4              # link previews fetched at once
+LINK_PREVIEW_QUEUE = 32             # and waiting for a slot; past that a link is skipped for now
+
+
+def _file_key(guid: str) -> str:
+    """The name an attachment's cached files go by. The GUID comes from the server, so it is
+    never part of a path itself: "/tmp/x" or "../.." would have put a preview outside the cache."""
+    return hashlib.sha256(guid.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+# Previews as older versions named them: after the GUID, and before 1.2.10 possibly sideways.
+# They are never read again and go at the next prune. (Not "anything but the current name": a
+# preview being made right now has a temporary name in the same folder.)
+OLD_PREVIEW = re.compile(r"-(preview|upright)\.jpg$")
 
 HOME = os.path.expanduser("~")
 CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "pear-messages")
@@ -719,6 +735,7 @@ class Daemon:
         that a send pointed at)."""
         if len(guid) < 8:
             return
+        key = _file_key(guid)
         for d in (os.path.join(CACHE, "previews"), os.path.join(CACHE, "attachments"),
                   os.path.join(RUNTIME, "previews"), os.path.join(RUNTIME, "attachments")):
             try:
@@ -726,7 +743,7 @@ class Daemon:
             except OSError:
                 continue
             for n in names:
-                if n.startswith(guid[:16] + "-"):
+                if n.startswith((key + "-", key + ".", guid[:16] + "-")):   # the last: older names
                     try:
                         os.unlink(os.path.join(d, n))
                     except OSError:
@@ -1333,16 +1350,22 @@ class Daemon:
         if cached is not None:
             self._send(c, {"ev": "link_preview", **cached})
             return
+        if url not in self._link_waiting and len(self._link_waiting) >= LINK_PREVIEW_SLOTS + LINK_PREVIEW_QUEUE:
+            # Every distinct link would otherwise get its own thread. Nothing is cached: "busy"
+            # tells the window to ask again the next time the link comes into view.
+            self._send(c, {"ev": "link_preview", "url": url, "ok": False, "busy": True})
+            return
         waiting = self._link_waiting.setdefault(url, [])
         waiting.append(c)
         if len(waiting) > 1:
             return
 
         def work():
-            try:
-                p = linkpreview.fetch(url)
-            except Exception:
-                p = None
+            with self._link_slots:
+                try:
+                    p = linkpreview.fetch(url)
+                except Exception:
+                    p = None
             GLib.idle_add(done, p)
 
         def done(p):
@@ -1372,7 +1395,7 @@ class Daemon:
             files = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(d) if e.is_file()]
         except OSError:
             return
-        stale = [f for f in files if f[2].endswith("-preview.jpg")]   # the pre-1.2.10 name
+        stale = [f for f in files if OLD_PREVIEW.search(f[2])]
         for f in stale:
             try:
                 os.unlink(f[2])
@@ -1459,12 +1482,10 @@ class Daemon:
         is_image = (mime or "").startswith("image/")
         keep_dir, temp_dir = os.path.join(CACHE, "previews"), os.path.join(RUNTIME, "previews")
         if kind == "full":
-            fname, dirs = f"{guid[:16]}-{safe}", (os.path.join(RUNTIME, "attachments"),)
+            fname, dirs = f"{_file_key(guid)}-{safe}", (os.path.join(RUNTIME, "attachments"),)
             keep_dir = temp_dir = dirs[0]
         else:
-            # "-upright": previews made before 1.2.10 could be sideways (see media.photo_preview)
-            # and are never read again; _prune_media removes them.
-            fname, dirs = f"{guid[:16]}-upright.jpg", (keep_dir, temp_dir)
+            fname, dirs = f"{_file_key(guid)}.thumb.jpg", (keep_dir, temp_dir)
         for d in dirs + (os.path.join(CACHE, "attachments"),) if kind == "full" else dirs:
             if os.path.exists(os.path.join(d, fname)):
                 self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "kind": kind, "path": os.path.join(d, fname)})

@@ -1529,3 +1529,245 @@ class BlueBubblesResponseLimitTest(unittest.TestCase):
                 media.photo_preview(BB.Client(url, "pw"), "at_0_ABC", os.path.join(tmp, "x.jpg"))
         finally:
             media.MAX_PREVIEW = old
+
+
+class LinkPreviewDeadlineTest(unittest.TestCase):
+    """Review of 35bddb8: the 8 s timeout is per socket wait, so a page that sends a byte every
+    few seconds held a preview worker for as long as it liked."""
+
+    def setUp(self):
+        import http.server, threading
+        from pearmsg import linkpreview
+        self.lp = linkpreview
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                body = b"<html><head><title>ok</title></head></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                if self.path == "/drip":
+                    self.send_header("Content-Length", "30")
+                    self.end_headers()
+                    try:
+                        for _ in range(30):            # one byte every 0.3 s: never idle for 8 s, 9 s in all
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                            time.sleep(0.3)
+                    except OSError:
+                        pass
+                    return
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        saved = (linkpreview._is_public, linkpreview.DEADLINE)
+        linkpreview._is_public = lambda ip: True       # the address rules have their own tests
+        linkpreview.DEADLINE = 2
+
+        def restore():
+            linkpreview._is_public, linkpreview.DEADLINE = saved
+            self.server.shutdown()
+        self.addCleanup(restore)
+
+    def test_a_dripping_page_is_cut_off_at_the_deadline(self):
+        start = time.monotonic()
+        with self.assertRaises(self.lp.Blocked):
+            self.lp.fetch(self.base + "/drip")
+        took = time.monotonic() - start
+        self.assertLess(took, 4, f"the fetch ran {took:.1f} s against a 2 s deadline")
+
+    def test_the_next_link_still_works(self):
+        with self.assertRaises(self.lp.Blocked):
+            self.lp.fetch(self.base + "/drip")
+        self.assertEqual(self.lp.fetch(self.base + "/page").get("title"), "ok")
+        self.assertIsNone(self.lp._budget.deadline, "the deadline leaked to the next fetch")
+
+
+class LinkPreviewAdmissionTest(unittest.TestCase):
+    """One thread per distinct link, with no limit: now LINK_PREVIEW_SLOTS at once and at most
+    LINK_PREVIEW_QUEUE waiting; past that the window is told to ask again later."""
+
+    def test_past_the_queue_no_thread_is_started(self):
+        import threading
+        from pearmsg import daemon as D
+        sent = []
+        fake = type("F", (), {})()
+        fake.settings = {"linkPreviews": True}
+        fake.store = type("S", (), {"link_preview": lambda self, u: None})()
+        fake._send = lambda c, m: sent.append(m)
+        fake._link_slots = threading.BoundedSemaphore(D.LINK_PREVIEW_SLOTS)
+        fake._link_waiting = {f"https://example.com/{i}": [object()]
+                              for i in range(D.LINK_PREVIEW_SLOTS + D.LINK_PREVIEW_QUEUE)}
+        before = threading.active_count()
+        D.Daemon._link_preview(fake, "conn", "https://example.com/one-more")
+        self.assertEqual(threading.active_count(), before, "a fetch thread was started anyway")
+        self.assertEqual(sent, [{"ev": "link_preview", "url": "https://example.com/one-more",
+                                 "ok": False, "busy": True}])
+        self.assertNotIn("https://example.com/one-more", fake._link_waiting)
+
+    def test_the_window_asks_again_after_busy(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "app", "shell.qml")) as f:
+            src = f.read()
+        self.assertIn("if (d.busy) delete l[d.url];", src)
+
+
+class AttachmentPathTest(unittest.TestCase):
+    """Review of 35bddb8: the server's attachment GUID was part of the cache file name, so a GUID
+    such as "/tmp/pm" or "../../x" put a preview outside the cache."""
+
+    def test_cache_names_never_carry_the_guid(self):
+        from pearmsg import daemon as D
+        for guid in ("/tmp/pm", "../../../x", "at_0_ABC/../../y", "a\x00b", "é/..", "x" * 200):
+            with self.subTest(guid=guid):
+                key = D._file_key(guid)
+                self.assertRegex(key, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(D._file_key("at_0_A"), D._file_key("at_0_B"))
+
+    def test_a_hostile_guid_stays_in_the_cache(self):
+        import threading
+        from pearmsg import daemon as D, media
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(outside)
+            saved = (D.CACHE, D.RUNTIME, media.photo_preview)
+            D.CACHE, D.RUNTIME = os.path.join(tmp, "cache"), os.path.join(tmp, "run")
+            asked = []
+
+            def fake_preview(client, guid, dst):
+                asked.append(dst)
+                with open(dst, "wb") as f:
+                    f.write(b"jpeg")
+                return dst
+            media.photo_preview = fake_preview
+            try:
+                fake = type("F", (), {})()
+                fake.client, fake.bb_online = object(), True
+                fake._send = lambda c, m: None
+                fake._prune_media = lambda: None
+                for guid in (outside + "/pm", "../../outside/pm"):
+                    D.Daemon._attachment(fake, None, 1, guid, "p.jpg", "image/jpeg")
+                deadline = time.monotonic() + 5
+                while len(asked) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            finally:
+                D.CACHE, D.RUNTIME, media.photo_preview = saved
+            self.assertEqual(len(asked), 2)
+            for dst in asked:
+                self.assertEqual(os.path.dirname(dst), os.path.join(tmp, "cache", "previews"), dst)
+            self.assertEqual(os.listdir(outside), [], "a file was created outside the cache")
+
+
+class EffectBoundTest(unittest.TestCase):
+    """Review of 35bddb8: every character of a message with a text effect becomes its own item,
+    and nothing bounded how many."""
+
+    def test_a_long_message_keeps_no_effect(self):
+        from pearmsg import store
+        long = "a" * 100_000
+        segs = store._segments(long, [{"start": 0, "length": len(long), "styles": [], "effect": "jitter"}])
+        self.assertTrue(segs)
+        self.assertFalse(any(s["effect"] for s in segs), "a 100,000-character message kept its effect")
+        short = "hello there"
+        segs = store._segments(short, [{"start": 0, "length": len(short), "styles": ["bold"], "effect": "jitter"}])
+        self.assertEqual([(s["effect"], s["styles"]) for s in segs], [("jitter", ["bold"])])
+        segs = store._segments(long, [{"start": 0, "length": 5, "styles": ["bold"], "effect": "big"}])
+        self.assertEqual(segs[0]["styles"], ["bold"], "styles must survive dropping the effect")
+
+    def test_runs_are_capped(self):
+        from pearmsg import store
+        text = "ab" * 5000
+        runs = [{"start": i, "length": 1, "styles": ["bold" if i % 2 else "italic"], "effect": ""}
+                for i in range(10_000)]
+        self.assertLessEqual(len(store._segments(text, runs)), 2 * store.MAX_RUNS + 1)
+        attributed = [{"runs": [{"range": [i, 1], "attributes": {"__kIMTextBoldAttributeName": 1}}
+                                for i in range(10_000)]}]
+        self.assertEqual(len(BB.text_runs(attributed)), store.MAX_RUNS)
+
+    @unittest.skipUnless(__import__("shutil").which("quickshell"), "needs quickshell")
+    def test_the_component_builds_at_most_its_limit(self):
+        """The real EffectText, offscreen: 30,000 characters of jitter (1.2.10 was still building
+        it after 100 s)."""
+        import shutil, subprocess
+        app = os.path.join(os.path.dirname(__file__), "..", "..", "app")
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(os.path.join(app, "EffectText.qml"), tmp)
+            with open(os.path.join(tmp, "shell.qml"), "w") as f:
+                f.write('''import QtQuick
+import Quickshell
+ShellRoot {
+    EffectText {
+        id: et
+        width: 400
+        segments: [{ text: "ab cd ".repeat(Number(Quickshell.env("ET_TIMES"))), styles: [], effect: "jitter" }]
+    }
+    Timer {
+        interval: 200; running: true
+        onTriggered: {
+            let n = 0;
+            for (let r = 0; r < et.children.length; r++)
+                for (const g of et.children[r].children || []) if (g.toString().indexOf("Glyph") >= 0) n++;
+            console.warn("GLYPHS " + n);
+            Qt.quit();
+        }
+    }
+}
+''')
+            counts = {}
+            for times in (10, 5000):
+                env = dict(os.environ, QT_QPA_PLATFORM="offscreen", ET_TIMES=str(times))
+                out = subprocess.run(["quickshell", "-p", tmp], env=env, capture_output=True, text=True,
+                                     timeout=60).stdout
+                m = re.search(r"GLYPHS (\d+)", out)
+                self.assertTrue(m, out[-500:])
+                counts[times] = int(m.group(1))
+        self.assertEqual(counts[10], 60, "a short message lost letters")
+        self.assertEqual(counts[5000], 500)
+
+
+@unittest.skipUnless(__import__("shutil").which("ffmpeg"), "needs ffmpeg")
+class PixelBoundTest(unittest.TestCase):
+    """Review of 35bddb8: a 995,368-byte PNG declaring 16000 x 16000 is under the byte cap but
+    decodes to a 1 GB frame. 1.3 GB peak in ffmpeg on fedora before; refused now."""
+
+    @staticmethod
+    def huge_png(w=16000, h=16000) -> bytes:
+        import struct, zlib
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        c = zlib.compressobj(9)
+        row = b"\0" * (w * 4 + 1)
+        data = b"".join(c.compress(row) for _ in range(h)) + c.flush()
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", data) + chunk(b"IEND", b""))
+
+    def test_the_header_check_refuses_it(self):
+        from pearmsg import media
+        png = self.huge_png()
+        self.assertEqual(len(png), 995_368)                 # the reviewer's file, byte for byte in size
+        served = PhotoOrientationTest.serve(self, png, png)
+        client, _seen = served
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(media.MediaError):
+            media.photo_preview(client, "at_0_ABC", os.path.join(tmp, "x.thumb.jpg"))
+
+    def test_ffmpeg_itself_refuses_it(self):
+        """The decoder limit, for a picture whose header this code can't read."""
+        import resource
+        from pearmsg import media
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            with open(src, "wb") as f:
+                f.write(self.huge_png())
+            start = time.monotonic()
+            self.assertFalse(media._to_jpeg(src, os.path.join(tmp, "out.jpg"), 600))
+            self.assertLess(time.monotonic() - start, 5)
+            # the whole test process's children: a full decode alone peaks past 1 GB
+            self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 600_000)

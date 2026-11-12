@@ -45,6 +45,8 @@ def text_runs(attributed) -> list[dict]:
             rng = r.get("range") or [0, 0]
             if (styles or fx) and len(rng) == 2:
                 out.append({"start": int(rng[0]), "length": int(rng[1]), "styles": styles, "effect": fx})
+                if len(out) >= 256:         # store.MAX_RUNS: past that it's not formatting
+                    break
     return out
 
 # associatedMessageType -> tapback. 2000-2005 add, 3000-3005 remove.

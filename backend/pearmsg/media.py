@@ -22,6 +22,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 
@@ -34,6 +35,18 @@ PREVIEW_WIDTH = 600
 MAX_PREVIEW = 16 * 1024 * 1024
 # How much of the original is read to find its orientation: the EXIF block sits at the start.
 ORIENTATION_HEAD = 128 * 1024
+# Pixels a picture may have before it is decoded. A small file can declare a huge picture (a
+# 1 MB PNG of 16000 x 16000 decodes to a 1 GB frame), and ?width= is only a request to the
+# server, so the size is checked here: in the header first, then by ffmpeg's own decoder limit,
+# which refuses before allocating the frame. 40 MP is past any phone camera's photo.
+MAX_PIXELS = 40_000_000
+# ffmpeg runs at once. Each visible photo or video asks for its preview on its own thread.
+_DECODES = threading.BoundedSemaphore(2)
+
+
+def _ffmpeg(*args: str) -> list[str]:
+    """An ffmpeg command line whose decoder refuses pictures over MAX_PIXELS."""
+    return ["ffmpeg", "-loglevel", "error", "-y", "-max_pixels", str(MAX_PIXELS), *args]
 
 # EXIF orientation -> the ffmpeg filter that turns the stored pixels upright (checked against
 # ffmpeg's own autorotate for all eight).
@@ -154,8 +167,9 @@ def _to_jpeg(src: str, dst: str, width: int = 0, rotate: str = "") -> bool:
         return False
     filters = [f for f in (rotate, f"scale='min({width},iw)':-2" if width else "") if f]
     vf = ["-vf", ",".join(filters)] if filters else []
-    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", src, *vf, "-frames:v", "1", "-q:v", "4", dst],
-                       capture_output=True, timeout=60)
+    with _DECODES:
+        r = subprocess.run(_ffmpeg("-i", src, *vf, "-frames:v", "1", "-q:v", "4", dst),
+                           capture_output=True, timeout=60)
     return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
 
 
@@ -177,6 +191,9 @@ def photo_preview(client, guid: str, dst: str) -> str:
     """A small JPEG of the photo. Returns the path written."""
     with _open(client, guid, PREVIEW_WIDTH) as r:
         data = _read_capped(r, MAX_PREVIEW)
+    _orient, w, h = image_info(data)
+    if w * h > MAX_PIXELS:
+        raise MediaError("The Mac sent a picture far bigger than a preview")
     rotate = ""
     if image_info(data)[0] == 1:                    # no tag of its own: ask the original
         try:
@@ -190,8 +207,12 @@ def photo_preview(client, guid: str, dst: str) -> str:
     try:
         if _to_jpeg(raw, dst + ".part.jpg", rotate=rotate):
             os.replace(dst + ".part.jpg", dst)   # ffmpeg wrote this one 0644
-        else:                       # no ffmpeg: keep what the Mac sent
+        elif w and h:
+            # No ffmpeg (or it failed): keep what the Mac sent, but only a JPEG or PNG whose header
+            # said it is within MAX_PIXELS - the window's decoder has no limit of its own.
             os.replace(raw, dst)
+        else:
+            raise MediaError("Couldn't read the picture")
         _private(dst)
     finally:
         for p in (raw, dst + ".part.jpg"):
@@ -227,23 +248,29 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
         first = _moov_first(head)
         if first:
             # stream: ffmpeg stops once it has a frame, and so do we
-            p = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-y", "-i", "pipe:0", "-frames:v", "1",
-                                  "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4", dst + ".part.jpg"],
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                p.stdin.write(head)
-                while p.poll() is None:
-                    chunk = r.read(256 * 1024)
-                    if not chunk:
-                        break
-                    p.stdin.write(chunk)
-            except (BrokenPipeError, OSError):
-                pass                       # ffmpeg had its frame and closed the pipe
-            try:
-                p.stdin.close()
-            except OSError:
-                pass
-            p.wait(timeout=30)
+            with _DECODES:
+                p = subprocess.Popen(_ffmpeg("-i", "pipe:0", "-frames:v", "1",
+                                             "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
+                                             dst + ".part.jpg"),
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    p.stdin.write(head)
+                    while p.poll() is None:
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        p.stdin.write(chunk)
+                except (BrokenPipeError, OSError):
+                    pass                   # ffmpeg had its frame and closed the pipe
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
         else:
             if size > AUTO_VIDEO and not allow_big:
                 raise MediaError("big")
@@ -259,9 +286,11 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
                         if limit and got > limit:   # more than the Mac said the video was
                             raise MediaError("big")
                         f.write(chunk)
-                subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", tmp, "-frames:v", "1",
-                                "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4", dst + ".part.jpg"],
-                               capture_output=True, timeout=60)
+                with _DECODES:
+                    subprocess.run(_ffmpeg("-i", tmp, "-frames:v", "1",
+                                           "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
+                                           dst + ".part.jpg"),
+                                   capture_output=True, timeout=60)
             finally:
                 os.unlink(tmp)
     finally:
