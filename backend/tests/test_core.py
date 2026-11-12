@@ -1314,3 +1314,218 @@ class ClipboardImageTest(unittest.TestCase):
         self.assertIsNone(info)
         self.assertEqual(left, [])
         self.assertLess(took, 12)
+
+
+def _with_orientation(jpeg: bytes, orientation: int) -> bytes:
+    """The JPEG with an APP1 EXIF block carrying only an Orientation tag, as a camera writes it."""
+    import struct
+    tiff = b"MM\0*" + struct.pack(">I", 8) + struct.pack(">H", 1) \
+        + struct.pack(">HHIHH", 0x0112, 3, 1, orientation, 0) + struct.pack(">I", 0)
+    body = b"Exif\0\0" + tiff
+    return jpeg[:2] + b"\xff\xe1" + struct.pack(">H", len(body) + 2) + body + jpeg[2:]
+
+
+@unittest.skipUnless(__import__("shutil").which("ffmpeg"), "needs ffmpeg")
+class PhotoOrientationTest(unittest.TestCase):
+    """iPhone photos showed sideways (#2). BlueBubbles 1.9.12 answers ?width= with a PNG of the
+    stored pixels and no orientation tag; only the original's EXIF says how to turn it."""
+
+    W, H = 160, 120                                # stored (sensor) shape: landscape
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # Asymmetric: a red block in the top-left corner on a blue/green gradient.
+        self.src_png = os.path.join(self.tmp.name, "src.png")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                        f"color=c=blue:s={self.W}x{self.H},geq=r='if(lt(X,40)*lt(Y,30),255,0)':"
+                        f"g='X':b='Y*2'", "-frames:v", "1", self.src_png], check=True)
+        jpg = os.path.join(self.tmp.name, "src.jpg")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", self.src_png, "-q:v", "2", jpg],
+                       check=True)
+        with open(jpg, "rb") as f:
+            self.jpeg = f.read()
+        with open(self.src_png, "rb") as f:
+            self.png = f.read()
+
+    def pixels(self, path, w, h):
+        import subprocess
+        return subprocess.run(["ffmpeg", "-loglevel", "error", "-i", path, "-s", f"{w}x{h}",
+                               "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                              capture_output=True, check=True).stdout
+
+    def assertSamePicture(self, a, b, w, h):
+        pa, pb = self.pixels(a, w, h), self.pixels(b, w, h)
+        self.assertEqual(len(pa), w * h)
+        self.assertEqual(len(pb), w * h)
+        diff = sum(abs(x - y) for x, y in zip(pa, pb)) / (w * h)
+        self.assertLess(diff, 6, f"pictures differ (mean {diff:.1f})")
+
+    def test_image_info(self):
+        from pearmsg import media
+        self.assertEqual(media.image_info(self.png), (1, self.W, self.H))
+        self.assertEqual(media.image_info(self.jpeg), (1, self.W, self.H))
+        for o in range(1, 9):
+            with self.subTest(orientation=o):
+                self.assertEqual(media.image_info(_with_orientation(self.jpeg, o)), (o, self.W, self.H))
+        self.assertEqual(media.image_info(b"not an image"), (1, 0, 0))
+        self.assertEqual(media.image_info(self.jpeg[:40]), (1, 0, 0))   # cut short
+
+    def test_filters_match_ffmpeg_autorotate(self):
+        """Each filter turns the stored pixels the way ffmpeg itself turns a tagged JPEG."""
+        import subprocess
+        from pearmsg import media
+        for o, vf in media._ORIENT_FILTER.items():
+            with self.subTest(orientation=o):
+                tagged = os.path.join(self.tmp.name, f"o{o}.jpg")
+                with open(tagged, "wb") as f:
+                    f.write(_with_orientation(self.jpeg, o))
+                auto = os.path.join(self.tmp.name, f"auto{o}.png")
+                ours = os.path.join(self.tmp.name, f"ours{o}.png")
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", tagged, auto], check=True)
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", self.src_png, "-vf", vf, ours],
+                               check=True)
+                w, h = (self.H, self.W) if o >= 5 else (self.W, self.H)
+                self.assertSamePicture(auto, ours, w, h)
+
+    def serve(self, preview: bytes, original: bytes):
+        import http.server, threading
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.path)
+                body = preview if "width=" in self.path else original
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return BB.Client(f"http://127.0.0.1:{server.server_port}", "pw"), seen
+
+    def preview_of(self, preview, original):
+        from pearmsg import media
+        client, seen = self.serve(preview, original)
+        dst = os.path.join(self.tmp.name, "out-upright.jpg")
+        media.photo_preview(client, "at_0_ABC", dst)
+        return dst, seen
+
+    def test_a_sideways_preview_is_turned_upright(self):
+        """The reported case: untagged PNG preview, original tagged 6 (portrait)."""
+        from pearmsg import media
+        dst, _ = self.preview_of(self.png, _with_orientation(self.jpeg, 6))
+        with open(dst, "rb") as f:
+            self.assertEqual(media.image_info(f.read())[1:], (self.H, self.W), "still sideways")
+        tagged = os.path.join(self.tmp.name, "o6.jpg")
+        with open(tagged, "wb") as f:
+            f.write(_with_orientation(self.jpeg, 6))
+        self.assertSamePicture(dst, tagged, self.H, self.W)   # ffmpeg autorotates the reference
+
+    def test_an_upright_preview_is_not_turned_again(self):
+        """A server that already turned its copy (and dropped the tag) must not get it turned twice."""
+        import subprocess
+        from pearmsg import media
+        upright = os.path.join(self.tmp.name, "upright.png")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", self.src_png, "-vf", "transpose=1",
+                        upright], check=True)
+        with open(upright, "rb") as f:
+            dst, _ = self.preview_of(f.read(), _with_orientation(self.jpeg, 6))
+        with open(dst, "rb") as f:
+            self.assertEqual(media.image_info(f.read())[1:], (self.H, self.W))
+        self.assertSamePicture(dst, upright, self.H, self.W)
+
+    def test_a_tagged_preview_is_left_to_ffmpeg(self):
+        tagged = _with_orientation(self.jpeg, 6)
+        dst, seen = self.preview_of(tagged, tagged)
+        self.assertEqual(len(seen), 1, "the original was fetched although the preview had its tag")
+        from pearmsg import media
+        with open(dst, "rb") as f:
+            self.assertEqual(media.image_info(f.read())[1:], (self.H, self.W))
+
+    def test_an_untagged_original_changes_nothing(self):
+        dst, _ = self.preview_of(self.png, self.jpeg)
+        self.assertSamePicture(dst, self.src_png, self.W, self.H)
+
+
+class BlueBubblesResponseLimitTest(unittest.TestCase):
+    """Replies from the Mac were read whole into memory (marketplace review of 718464e)."""
+
+    def serve(self, handler_body):
+        import http.server, threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                handler_body(self)
+
+            do_POST = do_GET
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def big(self, h, code=200, extra=()):
+        h.send_response(code)
+        for k, v in extra:
+            h.send_header(k, v)
+        h.send_header("Content-Length", str(8 * 1024 * 1024))
+        h.end_headers()
+        try:
+            for _ in range(8):
+                h.wfile.write(b"[" * (1024 * 1024))
+        except OSError:
+            pass
+
+    def test_an_oversized_answer_is_refused(self):
+        url = self.serve(self.big)
+        old = BB.MAX_RESPONSE
+        BB.MAX_RESPONSE = 1024 * 1024
+        try:
+            with self.assertRaises(BB.BBError) as cm:
+                BB.Client(url, "pw")._req("GET", "/ping")
+        finally:
+            BB.MAX_RESPONSE = old
+        self.assertIn("larger than", str(cm.exception))
+
+    def test_a_redirect_is_not_followed(self):
+        """Following one drains the hop with urllib's unbounded read and sends the password on."""
+        paths = []
+
+        def handler(h):
+            paths.append(h.path)
+            if h.path.startswith("/api/v1/ping"):
+                self.big(h, 302, [("Location", "/elsewhere")])
+            else:
+                h.send_response(200)
+                h.send_header("Content-Length", "2")
+                h.end_headers()
+                h.wfile.write(b"{}")
+        url = self.serve(handler)
+        with self.assertRaises(BB.BBError) as cm:
+            BB.Client(url, "pw")._req("GET", "/ping")
+        self.assertIn("HTTP 302", str(cm.exception))
+        self.assertEqual(len(paths), 1, f"the redirect was followed: {paths}")
+
+    def test_an_oversized_preview_is_refused(self):
+        from pearmsg import media
+        url = self.serve(self.big)
+        old = media.MAX_PREVIEW
+        media.MAX_PREVIEW = 1024 * 1024
+        try:
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(media.MediaError):
+                media.photo_preview(BB.Client(url, "pw"), "at_0_ABC", os.path.join(tmp, "x.jpg"))
+        finally:
+            media.MAX_PREVIEW = old

@@ -1,7 +1,6 @@
 pragma Singleton
 import QtQuick
 import Quickshell
-import qs.Commons
 import qs.Commons as Commons
 
 // Every colour, radius and font here now comes from Omarchy's own design tokens (the same
@@ -37,17 +36,17 @@ Singleton {
     readonly property color panel:        Commons.Color.menu.selectedBackground
     readonly property color line:         Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g,
                                                   Commons.Color.foreground.b, 0.12)
-    readonly property string uiFont:      Style.font.family
+    readonly property string uiFont:      Commons.Style.font.family
     // Omarchy's controls are square. Everything here was rounded 6-9px by hand.
-    readonly property int radius:         Style.cornerRadius
+    readonly property int radius:         Commons.Style.cornerRadius
 
     // Type. Omarchy's Style.font ramp (caption 10 / body 12 / heading 16) is sized for bar
     // flyouts and panel rows. This is an app window people read passwords in, so the whole
     // ramp is scaled up - but still multiplied off Style.font, so it keeps following the
     // [font] base-size in shell.toml rather than freezing at whatever looks right today.
     readonly property real appScale:  1.25
-    readonly property int fCaption:   Math.round(Style.font.caption   * appScale)
-    readonly property int fSmall:     Math.round(Style.font.bodySmall * appScale)
-    readonly property int fBody:      Math.round(Style.font.body      * appScale)
-    readonly property int fHeading:   Math.round(Style.font.heading   * appScale)
+    readonly property int fCaption:   Math.round(Commons.Style.font.caption   * appScale)
+    readonly property int fSmall:     Math.round(Commons.Style.font.bodySmall * appScale)
+    readonly property int fBody:      Math.round(Commons.Style.font.body      * appScale)
+    readonly property int fHeading:   Math.round(Commons.Style.font.heading   * appScale)
 }

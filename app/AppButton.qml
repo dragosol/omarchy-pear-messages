@@ -1,5 +1,5 @@
 import QtQuick
-import qs.Commons
+import qs.Commons as Commons
 import qs.Ui as O
 
 // Omarchy's own Button - same surface, border, focus ring and hover as the rest of the
@@ -8,8 +8,8 @@ import qs.Ui as O
 // One place to change it, rather than a padding override on every button.
 O.Button {
     bordered: true
-    horizontalPadding: Math.round(Style.spacing.controlPaddingX * 1.6)
-    verticalPadding: Math.round(Style.spacing.controlPaddingY * 1.5)
+    horizontalPadding: Math.round(Commons.Style.spacing.controlPaddingX * 1.6)
+    verticalPadding: Math.round(Commons.Style.spacing.controlPaddingY * 1.5)
     fontSize: Theme.fBody
     opacity: enabled ? 1 : 0.4
 }

@@ -56,6 +56,34 @@ class BBError(Exception):
     pass
 
 
+# The largest answer read from the server. A thousand messages with their attributed bodies are a
+# few MB; without a cap a broken or hostile server could fill the daemon's memory with one reply.
+MAX_RESPONSE = 64 * 1024 * 1024
+MAX_ERROR_BODY = 64 * 1024
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """BlueBubbles never redirects. Following one would also drain the hop's body with urllib's
+    bare, unbounded fp.read(); refusing it leaves an HTTPError whose body is read capped."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirects)
+
+
+def urlopen(req, timeout: float):
+    return _opener.open(req, timeout=timeout)
+
+
+def _read_capped(r, limit: int | None = None) -> bytes:
+    limit = MAX_RESPONSE if limit is None else limit
+    data = r.read(limit + 1)
+    if len(data) > limit:
+        raise BBError(f"The server's answer was larger than {limit // (1024 * 1024)} MB")
+    return data
+
+
 
 class Client:
     def __init__(self, url: str, password: str, timeout: float = 15.0):
@@ -75,13 +103,15 @@ class Client:
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Content-Type": "application/json", "User-Agent": "PearMessages/1.0"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
-                data = r.read()
+            with urlopen(req, timeout=timeout or self.timeout) as r:
+                data = _read_capped(r)
         except urllib.error.HTTPError as e:
             try:
-                msg = json.loads(e.read()).get("message") or str(e)
+                msg = json.loads(e.read(MAX_ERROR_BODY)).get("message") or str(e)
             except Exception:
                 msg = str(e)
+            finally:
+                e.close()                   # the rest of its body is never read
             if e.code == 401:
                 raise BBError("The server refused the password") from None
             raise BBError(f"{msg} (HTTP {e.code})") from None
@@ -92,7 +122,7 @@ class Client:
             return data
         try:
             d = json.loads(data)
-        except ValueError:
+        except (ValueError, RecursionError):        # RecursionError: absurdly deep nesting
             raise BBError("That address answered, but not like a BlueBubbles server") from None
         if isinstance(d, dict) and d.get("status", 200) >= 400:
             raise BBError(d.get("message") or d.get("error", {}).get("message") or "server error")
@@ -206,13 +236,15 @@ class Client:
                                               "User-Agent": "PearMessages/1.0"})
         timeout = 60 + len(data) / 200_000     # a minute, plus time to upload
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read())
+            with urlopen(req, timeout=timeout) as r:
+                d = json.loads(_read_capped(r))
         except urllib.error.HTTPError as e:
             try:
-                msg = json.loads(e.read()).get("message") or str(e)
+                msg = json.loads(e.read(MAX_ERROR_BODY)).get("message") or str(e)
             except Exception:
                 msg = str(e)
+            finally:
+                e.close()                   # the rest of its body is never read
             raise BBError(f"{msg} (HTTP {e.code})") from None
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
             raise BBError(f"Can't reach the server: {getattr(e, 'reason', e)}") from None

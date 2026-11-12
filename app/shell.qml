@@ -398,7 +398,7 @@ ShellRoot {
         root.appliedTheme = colors;
         Commons.Color.loadColors(colors);
         Commons.Color.loadShell(themeShell.text() || "");
-        Style.scheduleRefresh();
+        Commons.Style.scheduleRefresh();
     }
 
     // For testing from a shell:  quickshell ipc -p <app dir> call pearmessages effect Confetti
@@ -3178,7 +3178,7 @@ ShellRoot {
                                         font.pixelSize: Theme.fBody
                                         selectByMouse: true
                                         background: Rectangle {
-                                            color: Style.controlFill(composer.activeFocus, false, Theme.fg, Theme.accent)
+                                            color: Commons.Style.controlFill(composer.activeFocus, false, Theme.fg, Theme.accent)
                                             radius: Theme.radius
                                             border.width: 1
                                             border.color: composer.activeFocus ? Theme.accent : Theme.line

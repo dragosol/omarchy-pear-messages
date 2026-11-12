@@ -1372,6 +1372,13 @@ class Daemon:
             files = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(d) if e.is_file()]
         except OSError:
             return
+        stale = [f for f in files if f[2].endswith("-preview.jpg")]   # the pre-1.2.10 name
+        for f in stale:
+            try:
+                os.unlink(f[2])
+                files.remove(f)
+            except OSError:
+                pass
         total = sum(f[1] for f in files)
         for _, size, path in sorted(files):        # least recently used first
             if total <= cap:
@@ -1455,7 +1462,9 @@ class Daemon:
             fname, dirs = f"{guid[:16]}-{safe}", (os.path.join(RUNTIME, "attachments"),)
             keep_dir = temp_dir = dirs[0]
         else:
-            fname, dirs = f"{guid[:16]}-preview.jpg", (keep_dir, temp_dir)
+            # "-upright": previews made before 1.2.10 could be sideways (see media.photo_preview)
+            # and are never read again; _prune_media removes them.
+            fname, dirs = f"{guid[:16]}-upright.jpg", (keep_dir, temp_dir)
         for d in dirs + (os.path.join(CACHE, "attachments"),) if kind == "full" else dirs:
             if os.path.exists(os.path.join(d, fname)):
                 self._send(c, {"ev": "attachment", "re": rid, "guid": guid, "kind": kind, "path": os.path.join(d, fname)})
