@@ -643,7 +643,8 @@ ShellRoot {
         case "attachment": {
             const key = d.kind === "full" ? d.guid + "#full" : d.guid;
             const a = Object.assign({}, root.attachments);
-            a[key] = d.path ? { path: d.path } : { error: d.error || "failed", big: !!d.big };
+            if (d.busy) delete a[key];        // previews are taking turns: ask again when it shows
+            else a[key] = d.path ? { path: d.path } : { error: d.error || "failed", big: !!d.big };
             root.attachments = a;
             if (root.pendingPreview === key) {
                 root.pendingPreview = "";

@@ -32,6 +32,18 @@ BLUEZ = "org.bluez"
 OBEX = "org.bluez.obex"
 MAP_MSE = "00001132-0000-1000-8000-00805f9b34fb"
 PBAP_PSE = "0000112f-0000-1000-8000-00805f9b34fb"
+# What the phone's files may weigh before they're read. obexd writes them to disk whatever their
+# size; they are read on the main loop, so one that is far past any real message or address
+# book is skipped instead. A text's bMessage is a few KB; an address book with photos, MBs.
+MAX_BMESSAGE = 1024 * 1024
+MAX_VCARDS = 32 * 1024 * 1024
+
+
+def read_capped(path: str, limit: int) -> bytes | None:
+    """The file, or None if it's bigger than limit (only limit + 1 bytes are ever read)."""
+    with open(path, "rb") as f:
+        data = f.read(limit + 1)
+    return None if len(data) > limit else data
 # The iPhone's side of audio: A2DP source, AVRCP both ways, hands-free (both roles), headset.
 AUDIO_UUIDS = [
     "0000110a-0000-1000-8000-00805f9b34fb",  # A2DP source (the phone plays to us)
@@ -599,8 +611,11 @@ class Phone:
         text = subject
         if ok:
             try:
-                with open(target, "rb") as f:
-                    parsed = bmsg.parse(f.read())
+                data = read_capped(target, MAX_BMESSAGE)
+                if data is None:
+                    self.log("a message from the iPhone was too big to read; showing its subject")
+                    raise OSError("too big")
+                parsed = bmsg.parse(data)
                 text = parsed.text or subject
             except OSError:
                 pass
@@ -690,8 +705,11 @@ class Phone:
             _, target, spath = t
             if ok:
                 try:
-                    with open(target, "rb") as f:
-                        cards = contacts.parse_vcards(f.read())
+                    data = read_capped(target, MAX_VCARDS)
+                    if data is None:
+                        self.log("the iPhone's address book was too big to read; skipped")
+                        raise OSError("too big")
+                    cards = contacts.parse_vcards(data)
                     self.last_contacts = time.time()
                     self.emit("contacts", cards)
                 except OSError:

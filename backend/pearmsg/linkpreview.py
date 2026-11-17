@@ -121,6 +121,11 @@ class _Budget(threading.local):
     A socket timeout is per wait, so a server that sends one byte every few seconds never trips
     it and can hold a preview for as long as it likes. At the deadline a timer shuts every socket
     of the fetch down, which ends a blocked read at once, whatever layer (TLS, buffering) it's in.
+
+    Wrapping a socket in TLS detaches the plain socket object from its descriptor (it reads -1
+    from then on), so shutting that one down did nothing to the TLS handshake or a TLS body. The
+    TLS socket is registered too, before its handshake runs. Objects, not duplicated descriptors,
+    are kept, so a connection still closes as soon as urllib is done with it (a redirect hop's).
     """
     deadline = None
     socks = None
@@ -139,7 +144,10 @@ def _remaining() -> float:
 
 
 def _connect(ip: str, port: int, source_address) -> socket.socket:
-    sock = socket.create_connection((ip, port), _remaining(), source_address)
+    return _register(socket.create_connection((ip, port), _remaining(), source_address))
+
+
+def _register(sock):
     if _budget.socks is not None:
         _budget.socks.append(sock)
     return sock
@@ -169,8 +177,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self.sock = sock
             self._tunnel()
             sock = self.sock
-        # server_hostname stays the name, so the certificate is still checked against it.
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        # server_hostname stays the name, so the certificate is still checked against it. The
+        # handshake runs after the TLS socket is registered, so the deadline covers it.
+        self.sock = _register(self._context.wrap_socket(sock, server_hostname=self.host,
+                                                        do_handshake_on_connect=False))
+        self.sock.do_handshake()
 
 
 class _PinnedHTTPHandler(urllib.request.HTTPHandler):

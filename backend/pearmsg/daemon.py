@@ -45,6 +45,8 @@ from .store import Store, addr_thread
 CLIP_IMAGE_MAX = 50 * 1024 * 1024   # a pasted image bigger than this isn't attached
 LINK_PREVIEW_SLOTS = 4              # link previews fetched at once
 LINK_PREVIEW_QUEUE = 32             # and waiting for a slot; past that a link is skipped for now
+MEDIA_SLOTS = 3                     # photo/video previews made at once
+MEDIA_QUEUE = 24                    # and waiting; past that the window asks again later
 
 
 def _file_key(guid: str) -> str:
@@ -178,6 +180,9 @@ class Daemon:
         self.store = Store(os.path.join(DATA, "messages.db"))
         self.conns: list[Conn] = []
         self._link_waiting: dict[str, list] = {}
+        self._link_slots = threading.BoundedSemaphore(LINK_PREVIEW_SLOTS)
+        self._media_slots = threading.BoundedSemaphore(MEDIA_SLOTS)
+        self._media_jobs = 0                    # previews started and not yet answered
         self._in_flight: set[int] = set()
         self._roots_asked: set[str] = set()     # thread-starting messages already fetched once
         self._retry_at: dict[int, float] = {}
@@ -939,7 +944,7 @@ class Daemon:
                                       dbus.Array(["default", "Open"], signature="s"),
                                       dbus.Dictionary(hints, signature="sv"), dbus.Int32(-1)))
         except dbus.DBusException as e:
-            self.log(f"notify: {e}")
+            log(f"notify: {e}")
             return
         self._notified[nid] = m["thread"]
 
@@ -1361,12 +1366,14 @@ class Daemon:
             return
 
         def work():
-            with self._link_slots:
-                try:
+            p = None
+            try:
+                with self._link_slots:
                     p = linkpreview.fetch(url)
-                except Exception:
-                    p = None
-            GLib.idle_add(done, p)
+            except Exception:
+                p = None
+            finally:                    # whatever happened, the waiting entry is answered and goes
+                GLib.idle_add(done, p)
 
         def done(p):
             self.store.save_link_preview(url, p)
@@ -1501,24 +1508,43 @@ class Daemon:
         d = temp_dir if (temp or kind == "full") else keep_dir
         os.makedirs(d, mode=0o700, exist_ok=True)
         path = os.path.join(d, fname)
+        # Previews start by themselves as rows come into view, so they take turns: MEDIA_SLOTS
+        # at once, MEDIA_QUEUE waiting. Past that the window is told "busy" and asks again the
+        # next time the row is shown. An original is only fetched when you open it.
+        preview = kind != "full"
+        if preview:
+            if self._media_jobs >= MEDIA_SLOTS + MEDIA_QUEUE:
+                reply({"error": "busy", "busy": True})
+                return
+            self._media_jobs += 1
+
+        def answer(res):
+            if preview:
+                self._media_jobs -= 1
+            reply(res)
+            return False
 
         def work():
+            res = {"error": "failed"}
             try:
-                if kind == "full":
-                    res = {"path": media.original(client, guid, path)}
-                elif is_video:
-                    scratch = os.path.join(RUNTIME, "previews")
-                    os.makedirs(scratch, mode=0o700, exist_ok=True)
-                    res = {"path": media.video_thumb(client, guid, int(size or 0), path, scratch,
-                                                     allow_big=bool(temp is None))}
+                if not preview:
+                    res = {"path": media.original(client, guid, path, int(size or 0))}
                 else:
-                    res = {"path": media.photo_preview(client, guid, path)}
+                    with self._media_slots:
+                        if is_video:
+                            scratch = os.path.join(RUNTIME, "previews")
+                            os.makedirs(scratch, mode=0o700, exist_ok=True)
+                            res = {"path": media.video_thumb(client, guid, int(size or 0), path, scratch,
+                                                             allow_big=bool(temp is None))}
+                        else:
+                            res = {"path": media.photo_preview(client, guid, path)}
                 GLib.idle_add(lambda: (self._prune_media(), False)[1])
             except media.MediaError as e:
                 res = {"error": str(e), "big": str(e) == "big"}
-            except (OSError, subprocess.SubprocessError) as e:
-                res = {"error": str(e)}
-            GLib.idle_add(lambda: (reply(res), False)[1])
+            except Exception as e:      # never leave the window (or the queue count) waiting
+                res = {"error": str(e) or type(e).__name__}
+            finally:
+                GLib.idle_add(answer, res)
         threading.Thread(target=work, daemon=True).start()
 
     def _preview(self, c, rid, path: str) -> None:

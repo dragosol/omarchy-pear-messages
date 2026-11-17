@@ -23,6 +23,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -42,6 +43,14 @@ ORIENTATION_HEAD = 128 * 1024
 MAX_PIXELS = 40_000_000
 # ffmpeg runs at once. Each visible photo or video asks for its preview on its own thread.
 _DECODES = threading.BoundedSemaphore(2)
+# A video thumbnail that loads by itself: the most read from the Mac for it, and how long it may
+# take in all. Reads return whatever has arrived (read1), so a server that sends a byte now and
+# then can overrun the deadline by at most one PREVIEW_WAIT.
+THUMB_DEADLINE = 60
+PREVIEW_WAIT = 15
+# An original you opened: what the Mac said its size was, plus this. With no size, ORIGINAL_MAX.
+ORIGINAL_SLACK = 1024 * 1024
+ORIGINAL_MAX = 4 * 1024 * 1024 * 1024
 
 
 def _ffmpeg(*args: str) -> list[str]:
@@ -58,7 +67,7 @@ class MediaError(Exception):
     pass
 
 
-def _open(client, guid: str, width: int = 0):
+def _open(client, guid: str, width: int = 0, timeout: float = 120):
     path = f"/attachment/{urllib.parse.quote(guid, safe='')}/download"
     if width:
         path += f"?width={width}&quality=good"
@@ -66,9 +75,22 @@ def _open(client, guid: str, width: int = 0):
     req = urllib.request.Request(f"{client.url}/api/v1{path}{'&' if '?' in path else '?'}{q}",
                                  headers={"User-Agent": "PearMessages/1.0"})
     try:
-        return bluebubbles.urlopen(req, timeout=120)
+        return bluebubbles.urlopen(req, timeout=timeout)
     except Exception as e:
         raise MediaError(f"Can't fetch it from the Mac: {getattr(e, 'reason', e)}") from None
+
+
+def _read_by(r, n: int, deadline: float) -> bytes:
+    """Up to n bytes, stopping at the deadline or the end; never one long blocking read."""
+    out = bytearray()
+    while len(out) < n:
+        if time.monotonic() > deadline:
+            raise MediaError("The Mac was too slow sending it")
+        chunk = r.read1(min(256 * 1024, n - len(out)))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
 
 
 def _read_capped(r, limit: int) -> bytes:
@@ -242,9 +264,13 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
     """A JPEG frame from the start of the video."""
     if not shutil.which("ffmpeg"):
         raise MediaError("Video thumbnails need ffmpeg")
-    r = _open(client, guid)
+    r = _open(client, guid, timeout=PREVIEW_WAIT if not allow_big else 120)
+    deadline = time.monotonic() + (THUMB_DEADLINE if not allow_big else 3600)
+    # Only the start of a video is needed when its index comes first; the whole of it otherwise,
+    # which only a video the Mac says is under AUTO_VIDEO gets without being asked for.
+    limit = AUTO_VIDEO if not allow_big else max(size, AUTO_VIDEO) + ORIGINAL_SLACK
     try:
-        head = r.read(64 * 1024)
+        head = _read_by(r, 64 * 1024, deadline)
         first = _moov_first(head)
         if first:
             # stream: ffmpeg stops once it has a frame, and so do we
@@ -253,12 +279,14 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
                                              "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
                                              dst + ".part.jpg"),
                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                fed = len(head)
                 try:
                     p.stdin.write(head)
-                    while p.poll() is None:
-                        chunk = r.read(256 * 1024)
+                    while p.poll() is None and fed < limit and time.monotonic() < deadline:
+                        chunk = r.read1(256 * 1024)
                         if not chunk:
                             break
+                        fed += len(chunk)
                         p.stdin.write(chunk)
                 except (BrokenPipeError, OSError):
                     pass                   # ffmpeg had its frame and closed the pipe
@@ -267,7 +295,7 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
                 except OSError:
                     pass
                 try:
-                    p.wait(timeout=30)
+                    p.wait(timeout=max(1.0, min(30.0, deadline - time.monotonic())))
                 except subprocess.TimeoutExpired:
                     p.kill()
                     p.wait()
@@ -277,14 +305,17 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
             # the index is at the end: the whole file is needed for one frame
             fd, tmp = tempfile.mkstemp(dir=scratch, suffix=".video")
             try:
-                limit = max(size, AUTO_VIDEO) if not allow_big else 0
+                if not allow_big:
+                    limit = max(size, AUTO_VIDEO)
                 with os.fdopen(fd, "wb") as f:
                     f.write(head)
                     got = len(head)
-                    while chunk := r.read(1 << 20):
+                    while chunk := r.read1(1 << 20):
                         got += len(chunk)
-                        if limit and got > limit:   # more than the Mac said the video was
+                        if got > limit:             # more than the Mac said the video was
                             raise MediaError("big")
+                        if time.monotonic() > deadline:
+                            raise MediaError("The Mac was too slow sending it")
                         f.write(chunk)
                 with _DECODES:
                     subprocess.run(_ffmpeg("-i", tmp, "-frames:v", "1",
@@ -301,9 +332,24 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
     return _private(dst)
 
 
-def original(client, guid: str, dst: str) -> str:
+def original(client, guid: str, dst: str, size: int = 0) -> str:
+    """The file itself, to the temporary folder: no more than the Mac said it was (plus a
+    little), or ORIGINAL_MAX when it didn't say."""
+    limit = size + ORIGINAL_SLACK if size > 0 else ORIGINAL_MAX
     fd = os.open(dst + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with _open(client, guid) as r, os.fdopen(fd, "wb") as f:
-        shutil.copyfileobj(r, f, 1 << 20)
+    try:
+        with _open(client, guid) as r, os.fdopen(fd, "wb") as f:
+            got = 0
+            while chunk := r.read1(1 << 20):
+                got += len(chunk)
+                if got > limit:
+                    raise MediaError("The Mac sent more than the file's size")
+                f.write(chunk)
+    except BaseException:
+        try:
+            os.unlink(dst + ".part")
+        except OSError:
+            pass
+        raise
     os.replace(dst + ".part", dst)
     return _private(dst)

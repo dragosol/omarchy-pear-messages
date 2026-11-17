@@ -1,10 +1,12 @@
 import os
 import re
+import socket
 import stat
 import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -1649,10 +1651,7 @@ class AttachmentPathTest(unittest.TestCase):
                 return dst
             media.photo_preview = fake_preview
             try:
-                fake = type("F", (), {})()
-                fake.client, fake.bb_online = object(), True
-                fake._send = lambda c, m: None
-                fake._prune_media = lambda: None
+                fake = _FakeDaemon(D, client=object(), bb_online=True)
                 for guid in (outside + "/pm", "../../outside/pm"):
                     D.Daemon._attachment(fake, None, 1, guid, "p.jpg", "image/jpeg")
                 deadline = time.monotonic() + 5
@@ -1771,3 +1770,322 @@ class PixelBoundTest(unittest.TestCase):
             self.assertLess(time.monotonic() - start, 5)
             # the whole test process's children: a full decode alone peaks past 1 GB
             self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 600_000)
+
+
+class DaemonAttributesTest(unittest.TestCase):
+    """1.2.11 read self._link_slots, which nothing ever set: every uncached link preview raised
+    in its worker. A fake daemon in the test had it, so the tests passed. This reads the real
+    class: every attribute a method reads must be assigned somewhere in it (or be a method)."""
+
+    def test_every_attribute_read_is_set(self):
+        import ast, inspect
+        from pearmsg import daemon as D
+        tree = ast.parse(inspect.getsource(D.Daemon))
+        cls = tree.body[0]
+        defined = {n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        defined |= {t.id for n in cls.body if isinstance(n, ast.Assign) for t in n.targets
+                    if isinstance(t, ast.Name)}
+        assigned, read = set(), {}
+        for node in ast.walk(cls):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+                if isinstance(node.ctx, ast.Store):
+                    assigned.add(node.attr)
+                else:
+                    read.setdefault(node.attr, node.lineno)
+        missing = {a: ln for a, ln in read.items() if a not in assigned and a not in defined}
+        self.assertEqual(missing, {}, "read but never set (attribute: line in class)")
+
+
+class _FakeDaemon:
+    """Just enough of a daemon for one method, with the real class's own __init__ values."""
+
+    def __init__(self, D, **kw):
+        import threading
+        self.settings = {"linkPreviews": True}
+        self.store = type("S", (), {"link_preview": lambda s, u: None,
+                                    "save_link_preview": lambda s, u, p: None})()
+        self.conns = []
+        self.sent = []
+        self._send = lambda c, m: self.sent.append(m)
+        self._link_waiting = {}
+        self._link_slots = threading.BoundedSemaphore(D.LINK_PREVIEW_SLOTS)
+        self._media_slots = threading.BoundedSemaphore(D.MEDIA_SLOTS)
+        self._media_jobs = 0
+        self._prune_media = lambda: None
+        self.__dict__.update(kw)
+
+
+def _spin(until, seconds=10):
+    from gi.repository import GLib
+    ctx = GLib.MainContext.default()
+    end = time.monotonic() + seconds
+    while not until() and time.monotonic() < end:
+        ctx.iteration(False)
+        time.sleep(0.01)
+
+
+class WorkerCleanupTest(unittest.TestCase):
+    """A worker that fails in any way still answers and gives back its place in the queue."""
+
+    def test_a_failing_link_preview_leaves_no_waiting_entry(self):
+        from pearmsg import daemon as D, linkpreview
+        fake = _FakeDaemon(D)
+        fake.conns = ["conn"]
+        saved = linkpreview.fetch
+        linkpreview.fetch = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            D.Daemon._link_preview(fake, "conn", "https://example.com/x")
+            _spin(lambda: fake.sent)
+        finally:
+            linkpreview.fetch = saved
+        self.assertEqual(fake._link_waiting, {})
+        self.assertEqual(fake.sent[0]["ok"], False)
+
+    def test_previews_take_turns_and_give_their_place_back(self):
+        from pearmsg import daemon as D, media
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = (D.CACHE, D.RUNTIME, media.photo_preview)
+            D.CACHE, D.RUNTIME = os.path.join(tmp, "c"), os.path.join(tmp, "r")
+            media.photo_preview = lambda client, guid, dst: (_ for _ in ()).throw(ValueError("odd"))
+            try:
+                fake = _FakeDaemon(D, client=object(), bb_online=True)
+                fake._media_jobs = D.MEDIA_SLOTS + D.MEDIA_QUEUE
+                D.Daemon._attachment(fake, None, 1, "at_0_A", "p.jpg", "image/jpeg")
+                self.assertEqual(fake.sent[-1].get("busy"), True, "past the queue it must answer busy")
+                fake._media_jobs = 0
+                D.Daemon._attachment(fake, None, 2, "at_0_B", "p.jpg", "image/jpeg")
+                _spin(lambda: len(fake.sent) == 2)
+            finally:
+                D.CACHE, D.RUNTIME, media.photo_preview = saved
+        self.assertEqual(fake.sent[-1]["error"], "odd")
+        self.assertEqual(fake._media_jobs, 0, "a failed preview kept its place in the queue")
+
+
+@unittest.skipUnless(__import__("shutil").which("openssl"), "needs openssl")
+class LinkPreviewTLSDeadlineTest(unittest.TestCase):
+    """The deadline held the socket object TLS had detached from its descriptor, so it could not
+    end a TLS handshake or body (review of 6d7e440)."""
+
+    def setUp(self):
+        import ssl, subprocess, threading
+        from pearmsg import linkpreview
+        self.lp = linkpreview
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cert, key = os.path.join(self.tmp.name, "c.pem"), os.path.join(self.tmp.name, "k.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+                        "-keyout", key, "-out", cert], check=True, capture_output=True)
+        self.server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.server_ctx.load_cert_chain(cert, key)
+        client_ctx = ssl.create_default_context(cafile=cert)
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.port = self.listener.getsockname()[1]
+        self.mode = "drip"
+        self.held = []
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = self.listener.accept()
+                except OSError:
+                    return
+                self.held.append(conn)
+                threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        saved = (linkpreview._is_public, linkpreview.DEADLINE, linkpreview._opener)
+        linkpreview._is_public = lambda ip: True
+        linkpreview.DEADLINE = 2
+        linkpreview._opener = urllib.request.build_opener(
+            linkpreview._PinnedHTTPHandler, linkpreview._PinnedHTTPSHandler(context=client_ctx),
+            linkpreview._Redirects)
+
+        def restore():
+            linkpreview._is_public, linkpreview.DEADLINE, linkpreview._opener = saved
+            self.listener.close()
+            for c in self.held:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+        self.addCleanup(restore)
+
+    def handle(self, conn):
+        try:
+            if self.mode == "stall-handshake":
+                time.sleep(30)                       # TCP accepted, TLS never answered
+                return
+            tls = self.server_ctx.wrap_socket(conn, server_side=True)
+            tls.recv(4096)
+            if self.mode == "ok":
+                body = b"<html><head><title>ok</title></head></html>"
+                tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                            + str(len(body)).encode() + b"\r\n\r\n" + body)
+                return
+            tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 30\r\n\r\n")
+            for _ in range(30):                      # one byte every 0.3 s over TLS
+                tls.sendall(b"x")
+                time.sleep(0.3)
+        except OSError:
+            pass
+
+    def timed(self):
+        start = time.monotonic()
+        with self.assertRaises((self.lp.Blocked, OSError)):
+            self.lp.fetch(f"https://127.0.0.1:{self.port}/")
+        return time.monotonic() - start
+
+    def test_a_dripping_tls_body_is_cut_off(self):
+        took = self.timed()
+        self.assertLess(took, 4, f"TLS body ran {took:.1f} s against a 2 s deadline")
+
+    def test_a_stalled_tls_handshake_is_cut_off(self):
+        self.mode = "stall-handshake"
+        took = self.timed()
+        self.assertLess(took, 4, f"TLS handshake ran {took:.1f} s against a 2 s deadline")
+
+    def test_a_normal_tls_page_still_loads(self):
+        self.mode = "ok"
+        self.assertEqual(self.lp.fetch(f"https://127.0.0.1:{self.port}/").get("title"), "ok")
+
+
+class MediaTransferBoundTest(unittest.TestCase):
+    """Review of 6d7e440: a moov-first video thumbnail streamed with no overall byte or time
+    limit, and an opened original had no byte limit."""
+
+    def setUp(self):
+        import http.server, threading
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mode = "flood"
+        self.sent = [0]
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                head = b"\0\0\0\x08moov" + b"\0" * 1000          # index first: streamed to ffmpeg
+                try:
+                    self.wfile.write(head)
+                    test.sent[0] += len(head)
+                    while test.sent[0] < 200 * 1024 * 1024:
+                        if test.mode == "drip":
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                            test.sent[0] += 1
+                            time.sleep(0.2)
+                        else:
+                            self.wfile.write(b"x" * 65536)
+                            test.sent[0] += 65536
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.client = BB.Client(f"http://127.0.0.1:{server.server_port}", "pw")
+        # an ffmpeg that eats its input and never finds a frame
+        bindir = os.path.join(self.tmp.name, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(bindir, "ffmpeg"), "w") as f:
+            f.write("#!/bin/sh\nexec cat > /dev/null\n")
+        os.chmod(os.path.join(bindir, "ffmpeg"), 0o755)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + old_path
+        from pearmsg import media
+        self.media = media
+        saved = (media.AUTO_VIDEO, media.THUMB_DEADLINE, media.PREVIEW_WAIT)
+        media.AUTO_VIDEO, media.THUMB_DEADLINE, media.PREVIEW_WAIT = 2 * 1024 * 1024, 2, 1
+
+        def restore():
+            os.environ["PATH"] = old_path
+            media.AUTO_VIDEO, media.THUMB_DEADLINE, media.PREVIEW_WAIT = saved
+        self.addCleanup(restore)
+
+    def thumb(self):
+        dst = os.path.join(self.tmp.name, "v.thumb.jpg")
+        start = time.monotonic()
+        with self.assertRaises(self.media.MediaError):
+            self.media.video_thumb(self.client, "at_0_V", 0, dst, self.tmp.name)
+        return time.monotonic() - start
+
+    def test_a_flooding_stream_stops_at_the_byte_limit(self):
+        took = self.thumb()
+        self.assertLess(took, 10)
+        # what the client read is at most the limit plus a chunk and the socket buffers
+        self.assertLess(self.sent[0], 2 * 1024 * 1024 + 8 * 1024 * 1024,
+                        f"{self.sent[0]} bytes went out for a 2 MB limit")
+
+    def test_a_dripping_stream_stops_at_the_deadline(self):
+        self.mode = "drip"
+        took = self.thumb()
+        self.assertLess(took, 2 + 1 + 3, f"ran {took:.1f} s against a 2 s deadline")
+
+    def test_an_original_stops_past_its_size(self):
+        dst = os.path.join(self.tmp.name, "orig.mov")
+        with self.assertRaises(self.media.MediaError):
+            self.media.original(self.client, "at_0_V", dst, 1024 * 1024)
+        self.assertFalse(os.path.exists(dst))
+        self.assertFalse(os.path.exists(dst + ".part"), "the partial download was left behind")
+
+
+class PhoneFileBoundTest(unittest.TestCase):
+    def test_read_capped(self):
+        from pearmsg import iphone
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "f")
+            with open(p, "wb") as f:
+                f.write(b"a" * 100)
+            self.assertEqual(iphone.read_capped(p, 100), b"a" * 100)
+            self.assertIsNone(iphone.read_capped(p, 99))
+
+
+class RealDaemonLinkPreviewTest(unittest.TestCase):
+    """The real Daemon.__init__ and _link_preview end to end against a local page, with only
+    D-Bus, the phone and the database path stubbed. 1.2.11's previews never got this far."""
+
+    def test_a_link_preview_arrives(self):
+        import http.server, threading
+        from unittest import mock
+        from pearmsg import daemon as D, linkpreview
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<html><head><title>a real page</title></head></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(D, "DATA", tmp), mock.patch.object(D, "CACHE", tmp), \
+                mock.patch.object(D.dbus, "SystemBus"), mock.patch.object(D.dbus, "SessionBus"), \
+                mock.patch.object(D.dbus.mainloop.glib, "DBusGMainLoop"), \
+                mock.patch.object(D.IP, "AudioGuard"), mock.patch.object(D.IP, "Phone"), \
+                mock.patch.object(D.IP, "Pairing"), \
+                mock.patch.object(linkpreview, "_is_public", lambda ip: True):
+            d = D.Daemon()
+            sent = []
+            d.conns = ["conn"]
+            d._send = lambda c, m: sent.append(m)
+            url = f"http://127.0.0.1:{server.server_port}/page"
+            d._link_preview("conn", url)
+            _spin(lambda: sent)
+            d.store.db.close()
+        self.assertTrue(sent, "no answer: the worker died")
+        self.assertEqual((sent[0]["ok"], sent[0].get("title")), (True, "a real page"))
+        self.assertEqual(d._link_waiting, {})
