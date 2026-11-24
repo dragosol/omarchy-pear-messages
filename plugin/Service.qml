@@ -43,6 +43,11 @@ QtObject {
   // daemon that cannot start (missing python-dbus, say) does not spin for the whole session.
   readonly property int restartLimit: 20
 
+  // The system Python by absolute path, never whichever python3 is first on PATH: a Python from
+  // mise, pyenv, asdf, uv or conda there has no python-dbus or python-gobject, so the daemon died
+  // on import and the service gave up without a word (#3).
+  readonly property string python: "/usr/bin/python3"
+
   // Is the installed copy missing, or from another version than this checkout? Paths go in
   // as arguments, never spliced into the script.
   property Process check: Process {
@@ -89,13 +94,21 @@ QtObject {
     running: false
     // `python3 -m` puts the working directory on sys.path, so running from the backend folder
     // replaces PYTHONPATH, and -u replaces PYTHONUNBUFFERED. No environment to pass at all.
-    command: ["python3", "-B", "-u", "-m", "pearmsg", "daemon"]
+    command: [root.python, "-B", "-u", "-m", "pearmsg", "daemon"]
     // so it stops when this shell goes away instead of lingering beside the next one's
     environment: ({ PEAR_MESSAGES_SUPERVISED: "1" })
     workingDirectory: root.backendPath
     onExited: function (code, status) {
-      if (root.stopping || root.restarts >= root.restartLimit)
+      if (root.stopping)
         return
+      if (root.restarts >= root.restartLimit) {
+        // Given up: say so, and how to see why, instead of going quiet.
+        Quickshell.execDetached(["notify-send", "-a", "Pear Messages",
+          "Pear Messages could not start",
+          "Its service stopped " + (root.restartLimit + 1) + " times in a row. To see why, run: cd "
+            + root.backendPath + " && " + root.python + " -m pearmsg daemon"])
+        return
+      }
       root.restarts += 1
       root.retry.restart()
     }

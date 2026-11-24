@@ -12,7 +12,7 @@ mkdir -p "$run"
 
 focus_running() {
   if [ -n "$thread" ]; then
-    PYTHONPATH="$backend" python3 -B -m pearmsg open "$thread" >/dev/null 2>&1
+    PYTHONPATH="$backend" /usr/bin/python3 -B -m pearmsg open "$thread" >/dev/null 2>&1
   fi
   command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch focuswindow 'title:^Pear Messages$' >/dev/null 2>&1
 }
@@ -30,7 +30,7 @@ fi
 # process here. No service manager is involved either way.
 if [ ! -S "$run/sock" ]; then
   # not holding the window's lock (fd 9), or the window could never open again while it runs
-  (cd "$backend" && exec python3 -B -u -m pearmsg daemon >/dev/null 2>&1 9>&-) &
+  (cd "$backend" && exec /usr/bin/python3 -B -u -m pearmsg daemon >/dev/null 2>&1 9>&-) &
 fi
 
 PEAR_MESSAGES_OPEN="$thread" exec quickshell -p "$here"

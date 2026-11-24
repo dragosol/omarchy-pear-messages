@@ -150,7 +150,8 @@ plugin itself, as part of your Omarchy shell, and stops when you log out. Only o
 runs: when the shell restarts, its service stops with it, and a newly started service stops
 any older copy before it begins.
 
-Requirements: `python3`, `python-dbus`, `python-gobject`, `quickshell` and `bluez-obex` for the
+Requirements: the system Python (`/usr/bin/python3`, used even when mise, pyenv or similar put
+another `python3` first on your PATH), `python-dbus`, `python-gobject`, `quickshell` and `bluez-obex` for the
 iPhone connection. Omarchy already ships all of them, so there is nothing to install. `ffmpeg`,
 also already present, is used for video thumbnails.
 
@@ -219,8 +220,8 @@ The iPhone stays paired like any Bluetooth device. It reconnects by itself whene
 The `pear-messages` command talks to the service too:
 
 ```bash
-PYTHONPATH=~/.local/share/pear-messages/backend python3 -m pearmsg status    # connections, as JSON
-PYTHONPATH=~/.local/share/pear-messages/backend python3 -m pearmsg threads   # conversations
+PYTHONPATH=~/.local/share/pear-messages/backend /usr/bin/python3 -m pearmsg status    # connections, as JSON
+PYTHONPATH=~/.local/share/pear-messages/backend /usr/bin/python3 -m pearmsg threads   # conversations
 ```
 
 ## Development

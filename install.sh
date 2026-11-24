@@ -23,16 +23,18 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not root - nothing here needs root"
 
-for cmd in python3 quickshell; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
-done
+# The system Python, as the service and the window run it: a python3 earlier on PATH (mise,
+# pyenv, asdf, uv, conda) has none of the system's Python packages (#3).
+py=/usr/bin/python3
+[ -x "$py" ] || die "the system Python ($py) is required but not installed"
+command -v quickshell >/dev/null 2>&1 || die "'quickshell' is required but not installed"
 [ -d "$omarchy_shell/Ui" ] && [ -d "$omarchy_shell/Commons" ] \
   || die "Omarchy's shell components were not found in $omarchy_shell"
-python3 -c 'import dbus, gi; gi.require_version("GLib", "2.0"); from gi.repository import GLib' 2>/dev/null \
+"$py" -c 'import dbus, gi; gi.require_version("GLib", "2.0"); from gi.repository import GLib' 2>/dev/null \
   || die "the D-Bus bindings for Python are missing (python-dbus, python-gobject)"
 # Notifications go over D-Bus (org.freedesktop.Notifications), not by running notify-send, so
 # message text never reaches a command line. Any notification daemon that owns that name works.
-python3 -c "import dbus,dbus.mainloop.glib" >/dev/null 2>&1 ||
+"$py" -c "import dbus,dbus.mainloop.glib" >/dev/null 2>&1 ||
     warn "python-dbus is not installed: new messages will not pop up"
 
 missing_obex=0

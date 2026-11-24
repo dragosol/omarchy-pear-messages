@@ -21,7 +21,7 @@ def _call(req: dict, want: str, timeout: float = 30.0) -> dict:
         s.connect(SOCK)
     except OSError:
         sys.exit("pear-messages: the daemon isn't running. It starts with your Omarchy shell; "
-                 "open Pear Messages, or run it directly:  python3 -B -u -m pearmsg daemon")
+                 "open Pear Messages, or run it directly:  /usr/bin/python3 -B -u -m pearmsg daemon")
     req = {**req, "id": 1}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
