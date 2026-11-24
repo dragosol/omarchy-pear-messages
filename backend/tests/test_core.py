@@ -1,6 +1,7 @@
 import os
 import re
 import socket
+import subprocess
 import stat
 import sys
 import tempfile
@@ -1766,7 +1767,8 @@ class PixelBoundTest(unittest.TestCase):
             with open(src, "wb") as f:
                 f.write(self.huge_png())
             start = time.monotonic()
-            self.assertFalse(media._to_jpeg(src, os.path.join(tmp, "out.jpg"), 600))
+            with media._Watchdog(30) as dog:
+                self.assertFalse(media._to_jpeg(src, os.path.join(tmp, "out.jpg"), dog, 600))
             self.assertLess(time.monotonic() - start, 5)
             # the whole test process's children: a full decode alone peaks past 1 GB
             self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 600_000)
@@ -2089,3 +2091,319 @@ class RealDaemonLinkPreviewTest(unittest.TestCase):
         self.assertTrue(sent, "no answer: the worker died")
         self.assertEqual((sent[0]["ok"], sent[0].get("title")), (True, "a real page"))
         self.assertEqual(d._link_waiting, {})
+
+
+def _within(test, fn, seconds):
+    """Run fn on a thread; fail (without hanging the suite) if it isn't over in `seconds`.
+    Returns (elapsed, exception or None)."""
+    import threading
+    out = {}
+
+    def run():
+        start = time.monotonic()
+        try:
+            fn()
+        except BaseException as e:
+            out["error"] = e
+        out["took"] = time.monotonic() - start
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    test.assertFalse(t.is_alive(), f"still running after {seconds} s")
+    return out["took"], out.get("error")
+
+
+class _StallServer:
+    """A TCP server whose every connection is handed to `serve(conn)`."""
+
+    def __init__(self, serve):
+        import threading
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.conns = []
+        self.serve = serve
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        import threading
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            self.conns.append(c)
+            threading.Thread(target=self._run, args=(c,), daemon=True).start()
+
+    def _run(self, c):
+        try:
+            self.serve(c)
+        except OSError:
+            pass
+
+    def close(self):
+        self.sock.close()
+        for c in self.conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+class MediaWholeDeadlineTest(unittest.TestCase):
+    """Review of e08f20d: the decoder-pipe write and close ran before any timed wait, and a
+    photo download had no deadline for the whole of it - only per wait, which a server that
+    sends a byte now and then, or never answers a TLS handshake, never trips."""
+
+    def setUp(self):
+        from pearmsg import media
+        self.media = media
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = (media.PHOTO_DEADLINE, media.THUMB_DEADLINE, media.PREVIEW_WAIT, media.AUTO_VIDEO)
+        # the per-wait timeout well past the deadline: only the deadline can end these
+        media.PHOTO_DEADLINE, media.THUMB_DEADLINE, media.PREVIEW_WAIT = 2, 2, 30
+        media.AUTO_VIDEO = 64 * 1024 * 1024
+
+        def restore():
+            (media.PHOTO_DEADLINE, media.THUMB_DEADLINE, media.PREVIEW_WAIT,
+             media.AUTO_VIDEO) = saved
+        self.addCleanup(restore)
+
+    def server(self, serve):
+        s = _StallServer(serve)
+        self.addCleanup(s.close)
+        return s
+
+    def photo(self, url):
+        client = BB.Client(url, "pw")
+        dst = os.path.join(self.tmp.name, "p.jpg")
+        took, err = _within(self, lambda: self.media.photo_preview(client, "at_0_P", dst), 12)
+        self.assertIsInstance(err, self.media.MediaError)
+        self.assertLess(took, 2 + 1.5, f"ran {took:.1f} s against a 2 s deadline")
+
+    def test_headers_sent_a_byte_at_a_time(self):
+        def serve(c):
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\n")
+            while True:
+                c.sendall(b"X")
+                time.sleep(0.3)
+        s = self.server(serve)
+        self.photo(f"http://127.0.0.1:{s.port}")
+
+    def test_a_body_sent_a_byte_at_a_time(self):
+        def serve(c):
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+            while True:
+                c.sendall(b"x")
+                time.sleep(0.3)
+        s = self.server(serve)
+        self.photo(f"http://127.0.0.1:{s.port}")
+
+    def test_a_tls_handshake_that_never_answers(self):
+        def serve(c):
+            c.recv(65536)
+            time.sleep(60)
+        s = self.server(serve)
+        self.photo(f"https://127.0.0.1:{s.port}")
+
+    @unittest.skipUnless(os.path.exists("/bin/sh"), "needs sh")
+    def test_an_ffmpeg_that_stops_reading_its_pipe(self):
+        # moov first, so it streams into ffmpeg; this ffmpeg never reads, so the pipe fills and
+        # the write blocks - before any check of the deadline could run.
+        bindir = os.path.join(self.tmp.name, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(bindir, "ffmpeg"), "w") as f:
+            f.write("#!/bin/sh\nexec sleep 1000\n")
+        os.chmod(os.path.join(bindir, "ffmpeg"), 0o755)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + old_path
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+
+        def serve(c):
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\n\r\n" + b"\0\0\0\x08moov")
+            while True:
+                c.sendall(b"x" * 65536)
+        s = self.server(serve)
+        client = BB.Client(f"http://127.0.0.1:{s.port}", "pw")
+        dst = os.path.join(self.tmp.name, "v.jpg")
+        took, err = _within(self, lambda: self.media.video_thumb(client, "at_0_V", 0, dst,
+                                                                 self.tmp.name), 12)
+        self.assertIsInstance(err, self.media.MediaError)
+        self.assertLess(took, 2 + 1.5, f"ran {took:.1f} s against a 2 s deadline")
+        self.assertFalse(os.path.exists(dst))
+
+    def test_an_opened_original_has_a_deadline(self):
+        from unittest import mock
+
+        def serve(c):
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+            while True:
+                c.sendall(b"x")
+                time.sleep(0.3)
+        s = self.server(serve)
+        client = BB.Client(f"http://127.0.0.1:{s.port}", "pw")
+        dst = os.path.join(self.tmp.name, "o.bin")
+        with mock.patch.object(self.media, "original_deadline", lambda size: 2):
+            took, err = _within(self, lambda: self.media.original(client, "at_0_O", dst, 100000), 12)
+        self.assertIsInstance(err, self.media.MediaError)
+        self.assertLess(took, 2 + 1.5)
+        self.assertFalse(os.path.exists(dst) or os.path.exists(dst + ".part"))
+
+    def test_a_normal_photo_still_arrives(self):
+        """The watchdog's duplicate descriptors are closed, and a quick answer is untouched."""
+        import shutil as sh
+        if not sh.which("ffmpeg"):
+            self.skipTest("needs ffmpeg")
+        png = os.path.join(self.tmp.name, "src.png")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=red:s=64x48",
+                        "-frames:v", "1", png], check=True)
+        body = open(png, "rb").read()
+
+        def serve(c):
+            while c.recv(65536):
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        s = self.server(serve)
+        before = len(os.listdir("/proc/self/fd"))
+        client = BB.Client(f"http://127.0.0.1:{s.port}", "pw")
+        dst = os.path.join(self.tmp.name, "p.jpg")
+        took, err = _within(self, lambda: self.media.photo_preview(client, "at_0_P", dst), 12)
+        self.assertIsNone(err)
+        self.assertTrue(os.path.getsize(dst) > 0)
+        s.close()                       # the server's own ends of the connections
+        time.sleep(0.2)
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), before)
+
+
+class LinkPreviewResolverDeadlineTest(unittest.TestCase):
+    """Review of e08f20d: name resolution ran outside the link-preview deadline."""
+
+    def test_a_lookup_that_never_answers(self):
+        from unittest import mock
+        from pearmsg import linkpreview as LP
+        release = __import__("threading").Event()
+        self.addCleanup(release.set)
+
+        def slow(*a, **kw):
+            release.wait(30)
+            raise socket.gaierror("gave up")
+        with mock.patch.object(LP, "DEADLINE", 1), mock.patch.object(LP.socket, "getaddrinfo", slow):
+            took, err = _within(self, lambda: LP.fetch("http://example.invalid/"), 10)
+        self.assertIsInstance(err, LP.Blocked)
+        self.assertEqual(str(err), "too slow")
+        self.assertLess(took, 1 + 1)
+
+    def test_stuck_lookups_are_capped(self):
+        from unittest import mock
+        from pearmsg import linkpreview as LP
+        release = __import__("threading").Event()
+        started = []
+
+        def slow(*a, **kw):
+            started.append(1)
+            release.wait(30)
+            raise socket.gaierror("gave up")
+        try:
+            with mock.patch.object(LP, "DEADLINE", 0.3), \
+                    mock.patch.object(LP.socket, "getaddrinfo", slow):
+                errors = [_within(self, lambda: LP.fetch("http://example.invalid/"), 5)[1]
+                          for _ in range(LP.RESOLVERS + 3)]
+            self.assertEqual(len(started), LP.RESOLVERS)
+            self.assertEqual([str(e) for e in errors],
+                             ["too slow"] * LP.RESOLVERS + ["busy"] * 3)
+        finally:
+            release.set()
+        _spin(lambda: LP._resolvers.acquire(blocking=False) and (LP._resolvers.release() or True), 5)
+        # all slots come back once the lookups finish
+        got = [LP._resolvers.acquire(blocking=False) for _ in range(LP.RESOLVERS)]
+        for g in got:
+            if g:
+                LP._resolvers.release()
+        self.assertEqual(got, [True] * LP.RESOLVERS)
+
+
+class OBEXTransferGuardTest(unittest.TestCase):
+    """Review of e08f20d: the size bound applied when the downloaded file was read, after obexd
+    had already written all of it. The guard cancels the transfer while it runs."""
+
+    def setUp(self):
+        from pearmsg import iphone
+        self.iphone = iphone
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.target = os.path.join(self.tmp.name, "t.bmsg")
+        open(self.target, "wb").close()
+        self.cancels = []
+        test = self
+
+        class Transfer:
+            def Cancel(self, reply_handler, error_handler):
+                test.cancels.append(time.monotonic())
+                reply_handler()
+        self.transfer = Transfer()
+        self.finished = []
+
+    def guard(self, limit=1000, seconds=30):
+        g = self.iphone.TransferGuard(self.transfer, self.target, limit, seconds,
+                                      lambda: self.finished.append(1))
+        self.addCleanup(g.stop)
+        return g
+
+    def test_a_file_growing_past_its_size_is_cancelled_and_emptied(self):
+        g = self.guard()
+        with open(self.target, "ab") as f:
+            f.write(b"x" * 2000)
+        _spin(lambda: self.cancels, 3)
+        self.assertEqual(len(self.cancels), 1)
+        self.assertEqual(os.path.getsize(self.target), 0)
+        self.assertTrue(g.cancelled_at)
+
+    def test_a_declared_or_reported_size_cancels_at_once(self):
+        g = self.guard()
+        g.progress({"Size": 10_000})
+        self.assertEqual(len(self.cancels), 1)
+        g2 = self.iphone.TransferGuard(self.transfer, self.target, 1000, 30, lambda: None)
+        self.addCleanup(g2.stop)
+        g2.progress({"Transferred": 999})
+        self.assertEqual(len(self.cancels), 1)
+        g2.progress({"Transferred": 1001})
+        self.assertEqual(len(self.cancels), 2)
+
+    def test_a_slow_transfer_is_cancelled_at_its_time(self):
+        self.guard(seconds=0.5)
+        _spin(lambda: self.cancels, 3)
+        self.assertEqual(len(self.cancels), 1)
+
+    def test_no_word_from_obexd_after_cancelling_finishes_it_anyway(self):
+        from unittest import mock
+        with mock.patch.object(self.iphone.TransferGuard, "GRACE", 0.5):
+            g = self.guard()
+            g.progress({"Size": 10_000})
+            _spin(lambda: self.finished, 4)
+        self.assertEqual(self.finished, [1])
+
+    def test_the_phone_treats_a_cancelled_body_as_failed(self):
+        """Wired into Phone: an over-size Transferred cancels, and the message keeps its
+        listing's subject rather than reading the file."""
+        from unittest import mock
+        P = self.iphone
+        ph = P.Phone.__new__(P.Phone)
+        ph.transfers, ph.guards, ph.keep_unread, ph.seen = {}, {}, set(), set()
+        ph.session, ph.log = "/s", lambda m: None
+        ph.ses = mock.Mock()
+        bodies = []
+        ph._got_body = lambda *a, ok: bodies.append(ok)
+        with mock.patch.object(P.dbus, "Interface", lambda obj, iface: self.transfer):
+            ph.transfers["/t1"] = (self.target, "h", {}, [], [], "subject")
+            ph._guard("/t1", self.target, P.MAX_BMESSAGE, P.BMESSAGE_TIME, {"Size": 0})
+            ph._transfer_props("org.bluez.obex.Transfer1", {"Transferred": P.MAX_BMESSAGE + 1},
+                               [], path="/t1")
+            self.assertEqual(len(self.cancels), 1)
+            ph._transfer_props("org.bluez.obex.Transfer1", {"Status": "complete"}, [], path="/t1")
+        self.assertEqual(bodies, [False])
+        self.assertEqual((ph.transfers, ph.guards), ({}, {}))

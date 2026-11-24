@@ -9,6 +9,7 @@ loop; nothing here touches the store.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import threading
@@ -71,11 +72,51 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirects)
+# Who wants to hear about the sockets this thread opens (media's per-preview watchdog), so a
+# deadline can reach a connect, a TLS handshake or a header wait, not only the body.
+_sockets = threading.local()
 
 
-def urlopen(req, timeout: float):
-    return _opener.open(req, timeout=timeout)
+def _create_connection(*args, **kwargs):
+    sock = socket.create_connection(*args, **kwargs)
+    hook = getattr(_sockets, "hook", None)
+    if hook is not None:
+        hook(sock)              # before any TLS: the handshake runs on this connection
+    return sock
+
+
+class _HTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _create_connection
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _create_connection
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_HTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_HTTPSConnection, req, context=self._context)
+
+
+_opener = urllib.request.build_opener(_NoRedirects, _HTTPHandler, _HTTPSHandler)
+
+
+def urlopen(req, timeout: float, on_socket=None):
+    """on_socket(sock) is called with each new connection, before its TLS handshake."""
+    _sockets.hook = on_socket
+    try:
+        return _opener.open(req, timeout=timeout)
+    finally:
+        _sockets.hook = None
 
 
 def _read_capped(r, limit: int | None = None) -> bytes:

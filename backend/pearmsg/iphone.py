@@ -32,11 +32,81 @@ BLUEZ = "org.bluez"
 OBEX = "org.bluez.obex"
 MAP_MSE = "00001132-0000-1000-8000-00805f9b34fb"
 PBAP_PSE = "0000112f-0000-1000-8000-00805f9b34fb"
-# What the phone's files may weigh before they're read. obexd writes them to disk whatever their
-# size; they are read on the main loop, so one that is far past any real message or address
-# book is skipped instead. A text's bMessage is a few KB; an address book with photos, MBs.
+# What the phone's files may weigh, and how long they may take. obexd writes them to disk; a
+# transfer that goes past either is cancelled while it runs (TransferGuard), and what is on disk
+# is read no further than this. A text's bMessage is a few KB; an address book with photos, MBs.
 MAX_BMESSAGE = 1024 * 1024
 MAX_VCARDS = 32 * 1024 * 1024
+BMESSAGE_TIME = 60
+VCARDS_TIME = 300
+
+
+class TransferGuard:
+    """Cancels one OBEX transfer that grows past its size or outlives its time, while it runs.
+
+    obexd writes what the phone sends straight to the target file, so a bound that only applies
+    when reading it afterwards still lets the phone fill the disk first. The transfer's declared
+    Size and each Transferred update are checked as they arrive, and the file on disk twice a
+    second (obexd reports Transferred at most once a second). Past the bound: Transfer1.Cancel,
+    and the file is emptied at once. If obexd doesn't report the transfer over within a few
+    seconds of that, finish() is called anyway, as a failure.
+    """
+    POLL_MS = 500
+    GRACE = 5
+
+    def __init__(self, transfer, target: str, limit: int, seconds: float, finish, log=lambda m: None):
+        self.transfer, self.target, self.limit = transfer, target, limit
+        self.deadline = time.monotonic() + seconds
+        self.finish, self.log = finish, log
+        self.cancelled_at = 0.0
+        self.done = False
+        self.source = GLib.timeout_add(self.POLL_MS, self._poll)
+
+    def progress(self, changed) -> None:
+        """Size or Transferred from the transfer's properties."""
+        for key in ("Size", "Transferred"):
+            v = changed.get(key)
+            if v is not None and int(v) > self.limit:
+                self.cancel(f"{key} {int(v)} is over {self.limit}")
+
+    def _poll(self) -> bool:
+        if self.done:
+            return False
+        if self.cancelled_at:
+            if time.monotonic() - self.cancelled_at > self.GRACE:
+                self.stop()
+                self.finish()
+                return False
+            return True
+        try:
+            if os.path.getsize(self.target) > self.limit:
+                self.cancel("the file is over its size")
+        except OSError:
+            pass
+        if not self.cancelled_at and time.monotonic() > self.deadline:
+            self.cancel("it took too long")
+        return True
+
+    def cancel(self, why: str) -> None:
+        if self.cancelled_at or self.done:
+            return
+        self.cancelled_at = time.monotonic()
+        self.log(f"stopped a transfer from the iPhone: {why}")
+        try:
+            self.transfer.Cancel(reply_handler=lambda: None, error_handler=lambda e: None)
+        except dbus.DBusException:
+            pass
+        try:
+            os.truncate(self.target, 0)
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        """The transfer is over (obexd said so, or the grace ran out): no more checks."""
+        self.done = True
+        if self.source:
+            GLib.source_remove(self.source)
+            self.source = 0
 
 
 def read_capped(path: str, limit: int) -> bytes | None:
@@ -412,6 +482,7 @@ class Phone:
         self.busy = False
         self.sync_again = False
         self.transfers: dict[str, tuple] = {}
+        self.guards: dict[str, TransferGuard] = {}
         self.first_sync = True
         self.keep_unread: set[str] = set()
         sesbus.add_signal_receiver(self._obex_added, "InterfacesAdded",
@@ -576,6 +647,7 @@ class Phone:
 
         def got(tpath, props):
             self.transfers[str(tpath)] = (target, h, p, rest, done, subject)
+            self._guard(str(tpath), target, MAX_BMESSAGE, BMESSAGE_TIME, props)
         msg = dbus.Interface(self.ses.get_object(OBEX, path), "org.bluez.obex.Message1")
         if not p.get("Read", False):
             # Downloading a message can mark it read on the phone (MAP GetMessage). It isn't -
@@ -584,15 +656,34 @@ class Phone:
         msg.Get(target, False, reply_handler=got,
                 error_handler=lambda e: self._got_body(target, h, p, rest, done, subject, ok=False))
 
+    def _guard(self, tpath: str, target: str, limit: int, seconds: float, props) -> None:
+        tr = dbus.Interface(self.ses.get_object(OBEX, tpath), "org.bluez.obex.Transfer1")
+        g = TransferGuard(tr, target, limit, seconds, lambda: self._transfer_over(tpath, False),
+                          self.log)
+        self.guards[tpath] = g
+        g.progress({str(k): v for k, v in dict(props or {}).items()})
+
     def _transfer_props(self, iface, changed, invalidated, path=None):
         if iface != "org.bluez.obex.Transfer1" or str(path) not in self.transfers:
             return
+        g = self.guards.get(str(path))
+        if g is not None:
+            g.progress(changed)
         st = changed.get("Status")
         if st in ("complete", "error"):
-            if self.transfer_done(str(path), st == "complete"):
-                return
-            args = self.transfers.pop(str(path))
-            self._got_body(*args, ok=(st == "complete"))
+            # a cancelled transfer is a failed one, whatever obexd reports
+            self._transfer_over(str(path), st == "complete" and not (g and g.cancelled_at))
+
+    def _transfer_over(self, path: str, ok: bool) -> None:
+        g = self.guards.pop(path, None)
+        if g is not None:
+            g.stop()
+        if path not in self.transfers:
+            return
+        if self.transfer_done(path, ok):
+            return
+        args = self.transfers.pop(path)
+        self._got_body(*args, ok=ok)
 
     def _restore_unread(self, handle: str) -> None:
         path = f"{self.session}/message{handle}"
@@ -676,6 +767,7 @@ class Phone:
 
             def pulled(tpath, props):
                 self.transfers[str(tpath)] = ("__pb__", target, spath)
+                self._guard(str(tpath), target, MAX_VCARDS, VCARDS_TIME, props)
 
             def selected():
                 pb.PullAll(target, {"Format": "vcard30", "Fields": dbus.Array(["FN", "N", "TEL", "EMAIL", "ORG"], "s")},

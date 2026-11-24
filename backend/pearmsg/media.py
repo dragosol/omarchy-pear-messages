@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import tempfile
@@ -48,9 +49,101 @@ _DECODES = threading.BoundedSemaphore(2)
 # then can overrun the deadline by at most one PREVIEW_WAIT.
 THUMB_DEADLINE = 60
 PREVIEW_WAIT = 15
+# A photo preview, both downloads and the re-encode together.
+PHOTO_DEADLINE = 60
 # An original you opened: what the Mac said its size was, plus this. With no size, ORIGINAL_MAX.
 ORIGINAL_SLACK = 1024 * 1024
 ORIGINAL_MAX = 4 * 1024 * 1024 * 1024
+
+
+class _Watchdog:
+    """Ends one preview at its deadline, whatever it is blocked in.
+
+    A deadline that is only checked between steps can't end the step itself: a read waits up to
+    its socket timeout and starts again on every byte, and a write into ffmpeg's pipe waits for
+    as long as ffmpeg doesn't read. At the deadline this shuts the download's connection (a
+    blocked connect, handshake, header wait or read returns at once) and kills ffmpeg (a blocked
+    write fails with a broken pipe).
+
+    The connection is kept as a duplicate descriptor, taken as it is opened: TLS detaches the
+    plain socket object from its descriptor, and shutting down any descriptor of a connection
+    ends it for all of them. The duplicates are closed when the preview is over.
+    """
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + seconds
+        self.fired = False
+        self._lock = threading.Lock()
+        self._socks: list = []
+        self._procs: list = []
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def left(self) -> float:
+        left = self.deadline - time.monotonic()
+        if left <= 0 or self.fired:
+            raise MediaError("The Mac was too slow sending it")
+        return left
+
+    def socket(self, sock) -> None:
+        """A connection _open made: shut at the deadline."""
+        dup = sock.dup()
+        with self._lock:
+            self._socks.append(dup)
+            fired = self.fired
+        if fired:
+            self._shut(dup)
+
+    def proc(self, p):
+        with self._lock:
+            self._procs.append(p)
+            fired = self.fired
+        if fired:
+            p.kill()
+        return p
+
+    @staticmethod
+    def _shut(sock) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            socks, procs = list(self._socks), list(self._procs)
+        for sock in socks:
+            self._shut(sock)
+        for p in procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+    def slot(self):
+        """One of the _DECODES, waited for no longer than the deadline allows."""
+        dog = self
+
+        class _Slot:
+            def __enter__(self):
+                if not _DECODES.acquire(timeout=dog.left()):
+                    raise MediaError("The Mac was too slow sending it")
+
+            def __exit__(self, *exc):
+                _DECODES.release()
+        return _Slot()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._timer.cancel()
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            sock.close()
 
 
 def _ffmpeg(*args: str) -> list[str]:
@@ -67,7 +160,7 @@ class MediaError(Exception):
     pass
 
 
-def _open(client, guid: str, width: int = 0, timeout: float = 120):
+def _open(client, guid: str, width: int = 0, timeout: float = 120, dog: "_Watchdog | None" = None):
     path = f"/attachment/{urllib.parse.quote(guid, safe='')}/download"
     if width:
         path += f"?width={width}&quality=good"
@@ -75,7 +168,9 @@ def _open(client, guid: str, width: int = 0, timeout: float = 120):
     req = urllib.request.Request(f"{client.url}/api/v1{path}{'&' if '?' in path else '?'}{q}",
                                  headers={"User-Agent": "PearMessages/1.0"})
     try:
-        return bluebubbles.urlopen(req, timeout=timeout)
+        if dog is not None:
+            timeout = min(timeout, dog.left())
+        return bluebubbles.urlopen(req, timeout=timeout, on_socket=dog.socket if dog else None)
     except Exception as e:
         raise MediaError(f"Can't fetch it from the Mac: {getattr(e, 'reason', e)}") from None
 
@@ -93,8 +188,8 @@ def _read_by(r, n: int, deadline: float) -> bytes:
     return bytes(out)
 
 
-def _read_capped(r, limit: int) -> bytes:
-    data = r.read(limit + 1)
+def _read_capped(r, limit: int, deadline: float) -> bytes:
+    data = _read_by(r, limit + 1, deadline)
     if len(data) > limit:
         raise MediaError("The Mac sent far more than a preview")
     return data
@@ -184,14 +279,17 @@ def _upright_filter(preview: bytes, original_head: bytes) -> str:
     return vf
 
 
-def _to_jpeg(src: str, dst: str, width: int = 0, rotate: str = "") -> bool:
+def _to_jpeg(src: str, dst: str, dog: _Watchdog, width: int = 0, rotate: str = "") -> bool:
     if not shutil.which("ffmpeg"):
         return False
     filters = [f for f in (rotate, f"scale='min({width},iw)':-2" if width else "") if f]
     vf = ["-vf", ",".join(filters)] if filters else []
-    with _DECODES:
-        r = subprocess.run(_ffmpeg("-i", src, *vf, "-frames:v", "1", "-q:v", "4", dst),
-                           capture_output=True, timeout=60)
+    with dog.slot():
+        try:
+            r = subprocess.run(_ffmpeg("-i", src, *vf, "-frames:v", "1", "-q:v", "4", dst),
+                               capture_output=True, timeout=dog.left())
+        except subprocess.TimeoutExpired:
+            raise MediaError("The picture took too long to read") from None
     return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
 
 
@@ -210,24 +308,37 @@ def _private(path: str) -> str:
     return path
 
 def photo_preview(client, guid: str, dst: str) -> str:
-    """A small JPEG of the photo. Returns the path written."""
-    with _open(client, guid, PREVIEW_WIDTH) as r:
-        data = _read_capped(r, MAX_PREVIEW)
+    """A small JPEG of the photo, all of it within PHOTO_DEADLINE. Returns the path written."""
+    with _Watchdog(PHOTO_DEADLINE) as dog:
+        return _photo_preview(client, guid, dst, dog)
+
+
+def _photo_preview(client, guid: str, dst: str, dog: _Watchdog) -> str:
+    try:
+        with _open(client, guid, PREVIEW_WIDTH, PREVIEW_WAIT, dog) as r:
+            data = _read_capped(r, MAX_PREVIEW, dog.deadline)
+        dog.left()                                  # a read the watchdog cut short is no picture
+    except OSError as e:
+        dog.left()
+        raise MediaError(f"Can't fetch it from the Mac: {e}") from None
     _orient, w, h = image_info(data)
     if w * h > MAX_PIXELS:
         raise MediaError("The Mac sent a picture far bigger than a preview")
     rotate = ""
     if image_info(data)[0] == 1:                    # no tag of its own: ask the original
         try:
-            with _open(client, guid) as r:
-                rotate = _upright_filter(data, r.read(ORIENTATION_HEAD))
+            with _open(client, guid, timeout=PREVIEW_WAIT, dog=dog) as r:
+                head = _read_by(r, ORIENTATION_HEAD, dog.deadline)
+            dog.left()
+            rotate = _upright_filter(data, head)
         except (MediaError, OSError):
-            pass                                    # a sideways photo beats no photo
+            dog.left()                              # out of time: no preview at all
+            # otherwise a sideways photo beats no photo
     fd, raw = tempfile.mkstemp(dir=os.path.dirname(dst))
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     try:
-        if _to_jpeg(raw, dst + ".part.jpg", rotate=rotate):
+        if _to_jpeg(raw, dst + ".part.jpg", dog, rotate=rotate):
             os.replace(dst + ".part.jpg", dst)   # ffmpeg wrote this one 0644
         elif w and h:
             # No ffmpeg (or it failed): keep what the Mac sent, but only a JPEG or PNG whose header
@@ -241,6 +352,13 @@ def photo_preview(client, guid: str, dst: str) -> str:
             if os.path.exists(p):
                 os.unlink(p)
     return dst
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _moov_first(head: bytes) -> bool | None:
@@ -264,8 +382,17 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
     """A JPEG frame from the start of the video."""
     if not shutil.which("ffmpeg"):
         raise MediaError("Video thumbnails need ffmpeg")
-    r = _open(client, guid, timeout=PREVIEW_WAIT if not allow_big else 120)
-    deadline = time.monotonic() + (THUMB_DEADLINE if not allow_big else 3600)
+    with _Watchdog(THUMB_DEADLINE if not allow_big else 3600) as dog:
+        try:
+            return _video_thumb(client, guid, size, dst, scratch, allow_big, dog)
+        except OSError as e:
+            dog.left()                              # cut off by the deadline: "too slow"
+            raise MediaError(f"Can't fetch it from the Mac: {e}") from None
+
+
+def _video_thumb(client, guid, size, dst, scratch, allow_big, dog: _Watchdog) -> str:
+    r = _open(client, guid, timeout=PREVIEW_WAIT if not allow_big else 120, dog=dog)
+    deadline = dog.deadline
     # Only the start of a video is needed when its index comes first; the whole of it otherwise,
     # which only a video the Mac says is under AUTO_VIDEO gets without being asked for.
     limit = AUTO_VIDEO if not allow_big else max(size, AUTO_VIDEO) + ORIGINAL_SLACK
@@ -274,11 +401,12 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
         first = _moov_first(head)
         if first:
             # stream: ffmpeg stops once it has a frame, and so do we
-            with _DECODES:
-                p = subprocess.Popen(_ffmpeg("-i", "pipe:0", "-frames:v", "1",
-                                             "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
-                                             dst + ".part.jpg"),
-                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with dog.slot():
+                # The watchdog kills it at the deadline, which also ends a write it isn't reading.
+                p = dog.proc(subprocess.Popen(_ffmpeg("-i", "pipe:0", "-frames:v", "1",
+                                              "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
+                                              dst + ".part.jpg"),
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
                 fed = len(head)
                 try:
                     p.stdin.write(head)
@@ -295,10 +423,13 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
                 except OSError:
                     pass
                 try:
-                    p.wait(timeout=max(1.0, min(30.0, deadline - time.monotonic())))
+                    p.wait(timeout=max(0.1, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     p.kill()
                     p.wait()
+                if dog.fired:
+                    _unlink(dst + ".part.jpg")      # whatever it wrote before it was killed
+                    dog.left()
         else:
             if size > AUTO_VIDEO and not allow_big:
                 raise MediaError("big")
@@ -317,11 +448,15 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
                         if time.monotonic() > deadline:
                             raise MediaError("The Mac was too slow sending it")
                         f.write(chunk)
-                with _DECODES:
-                    subprocess.run(_ffmpeg("-i", tmp, "-frames:v", "1",
-                                           "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
-                                           dst + ".part.jpg"),
-                                   capture_output=True, timeout=60)
+                with dog.slot():
+                    try:
+                        subprocess.run(_ffmpeg("-i", tmp, "-frames:v", "1",
+                                               "-vf", f"scale='min({PREVIEW_WIDTH},iw)':-2", "-q:v", "4",
+                                               dst + ".part.jpg"),
+                                       capture_output=True, timeout=dog.left())
+                    except subprocess.TimeoutExpired:
+                        _unlink(dst + ".part.jpg")
+                        raise MediaError("The video took too long to read") from None
             finally:
                 os.unlink(tmp)
     finally:
@@ -332,19 +467,30 @@ def video_thumb(client, guid: str, size: int, dst: str, scratch: str, allow_big:
     return _private(dst)
 
 
+def original_deadline(size: int) -> float:
+    """How long an opened file may take: two minutes plus 128 KB/s of its size; an hour at most."""
+    return min(3600.0, 120 + (size if size > 0 else ORIGINAL_MAX) / (128 * 1024))
+
+
 def original(client, guid: str, dst: str, size: int = 0) -> str:
     """The file itself, to the temporary folder: no more than the Mac said it was (plus a
     little), or ORIGINAL_MAX when it didn't say."""
     limit = size + ORIGINAL_SLACK if size > 0 else ORIGINAL_MAX
     fd = os.open(dst + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with _open(client, guid) as r, os.fdopen(fd, "wb") as f:
+        with _Watchdog(original_deadline(size)) as dog, _open(client, guid, dog=dog) as r, \
+                os.fdopen(fd, "wb") as f:
             got = 0
-            while chunk := r.read1(1 << 20):
-                got += len(chunk)
-                if got > limit:
-                    raise MediaError("The Mac sent more than the file's size")
-                f.write(chunk)
+            try:
+                while chunk := r.read1(1 << 20):
+                    got += len(chunk)
+                    if got > limit:
+                        raise MediaError("The Mac sent more than the file's size")
+                    f.write(chunk)
+            except OSError as e:
+                dog.left()
+                raise MediaError(f"Can't fetch it from the Mac: {e}") from None
+            dog.left()                              # cut short by the deadline: not the file
     except BaseException:
         try:
             os.unlink(dst + ".part")

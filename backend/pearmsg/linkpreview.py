@@ -84,6 +84,45 @@ def _is_public(ip: ipaddress._BaseAddress) -> bool:
     return inner is None or _plain_public(inner)
 
 
+# Lookups still running. getaddrinfo can't be cancelled, so a fetch waits for one only until its
+# deadline and leaves it behind; this many may be left behind at once before new ones are refused.
+RESOLVERS = 4
+_resolvers = threading.BoundedSemaphore(RESOLVERS)
+
+
+def _lookup(host: str) -> list:
+    """getaddrinfo, given no longer than the fetch has left.
+
+    The lookup runs on its own thread, which is the only way to stop waiting for it: a slow or
+    silent DNS server otherwise held a preview past its deadline, since the timer shuts sockets
+    and the resolver's are not ours. A lookup that outlives the fetch finishes on its own (the
+    system resolver has its own timeout) and gives its slot back then.
+    """
+    if not _resolvers.acquire(blocking=False):
+        raise Blocked("busy")
+    out: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            out["infos"] = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except OSError as e:
+            out["error"] = e
+        finally:
+            done.set()
+            _resolvers.release()
+    try:
+        threading.Thread(target=run, daemon=True, name="resolve").start()
+    except BaseException:
+        _resolvers.release()
+        raise
+    if not done.wait(_remaining()):
+        raise Blocked("too slow")
+    if "error" in out:
+        raise Blocked("can't resolve")
+    return out["infos"]
+
+
 def _resolve(host: str) -> tuple[int, str]:
     """One resolution, fully checked, returning the single address to connect to.
 
@@ -91,10 +130,7 @@ def _resolve(host: str) -> tuple[int, str]:
     any answer is private means a name that returns both cannot be used to reach the private
     one, and the caller cannot accidentally connect to an address that was never checked.
     """
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        raise Blocked("can't resolve") from None
+    infos = _lookup(host)
     chosen = None
     for info in infos:
         raw = info[4][0].split("%")[0]
